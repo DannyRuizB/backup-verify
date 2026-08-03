@@ -78,6 +78,11 @@ fresh_backup() {
 realign_manifest() {
     python3 "$SCRIPT_DIR/realign_manifest.py" "$1" "${1%.json}.dump"
 }
+
+# Same, for an encrypted artefact (its name carries the .age suffix).
+realign_manifest_enc() {
+    python3 "$SCRIPT_DIR/realign_manifest.py" "$1" "$2"
+}
 printf '\n'
 
 echo '== Case 1: truncated archive (restores PARTIAL data, exits non-zero) =='
@@ -192,6 +197,81 @@ else
     else
         fail_case 'rejected, but not by the schema comparison'
         sed -n '1,20p' "$OUT/c6.log" | sed 's/^/        /'
+    fi
+fi
+printf '\n'
+
+echo '== Cases 7-11: encryption (a backup you cannot decrypt is not a backup) =='
+if ! command -v age >/dev/null 2>&1; then
+    fail_case 'age is not installed - the encryption cases could not run (they are not optional)'
+else
+    KEYDIR=$(mktemp -d "$OUT/keysXXXXXX")
+    age-keygen -o "$KEYDIR/good.txt" 2>/dev/null
+    age-keygen -o "$KEYDIR/other.txt" 2>/dev/null
+    GOOD_RECIP=$(grep 'public key' "$KEYDIR/good.txt" | sed 's/.*: //')
+    ENCDIR=$(mktemp -d "$OUT/encXXXXXX")
+    ./backup.sh --container "$SRC" --db app --out "$ENCDIR" \
+        --recipient "$GOOD_RECIP" --identity "$KEYDIR/good.txt" >/dev/null
+    ENCMAN=$(find "$ENCDIR" -name '*.json' | head -1)
+    ENCART="${ENCMAN%.json}.dump.age"
+
+    # 7: the artefact must actually BE encrypted, not merely named .age.
+    if [ -f "$ENCART" ] && head -c 16 "$ENCART" | grep -q 'age-encryption'; then
+        pass_case 'the artefact on disk is real age ciphertext'
+    else
+        fail_case "no age ciphertext at $ENCART"
+    fi
+    if head -c 200 "$ENCART" | grep -q 'PGDMP'; then
+        fail_case 'the plaintext pg_dump header is visible in the artefact'
+    else
+        pass_case '...with no pg_dump header in the clear'
+    fi
+
+    # 8: without the key, verification must REFUSE rather than pretend.
+    if ./verify.sh --manifest "$ENCMAN" --image "$IMAGE" >"$OUT/c7.log" 2>&1; then
+        fail_case 'an encrypted backup was "verified" with no identity at all'
+    elif grep -q 'pass --identity' "$OUT/c7.log"; then
+        pass_case 'without the key, verification refuses instead of pretending'
+    else
+        fail_case 'refused, but not because the identity was missing'
+        sed -n '1,6p' "$OUT/c7.log" | sed 's/^/        /'
+    fi
+
+    # 9: the WRONG key must fail loudly, and be told apart from a bad archive.
+    if ./verify.sh --manifest "$ENCMAN" --identity "$KEYDIR/other.txt" --image "$IMAGE" >"$OUT/c8.log" 2>&1; then
+        fail_case 'the wrong identity decrypted the backup'
+    elif grep -q 'decryption FAILED' "$OUT/c8.log"; then
+        pass_case 'the wrong identity fails at DECRYPTION, told apart from a bad archive'
+    else
+        fail_case 'rejected, but not distinguished as a decryption failure'
+        sed -n '1,6p' "$OUT/c8.log" | sed 's/^/        /'
+    fi
+
+    # 10: a truncated ciphertext - the contrast with case 1 is the lesson.
+    cp "$ENCART" "$ENCART.full"
+    HALF_E=$(( $(stat -c%s "$ENCART.full") / 2 ))
+    head -c "$HALF_E" "$ENCART.full" > "$ENCART"
+    rm -f "$ENCART.full"
+    realign_manifest_enc "$ENCMAN" "$ENCART"
+    if ./verify.sh --manifest "$ENCMAN" --identity "$KEYDIR/good.txt" --image "$IMAGE" >"$OUT/c9.log" 2>&1; then
+        fail_case 'a truncated ciphertext passed verification'
+    elif grep -q 'decryption FAILED' "$OUT/c9.log"; then
+        pass_case 'a truncated ciphertext cannot decrypt at all (authenticated encryption, unlike case 1)'
+    else
+        fail_case 'rejected, but not at the decryption stage'
+        sed -n '1,6p' "$OUT/c9.log" | sed 's/^/        /'
+    fi
+
+    # 11: and the good encrypted backup still verifies end to end.
+    ENCDIR2=$(mktemp -d "$OUT/enc2XXXXXX")
+    ./backup.sh --container "$SRC" --db app --out "$ENCDIR2" \
+        --recipient "$GOOD_RECIP" --identity "$KEYDIR/good.txt" >/dev/null
+    ENCMAN2=$(find "$ENCDIR2" -name '*.json' | head -1)
+    if ./verify.sh --manifest "$ENCMAN2" --identity "$KEYDIR/good.txt" --image "$IMAGE" >"$OUT/c10.log" 2>&1; then
+        pass_case 'an untouched ENCRYPTED backup decrypts, restores and verifies'
+    else
+        fail_case 'a good encrypted backup was rejected'
+        sed -n '1,15p' "$OUT/c10.log" | sed 's/^/        /'
     fi
 fi
 printf '\n'

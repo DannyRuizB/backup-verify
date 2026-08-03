@@ -18,6 +18,7 @@
 #
 # Options:
 #   --manifest FILE   manifest produced by backup.sh (the artefact sits beside it)
+#   --identity FILE   age identity, required when the backup is encrypted
 #   --image IMAGE     Postgres image for the throwaway instance
 #   --keep-container  leave the throwaway container running (for debugging)
 #   -h, --help        this help
@@ -29,16 +30,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 MANIFEST=""
+IDENTITY=""
 IMAGE="postgres:17-alpine"
 KEEP_CONTAINER=0
 PROBE=""
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --manifest)       MANIFEST="${2:-}"; shift 2;;
+            --identity)       IDENTITY="${2:-}"; shift 2;;
             --image)          IMAGE="${2:-}"; shift 2;;
             --keep-container) KEEP_CONTAINER=1; shift;;
             -h|--help)        usage 0;;
@@ -96,6 +99,18 @@ main() {
     [ -n "$db" ] || die "manifest has no database name"
     [ -f "$artefact" ] || die "artefact named by the manifest is missing: $artefact"
 
+    # An encrypted backup cannot be verified without the key, and pretending
+    # otherwise is exactly the kind of comfortable lie this repo exists to kill.
+    local encryption
+    encryption="$(json_str "$MANIFEST" encryption)"
+    if [ "$encryption" = "age" ]; then
+        [ -n "$IDENTITY" ] || die "this backup is encrypted with age: pass --identity FILE. Without the key it CANNOT be verified - and a backup you cannot decrypt is not a backup."
+        [ -f "$IDENTITY" ] || die "identity file not found: $IDENTITY"
+        encryption_available || die "the backup is age-encrypted but 'age' is not installed"
+    elif [ -n "$IDENTITY" ]; then
+        warn '--identity given but this backup is not encrypted - ignoring it'
+    fi
+
     log "verifying backup of '$db' -> $(basename "$artefact")"
 
     # --- Gate 1: the artefact is byte-identical to what was backed up --------
@@ -133,8 +148,28 @@ main() {
     # are the answer.
     local restore_rc=0
     log 'restoring...'
-    docker exec -i "$PROBE" pg_restore -U postgres -d "$db" --no-owner \
-        < "$artefact" >/tmp/bv-restore-$$.log 2>&1 || restore_rc=$?
+    if [ "$encryption" = "age" ]; then
+        # Decrypt straight into pg_restore: the plaintext never lands on disk,
+        # here either. PIPESTATUS separates "the key is wrong / the file is
+        # corrupt" from "the archive restored badly" - two different verdicts a
+        # single exit code would blur.
+        set +e
+        age -d -i "$IDENTITY" "$artefact" \
+            | docker exec -i "$PROBE" pg_restore -U postgres -d "$db" --no-owner \
+              >/tmp/bv-restore-$$.log 2>&1
+        local -a rst=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${rst[0]}" -ne 0 ]; then
+            sed -n '1,5p' /tmp/bv-restore-$$.log | sed 's/^/      /'
+            rm -f /tmp/bv-restore-$$.log
+            die "decryption FAILED (age rc=${rst[0]}) - wrong identity, or the ciphertext is corrupt. age authenticates its payload, so a truncated .age cannot decrypt at all."
+        fi
+        restore_rc=${rst[1]}
+        ok 'decrypted with the given identity'
+    else
+        docker exec -i "$PROBE" pg_restore -U postgres -d "$db" --no-owner \
+            < "$artefact" >/tmp/bv-restore-$$.log 2>&1 || restore_rc=$?
+    fi
     if [ "$restore_rc" -eq 0 ]; then
         ok 'pg_restore finished cleanly'
     else

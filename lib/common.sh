@@ -77,6 +77,34 @@ psql_in() {
     docker exec "$container" psql -tA -v ON_ERROR_STOP=1 -U postgres -d "$db" -c "$sql" < /dev/null
 }
 
+# --- Encryption (age) --------------------------------------------------------
+#
+# age rather than gpg: authenticated encryption, no keyring, no agent, one
+# binary. What the probe measured, and why the design looks like it does:
+#
+#   * a TRUNCATED .age file fails to decrypt at all ("failed to decrypt and
+#     authenticate payload chunk", zero bytes written) - so encryption hands
+#     us integrity for free, unlike a bare dump, where truncation restores
+#     PARTIAL data and lies;
+#   * but it does NOT save us from an EMPTY dump: a failed pg_dump piped into
+#     age produces a perfectly valid ~200-byte .age that decrypts to 0 bytes
+#     with exit code 0. Encryption protects the bytes, not their meaning. Only
+#     restoring proves meaning.
+# shellcheck disable=SC2034  # used by backup.sh/verify.sh, which source this
+ENC_SUFFIX=".age"
+
+# Manifest path for an artefact, encrypted or not. One place so the ".dump" ->
+# ".json" and ".dump.age" -> ".json" mapping cannot drift between scripts.
+manifest_for() {
+    local artefact="$1"
+    artefact="${artefact%"$ENC_SUFFIX"}"
+    printf '%s' "${artefact%.dump}.json"
+}
+
+encryption_available() {
+    command -v age >/dev/null 2>&1
+}
+
 # --- Schema inventory --------------------------------------------------------
 #
 # Comparing table CONTENTS is not enough, and this was measured, not assumed:

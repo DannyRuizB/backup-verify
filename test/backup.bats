@@ -170,3 +170,44 @@ JSON
     run bash -c "source '$REPO/lib/common.sh'; ok 'plain' | cat"
     [[ "$output" != *$'\033'* ]]
 }
+
+# --- encryption (v0.3) ------------------------------------------------------
+
+@test "backup.sh rejects --identity without --recipient" {
+    run bash -c "source '$REPO/backup.sh'; parse_args --container c --db app --identity /tmp/k"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"only makes sense with --recipient"* ]]
+}
+
+@test "backup.sh --help documents the encryption options" {
+    run bash "$REPO/backup.sh" --help
+    [[ "$output" == *"--recipient"* ]]
+    [[ "$output" == *"--identity"* ]]
+    [[ "$output" == *"NEVER touches disk"* ]]
+}
+
+@test "verify.sh --help documents --identity" {
+    run bash "$REPO/verify.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--identity"* ]]
+}
+
+@test "manifest_for maps both plain and encrypted artefacts to one manifest" {
+    run bash -c "source '$REPO/lib/common.sh'; manifest_for /b/app_2026.dump; echo; manifest_for /b/app_2026.dump.age"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"/b/app_2026.json"* ]]
+    # Both lines must be the same path: the mapping lives in one place so it
+    # cannot drift between backup.sh and verify.sh.
+    run bash -c "source '$REPO/lib/common.sh'; a=\$(manifest_for /b/x.dump); b=\$(manifest_for /b/x.dump.age); [ \"\$a\" = \"\$b\" ]"
+    [ "$status" -eq 0 ]
+}
+
+@test "the recipient flags are built as an array, not returned as text" {
+    # Regression guard: a helper returning "-r\nage1..." through printf without
+    # a trailing newline made `read` drop the value, and age got a bare -r.
+    run grep -c 'age_recipient_args' "$REPO/lib/common.sh" "$REPO/backup.sh"
+    [[ "$output" != *":1"* ]]
+    run bash -c "grep -A6 'recip_args=()' '$REPO/backup.sh'"
+    [[ "$output" == *"recip_args=(-R"* ]]
+    [[ "$output" == *"recip_args=(-r"* ]]
+}
