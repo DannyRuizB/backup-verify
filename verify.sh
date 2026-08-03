@@ -62,12 +62,17 @@ json_num() {
         | head -1 | sed 's/.*:[[:space:]]*//'
 }
 
-# Every "table": "fingerprint" pair inside the "tables" object, as TAB-separated
-# lines. Anchored on four leading spaces so the top-level keys can never be
-# mistaken for table entries.
-manifest_tables() {
-    sed -n 's/^    "\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1\t\2/p' "$1"
+# Every "key": "value" pair inside one top-level object of the manifest, as
+# TAB-separated lines. Scoped to the section's line range because "tables" and
+# "objects" both indent their entries by four spaces - a plain four-space match
+# would happily mix them.
+manifest_section() {
+    local file="$1" section="$2"
+    sed -n "/^  \"$section\": {/,/^  }/p" "$file" \
+        | sed -n 's/^    "\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1\t\2/p'
 }
+
+manifest_tables() { manifest_section "$1" tables; }
 
 cleanup() {
     if [ -n "$PROBE" ] && [ "$KEEP_CONTAINER" -eq 0 ]; then
@@ -161,6 +166,38 @@ main() {
 
     [ "$checked" -gt 0 ] || die 'the manifest lists no tables - nothing was verified, so nothing is proven'
 
+    # --- Gate 5: schema objects ---------------------------------------------
+    # Rows are half the database. Measured: `pg_restore -t a -t b` exits 0 with
+    # every row present and silently drops the indexes, constraints, view,
+    # function and trigger. A restored copy that cannot enforce a unique key is
+    # not a restored copy.
+    local obj_lines obj_class obj_expected obj_actual exp_count act_count
+    obj_lines=$(manifest_section "$MANIFEST" objects)
+    if [ -z "$obj_lines" ]; then
+        warn 'this manifest predates schema verification (schema 1) - only data was compared'
+    else
+        printf '\n'
+        while IFS=$'\t' read -r obj_class obj_expected; do
+            [ -n "$obj_class" ] || continue
+            obj_actual=$(schema_digest "$PROBE" "$db" "$obj_class")
+            exp_count=${obj_expected%%:*}
+            act_count=${obj_actual%%:*}
+            if [ "$obj_actual" = "$obj_expected" ]; then
+                printf '  %sOK%s   %s (%s)\n' "$c_green" "$c_reset" "$obj_class" "$act_count"
+            elif [ "$exp_count" != "$act_count" ]; then
+                printf '  %sFAIL%s %s - expected %s, restored copy has %s\n' \
+                    "$c_red" "$c_reset" "$obj_class" "$exp_count" "$act_count"
+                failures=$((failures + 1))
+            else
+                printf '  %sFAIL%s %s - same count (%s) but the definitions differ\n' \
+                    "$c_red" "$c_reset" "$obj_class" "$act_count"
+                failures=$((failures + 1))
+            fi
+        done <<EOF
+$obj_lines
+EOF
+    fi
+
     # A restored copy with EXTRA tables is also a mismatch: it means the
     # artefact and the manifest describe different moments.
     local restored_count
@@ -175,6 +212,30 @@ main() {
     if [ "$failures" -gt 0 ]; then
         die "VERIFICATION FAILED: $failures problem(s) across $checked table(s). This backup does NOT restore."
     fi
+    # --- Gate 6: can the application actually WRITE to it? -------------------
+    # Deliberately LAST, after every comparison, because it modifies the
+    # restored copy. A sequence restored behind its data makes the next INSERT
+    # collide with the primary key: all the rows present, and the application
+    # broken on its first write. Cheap to check, and it is the question the
+    # person restoring a backup actually cares about.
+    local seq_line seq_name seq_tbl write_failures=0
+    while IFS= read -r seq_line; do
+        [ -n "$seq_line" ] || continue
+        seq_name=${seq_line%%|*}
+        seq_tbl=${seq_line##*|}
+        if psql_in "$PROBE" "$db" "INSERT INTO \"$seq_tbl\" DEFAULT VALUES;" >/dev/null 2>&1 \
+           || psql_in "$PROBE" "$db" "SELECT nextval('\"$seq_name\"');" >/dev/null 2>&1; then
+            :
+        else
+            printf '  %sFAIL%s sequence %s cannot produce a usable next value\n' \
+                "$c_red" "$c_reset" "$seq_name"
+            write_failures=$((write_failures + 1))
+        fi
+    done < <(psql_in "$PROBE" "$db" "SELECT s.sequencename||'|'||coalesce(t.relname,'') FROM pg_sequences s LEFT JOIN pg_class c ON c.relname = s.sequencename LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype = 'a' LEFT JOIN pg_class t ON t.oid = d.refobjid WHERE s.schemaname='public' ORDER BY 1;" 2>/dev/null || true)
+    if [ "$write_failures" -gt 0 ]; then
+        die "VERIFICATION FAILED: $write_failures sequence(s) unusable - the data is there but writes will collide."
+    fi
+
     ok "VERIFIED: $checked table(s) restored byte-for-byte identical to the source."
     if [ "$restore_rc" -ne 0 ]; then
         warn "note: pg_restore exited $restore_rc yet the content matched - inspect before trusting"

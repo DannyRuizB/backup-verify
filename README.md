@@ -39,6 +39,22 @@ never answers the question by counting: for each table it computes an
 order-independent md5 over every column of every row, and compares it to the
 fingerprint recorded at backup time.
 
+### ...and rows are only half the database
+
+Measured the same way, on the "I only want the tables" flow every sysadmin has
+typed at some point:
+
+> `pg_restore -t customers -t orders` exits **0**, restores **every single row**
+> — and silently drops **4 of 4 indexes, 4 of 5 constraints, the view, the
+> function and the trigger**.
+
+A restored copy that cannot enforce a unique key, or whose trigger no longer
+fires, is not a restored copy. So the manifest also records **schema objects** —
+indexes, constraints, sequences (with their `last_value`), views, routines,
+triggers — as a count plus a fingerprint of their definitions, and `verify.sh`
+compares each class. A missing index is a failure, and so is an index that came
+back on the wrong column.
+
 Three more ways a backup lies, all measured, all covered by the negative suite:
 
 | What looks fine | What is actually happening |
@@ -69,24 +85,41 @@ pairs.
 4. **Content, table by table**, plus a guard that the restored copy has no
    **extra** tables (that guard earned its keep on day one: it caught a bug in
    this repo's own manifest writer).
+5. **Schema objects**, per class, by count and definition — the half of the
+   database a row comparison cannot see.
+6. **Can the application actually write to it?** Last on purpose, because it
+   modifies the restored copy: every sequence must be able to produce a usable
+   next value. A sequence restored *behind* its data makes the next `INSERT`
+   collide with the primary key — every row present, and the application broken
+   on its first write.
 
 ## How it's tested
 
 - **`test/e2e.sh`** — seed → back up → **`docker rm -f` the source** → restore
   into a fresh instance → compare. The destruction is the point: it removes the
   possibility of accidentally verifying against the original.
-- **`test/negative.sh`** — five cases: truncated archive, un-runnable dump,
-  post-backup corruption, matching row count with different content, and a good
-  backup that must still pass (a suite that only rejects is as useless as one
-  that only accepts). Each case takes its **own fresh backup**, because sharing
-  one artefact let case 4 inherit case 1's edits and quietly test the wrong gate,
-  and a counter-based directory name let case 5 read case 4's corrupted file.
-- **`test/backup.bats`** — 11 unit tests over argument parsing, manifest
-  reading, and one regression guard described below.
+- **`test/negative.sh`** — six cases: truncated archive, un-runnable dump,
+  post-backup corruption, matching row count with different content, **every row
+  restored with the schema silently gone**, and a good backup that must still
+  pass (a suite that only rejects is as useless as one that only accepts). Each
+  case takes its **own fresh backup**, because sharing one artefact let case 4
+  inherit case 1's edits and quietly test the wrong gate, and a counter-based
+  directory name let case 5 read case 4's corrupted file.
+- **`test/backup.bats`** — 16 unit tests over argument parsing, manifest
+  reading, the schema queries, and two regression guards described below.
 - CI runs the e2e against **Postgres 17 and 16**, and on a weekly schedule: a
   backup tool that only works the day you wrote it is not a backup tool.
 
-## Four bugs this harness caught in its own code
+## Five bugs this harness caught in its own code
+
+**A negative case that proved nothing.** The schema-loss case was added, went
+green, and was worthless: the negative suite's database had a single bare table,
+so a tables-only dump had no view, function or trigger to drop and the
+comparison trivially matched. A test that cannot fail is not a test. The suite
+now seeds the same shape as the e2e, and the case is surgical — data perfect,
+schema incomplete. (Its sibling symptom: an assertion grepping for
+`OK   customers` never matched, because the real bytes carried colour escapes
+between the two. Colour is now suppressed when stdout is not a terminal.)
 
 **A function called as `$(fn)` runs in a subshell.** The negative suite gave
 each case its own backup directory using an incrementing counter — except
@@ -123,7 +156,8 @@ into the `for` with `nullglob`.
 
 ## Scope
 
-PostgreSQL, via a Docker container. Deliberately not here yet: MySQL/MariaDB,
+PostgreSQL, via a Docker container: table contents, schema objects, and whether
+the restored copy can be written to. Deliberately not here yet: MySQL/MariaDB,
 filesystem archives, encryption at rest (age/gpg), off-site upload, and
 point-in-time recovery with WAL archiving — all on the roadmap, none pretended
 to work today.
