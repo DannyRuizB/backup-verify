@@ -61,7 +61,7 @@ write_manifest() {
 
     {
         printf '{\n'
-        printf '  "schema": 1,\n'
+        printf '  "schema": 2,\n'
         printf '  "database": "%s",\n' "$DB"
         printf '  "created_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf '  "artefact": "%s",\n' "$(basename "$artefact")"
@@ -81,13 +81,23 @@ $tables
 EOF
             printf '\n'
         fi
-        printf '  }\n'
+        printf '  },\n'
+        # Schema objects: the half a row-count comparison cannot see. Recorded
+        # as "<count>:<md5>" per class so a mismatch can name the numbers.
+        printf '  "objects": {\n'
+        local class first_obj=1
+        for class in $SCHEMA_CLASSES; do
+            [ "$first_obj" -eq 1 ] || printf ',\n'
+            first_obj=0
+            printf '    "%s": "%s"' "$class" "$(schema_digest "$CONTAINER" "$DB" "$class")"
+        done
+        printf '\n  }\n'
         printf '}\n'
     } > "$manifest"
 
     local count
     count=$(printf '%s\n' "$tables" | grep -c . || true)
-    ok "manifest written: $count table fingerprint(s)"
+    ok "manifest written: $count table fingerprint(s) + $(printf '%s' "$SCHEMA_CLASSES" | wc -w) object class(es)"
 }
 
 # Delete the oldest artefacts of THIS database, keeping the newest N. Only

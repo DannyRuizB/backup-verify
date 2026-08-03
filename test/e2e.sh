@@ -31,9 +31,15 @@ CREATE TABLE customers (
 CREATE TABLE orders (
   id serial PRIMARY KEY,
   customer_id int REFERENCES customers(id),
-  total numeric(10,2),
+  total numeric(10,2) CHECK (total >= 0),
   note text
 );
+-- Schema objects on purpose: a restore can bring back every row and drop all
+-- of these (measured with `pg_restore -t`), so the e2e must have some to lose.
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 1000;
+CREATE FUNCTION order_label(o orders) RETURNS text AS
+  $$ SELECT 'order #' || o.id $$ LANGUAGE sql;
 INSERT INTO customers (name, email)
   SELECT 'cliente ' || g, 'c' || g || '@example.com' FROM generate_series(1,500) g;
 INSERT INTO orders (customer_id, total, note)

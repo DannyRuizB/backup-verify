@@ -8,8 +8,15 @@
 # leaves a valid, 20-byte, completely empty gzip behind. Measured, not guessed.
 set -euo pipefail
 
-c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
-c_blue=$'\033[34m'; c_reset=$'\033[0m'
+# Colour only when stdout is a terminal. Escape codes in a CI log are noise at
+# best, and they broke a test that grepped for "OK   customers" while the real
+# bytes were "OK\033[0m   customers" - a check that silently stopped checking.
+if [ -t 1 ]; then
+    c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
+    c_blue=$'\033[34m'; c_reset=$'\033[0m'
+else
+    c_red=''; c_green=''; c_yellow=''; c_blue=''; c_reset=''
+fi
 
 log()  { printf '%s[*]%s %s\n' "$c_blue" "$c_reset" "$*"; }
 ok()   { printf '%s[+]%s %s\n' "$c_green" "$c_reset" "$*"; }
@@ -68,6 +75,56 @@ SQL
 psql_in() {
     local container="$1" db="$2" sql="$3"
     docker exec "$container" psql -tA -v ON_ERROR_STOP=1 -U postgres -d "$db" -c "$sql" < /dev/null
+}
+
+# --- Schema inventory --------------------------------------------------------
+#
+# Comparing table CONTENTS is not enough, and this was measured, not assumed:
+# `pg_restore -t customers -t orders` (the "I only want the tables" flow) exits
+# 0, restores every single row, and silently drops 4 of 4 indexes, 4 of 5
+# constraints, the view, the function and the trigger. A verification that only
+# looks at rows would call that a good backup and be wrong by omission - the
+# restored database cannot enforce a unique key or fire a trigger.
+#
+# One query per object class, each ORDER BY'd so the output is deterministic.
+# The definitions themselves are included (not just names): an index that comes
+# back on the wrong column is not the same index.
+schema_query() {
+    case "$1" in
+        indexes)
+            printf '%s' "SELECT indexdef FROM pg_indexes WHERE schemaname='public' ORDER BY indexdef;";;
+        constraints)
+            printf '%s' "SELECT conname||' '||pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='public' ORDER BY 1;";;
+        sequences)
+            # last_value included on purpose: a sequence restored but left
+            # behind the data means the next INSERT collides with the primary
+            # key - all the rows are there and the application is broken.
+            printf '%s' "SELECT sequencename||'='||coalesce(last_value::text,'unset') FROM pg_sequences WHERE schemaname='public' ORDER BY 1;";;
+        views)
+            printf '%s' "SELECT table_name||' '||md5(coalesce(view_definition,'')) FROM information_schema.views WHERE table_schema='public' ORDER BY 1;";;
+        routines)
+            printf '%s' "SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' ORDER BY 1;";;
+        triggers)
+            printf '%s' "SELECT t.tgname||' on '||c.relname FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal AND n.nspname='public' ORDER BY 1;";;
+        *)  die "unknown object class: $1";;
+    esac
+}
+
+# The object classes the manifest records, in report order. Consumed by
+# backup.sh and verify.sh, which source this file - hence the disable: analysing
+# this file on its own cannot see those uses.
+# shellcheck disable=SC2034
+SCHEMA_CLASSES="indexes constraints sequences views routines triggers"
+
+# "<count>:<md5 of the sorted definitions>" for one object class. The count is
+# carried alongside the fingerprint so a failure can say "expected 4 indexes,
+# found 0" instead of only "the fingerprints differ".
+schema_digest() {
+    local container="$1" db="$2" class="$3" out count fp
+    out=$(psql_in "$container" "$db" "$(schema_query "$class")")
+    count=$(printf '%s\n' "$out" | grep -c . || true)
+    fp=$(printf '%s' "$out" | md5sum | awk '{print $1}')
+    printf '%s:%s' "$count" "$fp"
 }
 
 # Wait until Postgres inside a container is *really* ready.

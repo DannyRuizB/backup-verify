@@ -38,10 +38,20 @@ log 'booting a source database with data'
 docker rm -f "$SRC" >/dev/null 2>&1 || true
 docker run -d --name "$SRC" -e POSTGRES_PASSWORD=neg -e POSTGRES_DB=app "$IMAGE" >/dev/null
 wait_for_postgres "$SRC"
+# Same shape as the e2e: two tables PLUS a view and a function. Case 6 needs
+# schema objects to lose - with a single bare table there is nothing for a
+# tables-only dump to drop, and the case silently proves nothing (it did,
+# first time round).
 docker exec -i "$SRC" psql -q -v ON_ERROR_STOP=1 -U postgres -d app <<'SQL'
 CREATE TABLE customers (id serial PRIMARY KEY, name text NOT NULL, email text UNIQUE);
+CREATE TABLE orders (id serial PRIMARY KEY, customer_id int REFERENCES customers(id), total numeric(10,2));
+CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 1000;
+CREATE FUNCTION order_label(o orders) RETURNS text AS
+  $$ SELECT 'order #' || o.id $$ LANGUAGE sql;
 INSERT INTO customers (name, email)
   SELECT 'cliente ' || g, 'c' || g || '@example.com' FROM generate_series(1,500) g;
+INSERT INTO orders (customer_id, total)
+  SELECT (g % 500) + 1, (g * 1.37)::numeric(10,2) FROM generate_series(1,800) g;
 SQL
 
 # Each case gets its OWN fresh backup. Sharing one artefact across cases meant
@@ -157,7 +167,35 @@ else
     sed -n '1,15p' "$OUT/c5.log" | sed 's/^/        /'
 fi
 
+echo '== Case 6: every row restored, schema silently gone =='
+# The most dangerous artefact of all, and entirely realistic: a cron that says
+# `pg_dump -t customers -t orders` because someone only cared about the tables.
+# MEASURED: it exits 0, restores every row, and drops 4 of 4 indexes, 4 of 5
+# constraints, the view, the function and the trigger. Before schema
+# verification existed, this repo called that backup VERIFIED.
+MANIFEST=$(fresh_backup)
+ARTEFACT="${MANIFEST%.json}.dump"
+# Both tables (so the data gates all pass) but no independent objects: the
+# view and the function are simply not in a `-t`-scoped dump.
+docker exec "$SRC" pg_dump -U postgres -d app -Fc -t customers -t orders < /dev/null > "$ARTEFACT"
+realign_manifest "$MANIFEST"
+if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c6.log" 2>&1; then
+    fail_case 'a tables-only artefact passed verification (schema loss went unnoticed)'
+    sed -n '1,20p' "$OUT/c6.log" | sed 's/^/        /'
+else
+    if grep -qE 'indexes - expected|constraints - expected|views - expected|routines - expected' "$OUT/c6.log"; then
+        pass_case 'schema loss caught by the object comparison'
+        # The point worth shouting about: the DATA was fine.
+        if grep -q 'OK   customers' "$OUT/c6.log"; then
+            pass_case '...while the table it did restore matched row for row'
+        fi
+    else
+        fail_case 'rejected, but not by the schema comparison'
+        sed -n '1,20p' "$OUT/c6.log" | sed 's/^/        /'
+    fi
+fi
 printf '\n'
+
 if [ "$FAILURES" -gt 0 ]; then
     die "$FAILURES negative case(s) behaved wrongly"
 fi

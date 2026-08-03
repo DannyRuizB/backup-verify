@@ -112,3 +112,61 @@ JSON
     run bash -c "grep -A3 '^psql_in()' '$REPO/lib/common.sh'"
     [[ "$output" == *"/dev/null"* ]]
 }
+
+# --- schema verification (v0.2) ---------------------------------------------
+
+@test "manifest_section keeps 'tables' and 'objects' apart" {
+    tmp="$BATS_TEST_TMPDIR/m.json"
+    cat > "$tmp" <<'JSON'
+{
+  "schema": 2,
+  "database": "shop",
+  "tables": {
+    "customers": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "orders": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "objects": {
+    "indexes": "4:cccccccccccccccccccccccccccccccc",
+    "views": "1:dddddddddddddddddddddddddddddddd"
+  }
+}
+JSON
+    # Both sections indent by four spaces, so a naive match would mix them.
+    run bash -c "source '$REPO/verify.sh'; manifest_section '$tmp' tables | wc -l"
+    [ "$output" = "2" ]
+    run bash -c "source '$REPO/verify.sh'; manifest_section '$tmp' objects | wc -l"
+    [ "$output" = "2" ]
+    run bash -c "source '$REPO/verify.sh'; manifest_section '$tmp' tables"
+    [[ "$output" != *"indexes"* ]]
+    run bash -c "source '$REPO/verify.sh'; manifest_section '$tmp' objects"
+    [[ "$output" != *"customers"* ]]
+    [[ "$output" == *"4:cccc"* ]]
+}
+
+@test "every schema class has a deterministic, ORDER BY'd query" {
+    for class in indexes constraints sequences views routines triggers; do
+        run bash -c "source '$REPO/lib/common.sh'; schema_query $class"
+        [ "$status" -eq 0 ]
+        [[ "$output" == *"ORDER BY"* ]]
+        [[ "$output" == *"public"* ]]
+    done
+}
+
+@test "an unknown schema class is a loud error, not an empty digest" {
+    run bash -c "source '$REPO/lib/common.sh'; schema_query nonsense"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown object class"* ]]
+}
+
+@test "sequences are compared with their last_value, not just their names" {
+    # A sequence restored behind its data means the next INSERT collides.
+    run bash -c "source '$REPO/lib/common.sh'; schema_query sequences"
+    [[ "$output" == *"last_value"* ]]
+}
+
+@test "colour is suppressed when stdout is not a terminal" {
+    # Escape codes broke a grep-based assertion once; a redirected run must be
+    # plain bytes.
+    run bash -c "source '$REPO/lib/common.sh'; ok 'plain' | cat"
+    [[ "$output" != *$'\033'* ]]
+}
