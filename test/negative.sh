@@ -49,12 +49,17 @@ SQL
 # file, so it tripped the size gate instead of the fingerprint comparison it
 # exists to test - a bug in the TEST, and exactly the kind of state carry-over
 # that makes a suite lie about what it covers.
-CASE_N=0
+# mktemp, NOT a counter. This function is called as `M=$(fresh_backup)`, which
+# runs it in a SUBSHELL - so an incrementing CASE_N never persisted in the
+# parent, every case landed in the same directory, and `find | head -1` handed
+# case 5 the CORRUPTED manifest from case 4. It passed locally purely because
+# find happened to return the newer file first; CI ordered them the other way.
+# Non-determinism in the test suite of a tool about non-determinism.
 fresh_backup() {
-    CASE_N=$((CASE_N + 1))
-    local dir="$OUT/case$CASE_N"
-    mkdir -p "$dir"
+    local dir
+    dir=$(mktemp -d "$OUT/caseXXXXXX")
     ./backup.sh --container "$SRC" --db app --out "$dir" >/dev/null
+    # Exactly one backup lives in this directory, so this is unambiguous.
     find "$dir" -name '*.json' | head -1
 }
 

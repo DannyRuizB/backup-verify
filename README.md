@@ -79,13 +79,23 @@ pairs.
   post-backup corruption, matching row count with different content, and a good
   backup that must still pass (a suite that only rejects is as useless as one
   that only accepts). Each case takes its **own fresh backup**, because sharing
-  one artefact let case 4 inherit case 1's edits and quietly test the wrong gate.
+  one artefact let case 4 inherit case 1's edits and quietly test the wrong gate,
+  and a counter-based directory name let case 5 read case 4's corrupted file.
 - **`test/backup.bats`** — 11 unit tests over argument parsing, manifest
   reading, and one regression guard described below.
 - CI runs the e2e against **Postgres 17 and 16**, and on a weekly schedule: a
   backup tool that only works the day you wrote it is not a backup tool.
 
-## Three bugs this harness caught in its own code
+## Four bugs this harness caught in its own code
+
+**A function called as `$(fn)` runs in a subshell.** The negative suite gave
+each case its own backup directory using an incrementing counter — except
+`M=$(fresh_backup)` runs the function in a subshell, so the counter never
+advanced in the parent. Every case shared one directory and `find | head -1`
+handed case 5 the *corrupted* manifest from case 4. It passed locally purely
+because `find` happened to return the newer file first; CI ordered them the
+other way. Non-determinism in the test suite of a tool about non-determinism.
+Fixed with `mktemp -d`, which needs no shared state.
 
 **The Postgres image starts two servers.** The first CI run failed with
 `FATAL: the database system is shutting down` and `database "app" does not
