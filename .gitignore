@@ -1,0 +1,4 @@
+# Backups produced by running the tool against a real database.
+backups/
+*.dump
+*.dump.full

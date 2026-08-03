@@ -1,0 +1,60 @@
+name: ci
+
+# Three jobs, in order of how much they prove:
+#   lint      - the scripts parse and shellcheck is happy
+#   e2e       - a real Postgres is seeded, backed up, DESTROYED, and restored
+#   negative  - every way a backup lies is caught, and a good one still passes
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A backup tool that only works on the day you wrote it is not a backup tool.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck + bats
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Bash syntax
+        run: for f in backup.sh verify.sh lib/common.sh test/*.sh; do bash -n "$f"; done
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -x backup.sh verify.sh lib/common.sh test/*.sh
+
+      - name: Unit tests (bats)
+        run: |
+          sudo apt-get install -y bats >/dev/null
+          bats test/
+
+  e2e:
+    name: Seed, back up, DESTROY, restore, compare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # A backup format is a compatibility promise: prove it across versions.
+      matrix:
+        image: ['postgres:17-alpine', 'postgres:16-alpine']
+    steps:
+      - uses: actions/checkout@v5
+      - name: e2e
+        env:
+          BV_IMAGE: ${{ matrix.image }}
+        run: ./test/e2e.sh
+
+  negative:
+    name: Every failure mode is caught
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: negative cases
+        run: ./test/negative.sh
