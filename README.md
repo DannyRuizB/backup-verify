@@ -14,6 +14,11 @@ five deliberately broken backups to prove the checks actually catch them.
 ```bash
 ./backup.sh --container my-postgres --db app --out ./backups --keep 7
 ./verify.sh --manifest ./backups/app_20260803T120447Z.json
+
+# encrypted at rest, and proven to decrypt at backup time:
+age-keygen -o key.txt
+./backup.sh --container my-postgres --db app --recipient age1... --identity key.txt
+./verify.sh --manifest ./backups/app_....json --identity key.txt
 ```
 
 ```
@@ -63,6 +68,30 @@ Three more ways a backup lies, all measured, all covered by the negative suite:
 | The nightly cron reported success | `pg_dump ... \| gzip > out.gz` exits **0 even when pg_dump fails** — without `set -o pipefail` the pipeline's status is gzip's |
 | The archive verified last month | Bit rot, a half-finished copy, a truncated upload: the sha256 in the manifest catches it *before* wasting a restore |
 
+## Encryption, and why it needs the same suspicion
+
+A backup you have never decrypted is **two** hopes stacked: that it restores,
+and that the key still opens it. So `--recipient` encrypts with
+[age](https://github.com/FiloSottile/age), and:
+
+- The **plaintext dump never touches disk** — `pg_dump` is piped straight into
+  `age`, so a crash cannot leave an unencrypted copy behind. This is the one
+  pipe this repo allows, and `PIPESTATUS` names *which* side failed instead of
+  guessing.
+- `--identity` at **backup** time decrypts the artefact immediately and parses
+  it. That turns "the key works" from an assumption into a fact you learn today
+  rather than during a restore. Without it the artefact is still written, and
+  the script **says out loud** that it was not decryption-checked.
+- `verify.sh` decrypts into `pg_restore` and **refuses to run without the key**:
+  no key, no verification, no comforting green tick.
+
+Two measured facts shaped this, and they pull in opposite directions:
+
+| Measured | Consequence |
+|---|---|
+| A **truncated** `.age` fails to decrypt at all — *"failed to decrypt and authenticate payload chunk"*, zero bytes written | Authenticated encryption hands you integrity for free. Contrast case 1: a truncated **plain** dump restores partial data and lies. |
+| A failed `pg_dump` piped into age yields a **valid ~200-byte `.age` that decrypts to 0 bytes with exit code 0** | Encryption protects the bytes, **not their meaning**. Only restoring proves meaning — which is the whole repo. |
+
 ## How it works
 
 **`backup.sh`** dumps with `pg_dump -Fc` and writes a **manifest** beside the
@@ -98,19 +127,33 @@ pairs.
 - **`test/e2e.sh`** — seed → back up → **`docker rm -f` the source** → restore
   into a fresh instance → compare. The destruction is the point: it removes the
   possibility of accidentally verifying against the original.
-- **`test/negative.sh`** — six cases: truncated archive, un-runnable dump,
+- **`test/negative.sh`** — eleven cases: truncated archive, un-runnable dump,
   post-backup corruption, matching row count with different content, **every row
-  restored with the schema silently gone**, and a good backup that must still
-  pass (a suite that only rejects is as useless as one that only accepts). Each
+  restored with the schema silently gone**, five encryption cases (real
+  ciphertext on disk with no `PGDMP` header in the clear, verification refusing
+  without a key, the **wrong** key failing at decryption and told apart from a
+  bad archive, a truncated ciphertext that cannot decrypt at all, and a good
+  encrypted backup that restores end to end), and a good plain backup that must
+  still pass (a suite that only rejects is as useless as one that only
+  accepts). Each
   case takes its **own fresh backup**, because sharing one artefact let case 4
   inherit case 1's edits and quietly test the wrong gate, and a counter-based
   directory name let case 5 read case 4's corrupted file.
-- **`test/backup.bats`** — 16 unit tests over argument parsing, manifest
-  reading, the schema queries, and two regression guards described below.
-- CI runs the e2e against **Postgres 17 and 16**, and on a weekly schedule: a
-  backup tool that only works the day you wrote it is not a backup tool.
+- **`test/backup.bats`** — 21 unit tests over argument parsing, manifest
+  reading, the schema queries, and three regression guards described below.
+- CI runs the e2e against **Postgres 17 and 16, plain and encrypted** (four
+  combinations), and on a weekly schedule: a backup tool that only works the day
+  you wrote it is not a backup tool. `age` is installed in the negative job
+  deliberately **without** a skip path — a missing tool fails the suite rather
+  than reporting green on tests that never ran.
 
-## Five bugs this harness caught in its own code
+## Six bugs this harness caught in its own code
+
+**A shell function cannot return a list.** The recipient flags came from a
+helper doing `printf '%s\n%s' -r "$key"` — with no trailing newline, so `read`
+**dropped the last line** and `age` was invoked with a bare `-r`. It failed on
+the very first encrypted run. Lists belong in arrays; the helper is gone and a
+bats guard keeps it gone.
 
 **A negative case that proved nothing.** The schema-loss case was added, went
 green, and was worthless: the negative suite's database had a single bare table,

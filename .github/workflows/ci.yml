@@ -33,7 +33,7 @@ jobs:
 
       - name: Unit tests (bats)
         run: |
-          sudo apt-get install -y bats >/dev/null
+          sudo apt-get install -y bats age >/dev/null
           bats test/
 
   e2e:
@@ -42,19 +42,29 @@ jobs:
     strategy:
       fail-fast: false
       # A backup format is a compatibility promise: prove it across versions.
+      # And encryption must not change the promise, so the same destruction
+      # test runs through age.
       matrix:
         image: ['postgres:17-alpine', 'postgres:16-alpine']
+        mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
+      - name: Install age
+        if: matrix.mode == '--encrypted'
+        run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
       - name: e2e
         env:
           BV_IMAGE: ${{ matrix.image }}
-        run: ./test/e2e.sh
+        run: ./test/e2e.sh ${{ matrix.mode }}
 
   negative:
     name: Every failure mode is caught
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # Not optional: the encryption cases FAIL the suite if age is missing,
+      # rather than skipping quietly and reporting green.
+      - name: Install age
+        run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
       - name: negative cases
         run: ./test/negative.sh

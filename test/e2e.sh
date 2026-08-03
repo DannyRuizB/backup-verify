@@ -11,6 +11,11 @@ cd "$(dirname "$0")/.."
 SRC=bv-e2e-src
 OUT=$(mktemp -d)
 IMAGE="${BV_IMAGE:-postgres:17-alpine}"
+# --encrypted runs the SAME cycle through age: the point is that encryption
+# changes nothing about the promise. A backup you cannot decrypt is not a
+# backup, so the encrypted path has to survive the same destruction test.
+ENCRYPTED=0
+[ "${1:-}" = "--encrypted" ] && ENCRYPTED=1
 
 cleanup() { docker rm -f "$SRC" >/dev/null 2>&1 || true; rm -rf "$OUT"; }
 trap cleanup EXIT
@@ -47,8 +52,19 @@ INSERT INTO orders (customer_id, total, note)
 SQL
 ok "seeded: $(psql_in "$SRC" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(psql_in "$SRC" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
 
-log "BACKUP"
-./backup.sh --container "$SRC" --db app --out "$OUT"
+KEYFILE=""
+if [ "$ENCRYPTED" -eq 1 ]; then
+    command -v age >/dev/null 2>&1 || die 'age is not installed - cannot run the encrypted cycle'
+    KEYFILE="$OUT/key.txt"
+    age-keygen -o "$KEYFILE" 2>/dev/null
+    RECIPIENT=$(grep 'public key' "$KEYFILE" | sed 's/.*: //')
+    log "BACKUP (encrypted to $RECIPIENT)"
+    ./backup.sh --container "$SRC" --db app --out "$OUT" \
+        --recipient "$RECIPIENT" --identity "$KEYFILE"
+else
+    log "BACKUP"
+    ./backup.sh --container "$SRC" --db app --out "$OUT"
+fi
 MANIFEST=$(find "$OUT" -name '*.json' | head -1)
 [ -n "$MANIFEST" ] || die 'backup.sh produced no manifest'
 
@@ -60,6 +76,14 @@ SRC=""
 ok 'source is gone - the artefact on disk is now the only copy'
 
 log "VERIFY (restores into a fresh instance and compares)"
-./verify.sh --manifest "$MANIFEST" --image "$IMAGE"
+if [ "$ENCRYPTED" -eq 1 ]; then
+    ./verify.sh --manifest "$MANIFEST" --identity "$KEYFILE" --image "$IMAGE"
+else
+    ./verify.sh --manifest "$MANIFEST" --image "$IMAGE"
+fi
 
-ok 'e2e passed: the backup restored identically after the source was destroyed'
+if [ "$ENCRYPTED" -eq 1 ]; then
+    ok 'e2e passed: the ENCRYPTED backup decrypted and restored identically after the source was destroyed'
+else
+    ok 'e2e passed: the backup restored identically after the source was destroyed'
+fi
