@@ -70,16 +70,33 @@ psql_in() {
     docker exec "$container" psql -tA -v ON_ERROR_STOP=1 -U postgres -d "$db" -c "$sql" < /dev/null
 }
 
-# Wait for Postgres inside a container to accept connections.
+# Wait until Postgres inside a container is *really* ready.
+#
+# `pg_isready` alone is NOT enough, and this cost a green local run and a red
+# CI one: the official Postgres image starts TWO servers. First a temporary one
+# on the unix socket to run initdb and any init scripts, then it SHUTS THAT
+# DOWN and starts the real one. pg_isready answers "accepting connections"
+# during the temporary phase, so a script that trusts it races the shutdown and
+# gets `FATAL: the database system is shutting down` - or worse, a
+# `database "app" does not exist` from the instant before the init finished.
+#
+# So: require a real query to succeed on STABLE_HITS consecutive attempts, one
+# second apart. The mid-init shutdown breaks the streak and the count restarts.
+# No log-message parsing, so it works across image versions.
 wait_for_postgres() {
-    local container="$1" tries="${2:-60}" i
+    local container="$1" tries="${2:-90}" stable_needed="${3:-3}"
+    local i streak=0
     for ((i = 1; i <= tries; i++)); do
-        if docker exec "$container" pg_isready -U postgres -q 2>/dev/null; then
-            return 0
+        if docker exec "$container" psql -U postgres -d postgres -tAc 'SELECT 1' \
+                >/dev/null 2>&1 < /dev/null; then
+            streak=$((streak + 1))
+            [ "$streak" -ge "$stable_needed" ] && return 0
+        else
+            streak=0
         fi
         sleep 1
     done
-    die "postgres in '$container' never became ready after ${tries}s"
+    die "postgres in '$container' never became stably ready after ${tries}s"
 }
 
 sha256_of() {

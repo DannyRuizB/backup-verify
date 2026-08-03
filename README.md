@@ -85,7 +85,18 @@ pairs.
 - CI runs the e2e against **Postgres 17 and 16**, and on a weekly schedule: a
   backup tool that only works the day you wrote it is not a backup tool.
 
-## Two bugs this harness caught in its own code
+## Three bugs this harness caught in its own code
+
+**The Postgres image starts two servers.** The first CI run failed with
+`FATAL: the database system is shutting down` and `database "app" does not
+exist`, having passed locally minutes earlier. The official image boots a
+*temporary* server on the unix socket to run `initdb`, **shuts it down**, and
+then starts the real one — and `pg_isready` happily answers "accepting
+connections" during that temporary phase. Anything that trusts it races the
+shutdown. `wait_for_postgres` now requires a **real query to succeed three
+times in a row**, one second apart: the mid-init shutdown breaks the streak and
+the count restarts. Reproduced locally by deleting the cached image first, which
+is the only reason the local run had been green — timing, not correctness.
 
 **`docker exec -i` eats a `while read` loop.** `psql_in` originally used
 `docker exec -i`, which attaches the caller's stdin to the container — so
