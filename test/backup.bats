@@ -96,21 +96,24 @@ JSON
     [[ "$output" == *"orders"* ]]
 }
 
-@test "the fingerprint SQL sorts rows so physical order cannot matter" {
-    run bash -c "source '$REPO/lib/common.sh'; fingerprint_sql customers"
-    [ "$status" -eq 0 ]
+@test "every engine's fingerprint sorts rows so physical order cannot matter" {
+    # Both engines must sort before hashing, or two identical databases would
+    # disagree because their rows sit in a different physical order.
+    run bash -c "grep -A4 '^eng_table_fingerprint' '$REPO/lib/postgres.sh'"
     [[ "$output" == *"ORDER BY row_text"* ]]
-    [[ "$output" == *"md5"* ]]
+    run bash -c "grep -A18 '^eng_table_fingerprint' '$REPO/lib/mysql.sh'"
+    [[ "$output" == *"ORDER BY row_text"* ]]
 }
 
-@test "psql_in never attaches stdin (it would eat a caller's read loop)" {
-    # Regression guard for a real bug: with `docker exec -i`, calling psql_in
-    # from inside a `while read` loop made psql swallow the loop's remaining
-    # input, and the manifest listed 1 of 2 tables.
-    run grep -n 'docker exec' "$REPO/lib/common.sh"
-    [[ "$output" != *"docker exec -i \"\$container\" psql"* ]]
-    run bash -c "grep -A3 '^psql_in()' '$REPO/lib/common.sh'"
-    [[ "$output" == *"/dev/null"* ]]
+@test "no engine's query helper attaches stdin (it would eat a caller's read loop)" {
+    # Regression guard for a real bug: with `docker exec -i`, calling the query
+    # helper from inside a `while read` loop made the client swallow the loop's
+    # remaining input, and the manifest listed 1 of 2 tables.
+    for engine in postgres mysql; do
+        run bash -c "grep -A3 '^eng_query' '$REPO/lib/$engine.sh'"
+        [[ "$output" == *"/dev/null"* ]]
+        [[ "$output" != *"docker exec -i \"\$container\""* ]]
+    done
 }
 
 # --- schema verification (v0.2) ---------------------------------------------
@@ -143,25 +146,81 @@ JSON
     [[ "$output" == *"4:cccc"* ]]
 }
 
-@test "every schema class has a deterministic, ORDER BY'd query" {
-    for class in indexes constraints sequences views routines triggers; do
-        run bash -c "source '$REPO/lib/common.sh'; schema_query $class"
-        [ "$status" -eq 0 ]
-        [[ "$output" == *"ORDER BY"* ]]
-        [[ "$output" == *"public"* ]]
+@test "every engine covers every schema class, with ORDER BY" {
+    # A class an engine forgets would silently never be compared.
+    for engine in postgres mysql; do
+        for class in indexes constraints sequences views routines triggers; do
+            run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/$engine.sh' | grep -c '^ *$class)'"
+            [ "$output" = "1" ]
+        done
+        run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/$engine.sh' | grep -c 'ORDER BY'"
+        [ "$output" -ge 6 ]
     done
 }
 
-@test "an unknown schema class is a loud error, not an empty digest" {
-    run bash -c "source '$REPO/lib/common.sh'; schema_query nonsense"
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"unknown object class"* ]]
+@test "an unknown schema class is a loud error in every engine" {
+    for engine in postgres mysql; do
+        run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/$engine.sh'"
+        [[ "$output" == *"unknown object class"* ]]
+    done
 }
 
-@test "sequences are compared with their last_value, not just their names" {
+@test "an unsupported engine is refused by name" {
+    run bash -c "source '$REPO/lib/common.sh'; load_engine oracle"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unsupported engine"* ]]
+}
+
+@test "each engine module defines the whole eng_* interface" {
+    # Adding an engine must not mean discovering a missing function at runtime,
+    # halfway through someone's restore.
+    for engine in postgres mysql; do
+        for fn in eng_boot eng_wait_ready eng_query eng_dump eng_restore \
+                  eng_archive_parses eng_list_tables eng_table_fingerprint \
+                  eng_schema_digest eng_count_tables eng_count_relations \
+                  eng_writable_probe_failures; do
+            run grep -c "^$fn()" "$REPO/lib/$engine.sh"
+            [ "$output" = "1" ]
+        done
+        run bash -c "grep -c '^ENG_NAME=\|^ENG_DEFAULT_IMAGE=\|^ENG_ARTEFACT_EXT=' '$REPO/lib/$engine.sh'"
+        [ "$output" = "3" ]
+    done
+}
+
+@test "Postgres compares sequences with their last_value" {
     # A sequence restored behind its data means the next INSERT collides.
-    run bash -c "source '$REPO/lib/common.sh'; schema_query sequences"
+    run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/postgres.sh'"
     [[ "$output" == *"last_value"* ]]
+}
+
+@test "MySQL fingerprints auto_increment EXISTENCE, never the counter value" {
+    # Measured on 8.4: information_schema rounds the counter (512/1024 while the
+    # real maxima were 500/800), so comparing it would raise false alarms.
+    run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/mysql.sh' | sed -n '/sequences)/,/;;/p'"
+    [[ "$output" == *"auto_increment"* ]]
+    [[ "$output" != *"IFNULL(auto_increment"* ]]
+}
+
+@test "MySQL defuses the group_concat_max_len trap twice over" {
+    # Default 1024 bytes: a fingerprint would cover 6% of the data and report OK.
+    run bash -c "sed -n '/^eng_table_fingerprint/,/^}/p' '$REPO/lib/mysql.sh'"
+    [[ "$output" == *"group_concat_max_len"* ]]   # raise the limit...
+    [[ "$output" == *"expected_len"* ]]           # ...and prove it was enough
+    [[ "$output" == *"TRUNCATED"* ]]
+}
+
+@test "MySQL always dumps routines (mysqldump omits them by default)" {
+    run bash -c "sed -n '/^eng_dump/,/^}/p' '$REPO/lib/mysql.sh'"
+    [[ "$output" == *"--routines"* ]]
+    [[ "$output" == *"--triggers"* ]]
+    [[ "$output" == *"--single-transaction"* ]]
+}
+
+@test "manifest_for handles both engines' extensions, plain and encrypted" {
+    run bash -c "source '$REPO/lib/common.sh'; manifest_for /b/a.sql; echo; manifest_for /b/a.sql.age"
+    [[ "$output" == *"/b/a.json"* ]]
+    run bash -c "source '$REPO/lib/common.sh'; a=\$(manifest_for /b/x.sql); b=\$(manifest_for /b/x.sql.age); [ \"\$a\" = \"\$b\" ]"
+    [ "$status" -eq 0 ]
 }
 
 @test "colour is suppressed when stdout is not a terminal" {
@@ -210,4 +269,26 @@ JSON
     run bash -c "grep -A6 'recip_args=()' '$REPO/backup.sh'"
     [[ "$output" == *"recip_args=(-R"* ]]
     [[ "$output" == *"recip_args=(-r"* ]]
+}
+
+@test "common.sh turns errtrace on, so ERR traps fire inside eng_* functions" {
+    # Regression guard for bug 8: without `set -E`, backup.sh's cleanup trap
+    # never fired when the dump failed INSIDE eng_dump(), and a failed dump left
+    # a plausible 0-byte artefact behind. Negative case 2 caught it.
+    run bash -c "source '$REPO/lib/common.sh'; set -o | grep errtrace"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *on* ]]
+}
+
+@test "break_fingerprint corrupts the md5 and keeps the row count intact" {
+    # The helper must track the manifest's fingerprint format. When the format
+    # grew a ':<rowcount>' suffix, the old 32-hex-only regex matched NOTHING,
+    # exited non-zero, and set -e killed the negative suite at case 4.
+    tmp=$(mktemp)
+    printf '{\n  "tables": {\n    "customers": "0123456789abcdef0123456789abcdef:500"\n  }\n}\n' > "$tmp"
+    run python3 "$REPO/test/break_fingerprint.py" "$tmp"
+    [ "$status" -eq 0 ]
+    run grep -c 'deadbeefdeadbeefdeadbeefdeadbeef:500' "$tmp"
+    [ "$output" = "1" ]
+    rm -f "$tmp"
 }

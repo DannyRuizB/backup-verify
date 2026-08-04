@@ -2,10 +2,10 @@
 # =============================================================================
 # verify.sh - prove a backup restores, by restoring it.
 #
-# Boots a THROWAWAY Postgres container, restores the artefact into it, and
-# compares every table's content fingerprint against the manifest written at
-# backup time. Nothing is trusted: not the file size, not the exit code of
-# pg_restore, not the presence of rows.
+# Boots a THROWAWAY database container (the engine is read from the manifest),
+# restores the artefact into it, and compares every table's content fingerprint
+# against the manifest written at backup time. Nothing is trusted: not the file
+# size, not the exit code of the restore tool, not the presence of rows.
 #
 # Why the whole content and not a row count: a TRUNCATED dump makes pg_restore
 # exit non-zero but STILL LEAVES THE TABLE POPULATED (measured on a real
@@ -19,7 +19,8 @@
 # Options:
 #   --manifest FILE   manifest produced by backup.sh (the artefact sits beside it)
 #   --identity FILE   age identity, required when the backup is encrypted
-#   --image IMAGE     Postgres image for the throwaway instance
+#   --image IMAGE     container image for the throwaway instance (engine default
+#                     if omitted)
 #   --keep-container  leave the throwaway container running (for debugging)
 #   -h, --help        this help
 #
@@ -31,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MANIFEST=""
 IDENTITY=""
-IMAGE="postgres:17-alpine"
+IMAGE=""  # engine default unless overridden
 KEEP_CONTAINER=0
 PROBE=""
 
@@ -90,7 +91,13 @@ main() {
     need sha256sum
     [ -f "$MANIFEST" ] || die "manifest not found: $MANIFEST"
 
-    local dir db artefact expected_sha expected_bytes
+    local dir db artefact expected_sha expected_bytes engine
+    # The manifest says which engine wrote it: verification never has to be told
+    # twice, and a Postgres backup cannot accidentally be checked as MySQL.
+    engine="$(json_str "$MANIFEST" engine)"
+    [ -n "$engine" ] || engine="postgres"   # schema 1/2 manifests predate the field
+    load_engine "$engine"
+    [ -n "$IMAGE" ] || IMAGE="$ENG_DEFAULT_IMAGE"
     dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
     db="$(json_str "$MANIFEST" database)"
     artefact="$dir/$(json_str "$MANIFEST" artefact)"
@@ -111,7 +118,7 @@ main() {
         warn '--identity given but this backup is not encrypted - ignoring it'
     fi
 
-    log "verifying backup of '$db' -> $(basename "$artefact")"
+    log "verifying $ENG_NAME backup of '$db' -> $(basename "$artefact")"
 
     # --- Gate 1: the artefact is byte-identical to what was backed up --------
     # Cheap, and it separates "the backup was born broken" from "the file rotted
@@ -133,12 +140,11 @@ main() {
     PROBE="bv-verify-$$"
     trap cleanup EXIT
     log "booting a throwaway $IMAGE as '$PROBE'"
-    docker run -d --name "$PROBE" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB="$db" \
-        "$IMAGE" >/dev/null
-    wait_for_postgres "$PROBE"
+    eng_boot "$PROBE" "$db" "$IMAGE"
+    eng_wait_ready "$PROBE"
 
     local pre
-    pre=$(psql_in "$PROBE" "$db" "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" | tr -d '\n')
+    pre=$(eng_count_relations "$PROBE" "$db" | tr -d '\n')
     [ "$pre" = "0" ] || die "the throwaway instance is not clean ($pre tables) - aborting"
     ok "throwaway instance is empty (0 tables)"
 
@@ -155,8 +161,7 @@ main() {
         # single exit code would blur.
         set +e
         age -d -i "$IDENTITY" "$artefact" \
-            | docker exec -i "$PROBE" pg_restore -U postgres -d "$db" --no-owner \
-              >/tmp/bv-restore-$$.log 2>&1
+            | eng_restore "$PROBE" "$db" >/tmp/bv-restore-$$.log 2>&1
         local -a rst=("${PIPESTATUS[@]}")
         set -e
         if [ "${rst[0]}" -ne 0 ]; then
@@ -167,29 +172,30 @@ main() {
         restore_rc=${rst[1]}
         ok 'decrypted with the given identity'
     else
-        docker exec -i "$PROBE" pg_restore -U postgres -d "$db" --no-owner \
-            < "$artefact" >/tmp/bv-restore-$$.log 2>&1 || restore_rc=$?
+        eng_restore "$PROBE" "$db" < "$artefact" >/tmp/bv-restore-$$.log 2>&1 || restore_rc=$?
     fi
     if [ "$restore_rc" -eq 0 ]; then
-        ok 'pg_restore finished cleanly'
+        ok 'the restore finished cleanly'
     else
-        warn "pg_restore exited $restore_rc - continuing, because the content comparison is what decides"
+        warn "the restore exited $restore_rc - continuing, because the content comparison is what decides"
         sed -n '1,5p' /tmp/bv-restore-$$.log | sed 's/^/      /'
     fi
     rm -f /tmp/bv-restore-$$.log
 
     # --- Gate 4: content, table by table ------------------------------------
-    local failures=0 checked=0 table expected actual
+    local failures=0 checked=0 table expected actual wline
     local -a missing=()
     while IFS=$'\t' read -r table expected; do
         [ -n "$table" ] || continue
         checked=$((checked + 1))
-        if ! actual=$(psql_in "$PROBE" "$db" "$(fingerprint_sql "\"$table\"")" 2>/dev/null | tr -d '\n'); then
+        if ! actual=$(eng_table_fingerprint "$PROBE" "$db" "$table" 2>/dev/null | tr -d '\n'); then
             missing+=("$table")
             printf '  %sFAIL%s %s - table absent from the restored copy\n' "$c_red" "$c_reset" "$table"
             failures=$((failures + 1))
             continue
         fi
+        assert_fingerprint "$table (restored copy)" "$actual"
+        assert_fingerprint "$table (manifest)" "$expected"
         if [ "$actual" = "$expected" ]; then
             printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$table"
         else
@@ -214,7 +220,7 @@ main() {
         printf '\n'
         while IFS=$'\t' read -r obj_class obj_expected; do
             [ -n "$obj_class" ] || continue
-            obj_actual=$(schema_digest "$PROBE" "$db" "$obj_class")
+            obj_actual=$(eng_schema_digest "$PROBE" "$db" "$obj_class")
             exp_count=${obj_expected%%:*}
             act_count=${obj_actual%%:*}
             if [ "$obj_actual" = "$obj_expected" ]; then
@@ -236,7 +242,7 @@ EOF
     # A restored copy with EXTRA tables is also a mismatch: it means the
     # artefact and the manifest describe different moments.
     local restored_count
-    restored_count=$(psql_in "$PROBE" "$db" "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" | tr -d '\n')
+    restored_count=$(eng_count_tables "$PROBE" "$db" | tr -d '\n')
     if [ "$restored_count" != "$checked" ]; then
         printf '  %sFAIL%s restored copy has %s tables, the manifest describes %s\n' \
             "$c_red" "$c_reset" "$restored_count" "$checked"
@@ -248,32 +254,30 @@ EOF
         die "VERIFICATION FAILED: $failures problem(s) across $checked table(s). This backup does NOT restore."
     fi
     # --- Gate 6: can the application actually WRITE to it? -------------------
-    # Deliberately LAST, after every comparison, because it modifies the
-    # restored copy. A sequence restored behind its data makes the next INSERT
-    # collide with the primary key: all the rows present, and the application
-    # broken on its first write. Cheap to check, and it is the question the
-    # person restoring a backup actually cares about.
-    local seq_line seq_name seq_tbl write_failures=0
-    while IFS= read -r seq_line; do
-        [ -n "$seq_line" ] || continue
-        seq_name=${seq_line%%|*}
-        seq_tbl=${seq_line##*|}
-        if psql_in "$PROBE" "$db" "INSERT INTO \"$seq_tbl\" DEFAULT VALUES;" >/dev/null 2>&1 \
-           || psql_in "$PROBE" "$db" "SELECT nextval('\"$seq_name\"');" >/dev/null 2>&1; then
-            :
-        else
-            printf '  %sFAIL%s sequence %s cannot produce a usable next value\n' \
-                "$c_red" "$c_reset" "$seq_name"
-            write_failures=$((write_failures + 1))
-        fi
-    done < <(psql_in "$PROBE" "$db" "SELECT s.sequencename||'|'||coalesce(t.relname,'') FROM pg_sequences s LEFT JOIN pg_class c ON c.relname = s.sequencename LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype = 'a' LEFT JOIN pg_class t ON t.oid = d.refobjid WHERE s.schemaname='public' ORDER BY 1;" 2>/dev/null || true)
-    if [ "$write_failures" -gt 0 ]; then
-        die "VERIFICATION FAILED: $write_failures sequence(s) unusable - the data is there but writes will collide."
+    # Deliberately LAST, after every comparison, because it may modify the
+    # restored copy. The engine module knows what to ask: Postgres advances each
+    # sequence, MySQL compares every AUTO_INCREMENT counter against the largest
+    # value its column actually holds. Both answer the same question - a counter
+    # restored BEHIND its data means every row is present and the application
+    # breaks on its first INSERT.
+    local write_problems=0
+    local -a write_msgs=()
+    while IFS= read -r wline; do
+        [ -n "$wline" ] || continue
+        write_msgs+=("$wline")
+    done < <(eng_writable_probe_failures "$PROBE" "$db" || true)
+    write_problems=${#write_msgs[@]}
+    if [ "$write_problems" -gt 0 ]; then
+        printf '\n'
+        for wline in "${write_msgs[@]}"; do
+            printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$wline"
+        done
+        die "VERIFICATION FAILED: $write_problems write problem(s) - the data is there but the next INSERT collides."
     fi
 
     ok "VERIFIED: $checked table(s) restored byte-for-byte identical to the source."
     if [ "$restore_rc" -ne 0 ]; then
-        warn "note: pg_restore exited $restore_rc yet the content matched - inspect before trusting"
+        warn "note: the restore exited $restore_rc yet the content matched - inspect before trusting"
     fi
 }
 
