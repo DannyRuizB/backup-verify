@@ -1,9 +1,11 @@
 name: ci
 
-# Three jobs, in order of how much they prove:
-#   lint      - the scripts parse and shellcheck is happy
-#   e2e       - a real Postgres is seeded, backed up, DESTROYED, and restored
-#   negative  - every way a backup lies is caught, and a good one still passes
+# Three stages, in order of how much they prove:
+#   lint      - the scripts parse, shellcheck is happy, the units pass
+#   e2e       - a real server (Postgres 17/16, MySQL 8.4; plain and encrypted)
+#               is seeded, backed up, DESTROYED, and restored
+#   negative  - every way a backup lies is caught on BOTH engines, and a good
+#               one still passes
 on:
   push:
     branches: [main]
@@ -24,12 +26,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Bash syntax
-        run: for f in backup.sh verify.sh lib/common.sh test/*.sh; do bash -n "$f"; done
+        run: for f in backup.sh verify.sh lib/*.sh test/*.sh; do bash -n "$f"; done
 
       - name: ShellCheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck >/dev/null
-          shellcheck -x backup.sh verify.sh lib/common.sh test/*.sh
+          shellcheck -x backup.sh verify.sh lib/*.sh test/*.sh
 
       - name: Unit tests (bats)
         run: |
@@ -37,15 +39,19 @@ jobs:
           bats test/
 
   e2e:
-    name: Seed, back up, DESTROY, restore, compare
+    name: e2e ${{ matrix.target.image }} ${{ matrix.mode }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # A backup format is a compatibility promise: prove it across versions.
-      # And encryption must not change the promise, so the same destruction
-      # test runs through age.
+      # Two promises proven at once. A backup format is a compatibility
+      # promise, so Postgres runs across versions and MySQL alongside them -
+      # every engine survives the same destruction test. And encryption must
+      # not change the promise, so the same cycle also runs through age.
       matrix:
-        image: ['postgres:17-alpine', 'postgres:16-alpine']
+        target:
+          - { engine: postgres, image: 'postgres:17-alpine' }
+          - { engine: postgres, image: 'postgres:16-alpine' }
+          - { engine: mysql, image: 'mysql:8.4' }
         mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
@@ -54,12 +60,19 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
       - name: e2e
         env:
-          BV_IMAGE: ${{ matrix.image }}
-        run: ./test/e2e.sh ${{ matrix.mode }}
+          BV_IMAGE: ${{ matrix.target.image }}
+        run: ./test/e2e.sh --engine ${{ matrix.target.engine }} ${{ matrix.mode }}
 
   negative:
-    name: Every failure mode is caught
+    name: Every failure mode is caught (${{ matrix.engine }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Both engines, because each contributes its own measured disaster to
+      # case 6: pg_dump -t on Postgres, mysqldump's routine-dropping DEFAULT
+      # invocation on MySQL.
+      matrix:
+        engine: [postgres, mysql]
     steps:
       - uses: actions/checkout@v5
       # Not optional: the encryption cases FAIL the suite if age is missing,
@@ -67,4 +80,4 @@ jobs:
       - name: Install age
         run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
       - name: negative cases
-        run: ./test/negative.sh
+        run: ./test/negative.sh --engine ${{ matrix.engine }}

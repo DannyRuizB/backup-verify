@@ -11,7 +11,9 @@ import sys
 
 manifest = sys.argv[1]
 text = open(manifest).read()
-new_text, n = re.subn(r'("customers":\s*")[0-9a-f]{32}(")',
+# Only the md5 half is corrupted; the ':<rowcount>' half is kept INTACT on
+# purpose, because that is the whole case: same row count, different content.
+new_text, n = re.subn(r'("customers":\s*")[0-9a-f]{32}(:\d+")',
                       r'\g<1>deadbeefdeadbeefdeadbeefdeadbeef\g<2>', text)
 if n != 1:
     raise SystemExit('expected exactly one customers fingerprint, replaced %d' % n)
