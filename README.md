@@ -3,15 +3,15 @@
 [![ci](https://github.com/DannyRuizB/backup-verify/actions/workflows/ci.yml/badge.svg)](https://github.com/DannyRuizB/backup-verify/actions/workflows/ci.yml)
 
 **A backup nobody has restored is not a backup, it is a hope.** This repo takes
-PostgreSQL and MySQL/MariaDB backups and then *proves they restore* — by
-restoring them into a throwaway instance and comparing the result against the
-source, table by table.
+PostgreSQL, MySQL/MariaDB and plain file-tree backups and then *proves they
+restore* — by restoring them into a throwaway instance and comparing the
+result against the source, table by table (or file by file).
 
 CI does the thing everyone talks about and almost nobody automates: it seeds a
-real server, backs it up, **destroys the database**, restores from the
-artefact, and checks the restored copy is identical. Then it does it again with
-a suite of deliberately broken backups to prove the checks actually catch them
-— on both engines.
+real source, backs it up, **destroys it**, restores from the artefact, and
+checks the restored copy is identical. Then it does it again with a suite of
+deliberately broken backups to prove the checks actually catch them — on every
+engine.
 
 ```bash
 ./backup.sh --container my-postgres --db app --out ./backups --keep 7
@@ -20,6 +20,9 @@ a suite of deliberately broken backups to prove the checks actually catch them
 # MySQL / MariaDB: same promise, same gates
 ./backup.sh --engine mysql --container my-mysql --db app --out ./backups
 # (verify.sh reads the engine from the manifest - no flag needed)
+
+# a directory tree: same promise, same gates, no Docker involved
+./backup.sh --engine files --path /srv/app --out ./backups
 
 # encrypted at rest, and proven to decrypt at backup time:
 age-keygen -o key.txt
@@ -116,12 +119,31 @@ And the official MySQL image boots **two** servers just like the Postgres one
 (init, shutdown, the real one), so the same wait rule applies to both: a real
 query must succeed three times in a row before anyone trusts the server.
 
+## File trees have their own ways of lying
+
+The third engine needed no database at all to earn its measurement table —
+every row below was observed on this machine before the module was written:
+
+| What looks fine | What is actually happening |
+|---|---|
+| The restore directory exists and has files in it | **A truncated `.tar.gz` extracts a partial tree.** tar exits 2, but the files it got to are on disk — and the one it was cut off inside has a plausible size (a 100 000-byte blob came back as 49 664). "It restored something" signs it off; only a per-file content hash does not. |
+| `tar czf backup.tgz *` exited 0 | **The glob never matched the dotfiles.** `.env` — the credentials — was simply not in the archive. No error, no warning. The engine dumps `.` instead, and negative case 6 proves a glob-built artefact is rejected with `.env - file absent`. |
+| The `.tgz` passes `gzip -t` | **A failing tar piped into gzip leaves a valid archive of nothing** — 45 bytes that decompress happily. Without `pipefail` the pipeline exits 0. Same family as the empty `pg_dump`; and an EMPTY source tree gives a valid 110-byte archive the same way, so backing up zero files is refused outright. |
+| The files came back, same names, same sizes | **Extraction without `-p` lets the umask strip modes**: 664 became 644 and a setgid 2775 shared directory came back 755 — silently no longer shared. (600 and 755 survive, which hides the problem in simple tests.) Restores here always use `-p`, and the `modes` class fingerprints every entry's mode so drift is named. |
+| Size and mtime match the manifest | **Same size + same mtime with different content fools every metadata comparison** — an rsync-style check calls the files identical. Fingerprints are `sha256:bytes`, so content is what decides. |
+
+The "schema objects" of a tree are its metadata, digested in three classes the
+way the database engines digest theirs: **modes** (every entry's permission
+bits — the umask lie), **symlinks** (a link turned into a copy is a different
+tree), and **dirs** (an empty directory a naive tool drops is still a loss).
+
 ## How it works
 
-**`backup.sh --engine postgres|mysql`** dumps with the engine's own tool
+**`backup.sh --engine postgres|mysql|files`** dumps with the engine's own tool
 (`pg_dump -Fc`; `mysqldump --single-transaction --routines --events
---triggers`) and writes a **manifest** beside the artefact: size, sha256, the
-engine, and one content fingerprint per table — the yardstick for later.
+--triggers`; `tar -cz .` — the dot, never the dotfile-dropping glob) and writes
+a **manifest** beside the artefact: size, sha256, the
+engine, and one content fingerprint per table (or file) — the yardstick for later.
 `verify.sh` reads the engine back from the manifest, so a Postgres backup can
 never be accidentally "verified" as MySQL. Everything engine-specific lives in
 `lib/postgres.sh` and `lib/mysql.sh` behind one `eng_*` interface — neither
@@ -158,16 +180,19 @@ trailing `Dump completed` line an interrupted dump never writes) is deleted.
 
 ## How it's tested
 
-- **`test/e2e.sh [--engine postgres|mysql] [--encrypted]`** — seed → back up →
-  **`docker rm -f` the source** → restore into a fresh instance → compare. The
+- **`test/e2e.sh [--engine postgres|mysql|files] [--encrypted]`** — seed →
+  back up → **destroy the source** (`docker rm -f`, or `rm -rf` of the tree) →
+  restore into a fresh instance → compare. The
   destruction is the point: it removes the possibility of accidentally
   verifying against the original.
-- **`test/negative.sh [--engine postgres|mysql]`** — eleven cases *per engine*:
+- **`test/negative.sh [--engine postgres|mysql|files]`** — eleven cases *per
+  engine*:
   truncated archive, un-runnable dump, post-backup corruption, matching row
-  count with different content, **every row restored with the schema silently
-  gone** (Postgres: a `pg_dump -t` tables-only artefact; MySQL: a dump made
+  count with different content, **everything restored with the silent loss
+  intact** (Postgres: a `pg_dump -t` tables-only artefact; MySQL: a dump made
   with mysqldump's own **default** invocation, rejected for exactly
-  `routines - expected 2, restored copy has 0`), five encryption cases (real
+  `routines - expected 2, restored copy has 0`; files: a `tar czf backup.tgz *`
+  artefact, rejected for exactly `.env - file absent`), five encryption cases (real
   ciphertext on disk with no plaintext header in the clear, verification
   refusing without a key, the **wrong** key failing at decryption and told
   apart from a bad archive, a truncated ciphertext that cannot decrypt at all,
@@ -178,14 +203,17 @@ trailing `Dump completed` line an interrupted dump never writes) is deleted.
   gate, and a counter-based directory name let case 5 read case 4's corrupted
   file.
 - **`test/seed.sh`** — ONE seed shared by both suites, per engine, after a
-  negative case went green against a different shape and proved nothing. Every
-  engine gets the same things to lose: two tables (PK, UNIQUE, CHECK, FK), an
-  index, a view, routines and a trigger.
-- **`test/backup.bats`** — 29 unit tests over argument parsing, manifest
+  negative case went green against a different shape and proved nothing. The
+  database engines get the same things to lose: two tables (PK, UNIQUE, CHECK,
+  FK), an index, a view, routines and a trigger. The files tree gets what a
+  naive file backup is measured to lose: a dotfile, a 100 KB blob, a setgid
+  shared directory, a group-writable file, a symlink and an empty directory.
+- **`test/backup.bats`** — unit tests over argument parsing, manifest
   reading, the schema queries, the `eng_*` interface, and the regression guards
   described below.
-- CI runs the e2e against **Postgres 17, Postgres 16 and MySQL 8.4, plain and
-  encrypted** (six combinations) plus the negative suite per engine, and on a
+- CI runs the e2e against **Postgres 17, Postgres 16, MySQL 8.4 and a file
+  tree, plain and encrypted** (eight combinations) plus the negative suite per
+  engine, and on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
   a skip path — a missing tool fails the suite rather than reporting green on
@@ -266,11 +294,11 @@ into the `for` with `nullglob`.
 
 ## Scope
 
-PostgreSQL and MySQL/MariaDB, via Docker containers: table contents, schema
-objects, encryption at rest, and whether the restored copy can be written to.
-Deliberately not here yet: filesystem archives, off-site upload, and
-point-in-time recovery with WAL archiving — all on the roadmap, none pretended
-to work today.
+PostgreSQL and MySQL/MariaDB via Docker containers, and plain directory trees
+via `--engine files`: contents, schema objects (or file metadata), encryption
+at rest, and whether the restored copy is actually usable. Deliberately not
+here yet: off-site upload and point-in-time recovery with WAL archiving — on
+the roadmap, none pretended to work today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

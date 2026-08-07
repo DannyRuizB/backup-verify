@@ -34,12 +34,13 @@ ENGINE="postgres"
 while [ $# -gt 0 ]; do
     case "$1" in
         --engine) ENGINE="${2:-}"; shift 2;;
-        *)        die "unknown option: $1 (usage: negative.sh [--engine postgres|mysql])";;
+        *)        die "unknown option: $1 (usage: negative.sh [--engine postgres|mysql|files])";;
     esac
 done
 load_engine "$ENGINE"
 
 SRC=bv-neg-src
+SRC_DIR=""
 OUT=$(mktemp -d)
 IMAGE="${BV_IMAGE:-$ENG_DEFAULT_IMAGE}"
 EXT="$ENG_ARTEFACT_EXT"
@@ -49,20 +50,31 @@ pass_case() { printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$1"; }
 fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAILURES + 1)); }
 
 cleanup() {
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
-    docker ps -aq --filter "name=bv-verify-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    if [ "$ENG_NAME" = files ]; then
+        if [ -n "$SRC_DIR" ]; then rm -rf "$SRC_DIR"; fi
+        rm -rf "${TMPDIR:-/tmp}"/bv-files-bv-verify-* 2>/dev/null || true
+    else
+        docker rm -f "$SRC" >/dev/null 2>&1 || true
+        docker ps -aq --filter "name=bv-verify-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    fi
     rm -rf "$OUT"
 }
 trap cleanup EXIT
 
-log "booting a source database with data ($ENG_NAME, $IMAGE)"
-docker rm -f "$SRC" >/dev/null 2>&1 || true
-eng_boot "$SRC" app "$IMAGE"
-eng_wait_ready "$SRC"
 # The seed is SHARED with the e2e (test/seed.sh) since the day case 6 passed
 # while proving nothing: this suite had seeded one bare table, so a tables-only
 # dump had no view or function to lose. Same shape, structurally.
-"seed_$ENG_NAME" "$SRC" app
+if [ "$ENG_NAME" = files ]; then
+    SRC_DIR=$(mktemp -d)
+    log "seeding a source file tree ($SRC_DIR)"
+    seed_files "$SRC_DIR"
+else
+    log "booting a source database with data ($ENG_NAME, $IMAGE)"
+    docker rm -f "$SRC" >/dev/null 2>&1 || true
+    eng_boot "$SRC" app "$IMAGE"
+    eng_wait_ready "$SRC"
+    "seed_$ENG_NAME" "$SRC" app
+fi
 
 # Each case gets its OWN fresh backup. Sharing one artefact across cases meant
 # case 4 inherited the size/sha that the case-1 edit had aligned to a TRUNCATED
@@ -78,7 +90,11 @@ eng_wait_ready "$SRC"
 fresh_backup() {
     local dir
     dir=$(mktemp -d "$OUT/caseXXXXXX")
-    ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$dir" >/dev/null
+    if [ "$ENG_NAME" = files ]; then
+        ./backup.sh --engine "$ENGINE" --path "$SRC_DIR" --db app --out "$dir" >/dev/null
+    else
+        ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$dir" >/dev/null
+    fi
     # Exactly one backup lives in this directory, so this is unambiguous.
     find "$dir" -name '*.json' | head -1
 }
@@ -112,7 +128,7 @@ if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c1.log" 2>&1; then
     fail_case 'a truncated archive was accepted as a good backup'
     sed -n '1,12p' "$OUT/c1.log" | sed 's/^/        /'
 else
-    if grep -qE 'fingerprint differs|table absent|restored copy has' "$OUT/c1.log"; then
+    if grep -qE 'fingerprint differs|absent from the restored|restored copy has' "$OUT/c1.log"; then
         pass_case 'truncated archive REJECTED by the content comparison'
         # The evidence for why counting rows is not enough:
         if grep -q 'the restore exited' "$OUT/c1.log"; then
@@ -128,14 +144,36 @@ printf '\n'
 echo '== Case 2: empty artefact (the failed-dump signature) =='
 # backup.sh must never create one: a dump of a database that does not exist
 # leaves 0 bytes, and piped through gzip, ~20 bytes of valid empty archive.
-if ./backup.sh --engine "$ENGINE" --container "$SRC" --db nosuchdb --out "$OUT" >"$OUT/c2.log" 2>&1; then
-    fail_case 'backup.sh reported success for a database that does not exist'
-else
-    pass_case 'backup.sh fails on a dump that cannot run'
-    if find "$OUT" -name 'nosuchdb_*' | grep -q .; then
-        fail_case 'and it left an artefact behind'
+# The files version of the same lie, both measured: a missing source, and an
+# EMPTY source - tar of an empty directory exits 0 with a valid 110-byte
+# archive that guards exactly nothing.
+if [ "$ENG_NAME" = files ]; then
+    if ./backup.sh --engine "$ENGINE" --path "$OUT/does-not-exist" --out "$OUT" >"$OUT/c2.log" 2>&1; then
+        fail_case 'backup.sh reported success for a source directory that does not exist'
     else
-        pass_case '...and leaves no plausible-looking artefact behind'
+        pass_case 'backup.sh fails on a source that is not there'
+    fi
+    EMPTY_SRC=$(mktemp -d "$OUT/emptyXXXXXX")
+    if ./backup.sh --engine "$ENGINE" --path "$EMPTY_SRC" --db emptyset --out "$OUT" >"$OUT/c2b.log" 2>&1; then
+        fail_case 'backup.sh called a valid archive of an EMPTY directory a backup'
+    else
+        pass_case 'backup.sh refuses to back up an empty tree (a backup of nothing is nothing)'
+        if find "$OUT" -maxdepth 1 -name 'emptyset_*' | grep -q .; then
+            fail_case 'and it left an artefact behind'
+        else
+            pass_case '...and leaves no plausible-looking artefact behind'
+        fi
+    fi
+else
+    if ./backup.sh --engine "$ENGINE" --container "$SRC" --db nosuchdb --out "$OUT" >"$OUT/c2.log" 2>&1; then
+        fail_case 'backup.sh reported success for a database that does not exist'
+    else
+        pass_case 'backup.sh fails on a dump that cannot run'
+        if find "$OUT" -name 'nosuchdb_*' | grep -q .; then
+            fail_case 'and it left an artefact behind'
+        else
+            pass_case '...and leaves no plausible-looking artefact behind'
+        fi
     fi
 fi
 printf '\n'
@@ -159,8 +197,14 @@ printf '\n'
 echo '== Case 4: same row count, different content =='
 # Rewriting one fingerprint is the same comparison that happens when a restore
 # silently drops a value while keeping the row: counts match, content does not.
+# For files this is the measured same-size-same-mtime edit: every metadata
+# comparison calls the two files identical, only the hash disagrees.
 MANIFEST=$(fresh_backup)
-python3 "$SCRIPT_DIR/break_fingerprint.py" "$MANIFEST"
+if [ "$ENG_NAME" = files ]; then
+    python3 "$SCRIPT_DIR/break_fingerprint.py" "$MANIFEST" "config/nginx.conf"
+else
+    python3 "$SCRIPT_DIR/break_fingerprint.py" "$MANIFEST"
+fi
 if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c4.log" 2>&1; then
     fail_case 'a content mismatch passed verification'
 else
@@ -184,13 +228,16 @@ fi
 
 echo '== Case 6: every row restored, schema silently gone =='
 # The most dangerous artefact of all, and entirely realistic - each engine has
-# its own version, both measured:
+# its own version, all measured:
 #   Postgres: a cron that says `pg_dump -t customers -t orders` because someone
 #   only cared about the tables. Exit 0, every row, and it drops the indexes,
 #   constraints, view, functions and trigger.
 #   MySQL: `mysqldump` run WITHOUT --routines - the DEFAULT invocation - which
 #   silently omits every function and procedure. Exit 0, no warning. Before
 #   schema verification existed, this repo called both of these VERIFIED.
+#   Files: `tar czf backup.tgz *` - the invocation in half the tutorials on
+#   the internet - which silently drops every dotfile. The .env with the
+#   credentials is the first thing the backup loses, exit code 0.
 MANIFEST=$(fresh_backup)
 ARTEFACT="${MANIFEST%.json}$EXT"
 case "$ENG_NAME" in
@@ -204,27 +251,35 @@ case "$ENG_NAME" in
         # tables, view and trigger survive; the function and procedure vanish.
         docker exec -e MYSQL_PWD=verify "$SRC" mysqldump -uroot \
             --single-transaction --databases app < /dev/null > "$ARTEFACT";;
+    files)
+        # The glob expands to everything EXCEPT the dotfiles - measured: .env
+        # was simply not in the archive, and tar exited 0.
+        (cd "$SRC_DIR" && tar -czf - -- *) > "$ARTEFACT";;
 esac
 realign_manifest "$MANIFEST"
 # What the rejection must SAY, per engine. MySQL is pinned to the exact numbers
 # because only the routines differ there (triggers and the view survive a
 # default mysqldump): a looser pattern could pass on the wrong signal.
 case "$ENG_NAME" in
-    postgres) C6_PAT='indexes - expected|constraints - expected|views - expected|routines - expected';;
-    mysql)    C6_PAT='routines - expected 2, restored copy has 0';;
+    postgres) C6_PAT='indexes - expected|constraints - expected|views - expected|routines - expected'
+              C6_OK='OK   customers';;
+    mysql)    C6_PAT='routines - expected 2, restored copy has 0'
+              C6_OK='OK   customers';;
+    files)    C6_PAT='\.env - file absent'
+              C6_OK='OK   config/nginx.conf';;
 esac
 if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c6.log" 2>&1; then
-    fail_case 'a schema-stripped artefact passed verification (the loss went unnoticed)'
+    fail_case 'a stripped artefact passed verification (the loss went unnoticed)'
     sed -n '1,20p' "$OUT/c6.log" | sed 's/^/        /'
 else
     if grep -qE "$C6_PAT" "$OUT/c6.log"; then
-        pass_case 'schema loss caught by the object comparison'
-        # The point worth shouting about: the DATA was fine.
-        if grep -q 'OK   customers' "$OUT/c6.log"; then
-            pass_case '...while the table it did restore matched row for row'
+        pass_case 'the silent loss was caught and NAMED'
+        # The point worth shouting about: what the artefact did carry was fine.
+        if grep -q "$C6_OK" "$OUT/c6.log"; then
+            pass_case '...while the content it did restore matched byte for byte'
         fi
     else
-        fail_case 'rejected, but not by the schema comparison'
+        fail_case 'rejected, but not for the right reason'
         sed -n '1,20p' "$OUT/c6.log" | sed 's/^/        /'
     fi
 fi
@@ -234,18 +289,27 @@ echo '== Cases 7-11: encryption (a backup you cannot decrypt is not a backup) ==
 if ! command -v age >/dev/null 2>&1; then
     fail_case 'age is not installed - the encryption cases could not run (they are not optional)'
 else
-    # What a LEAKED plaintext of this engine starts with - the string that must
-    # never be readable in the artefact on disk.
+    # What a LEAKED plaintext of this engine starts with - the signature that
+    # must never appear in the artefact on disk. The files plaintext is a
+    # gzip stream, so its signature is the two magic bytes, checked as hex.
     case "$ENG_NAME" in
         postgres) PLAIN_SIG='PGDMP';;
         mysql)    PLAIN_SIG='MySQL dump';;
+        files)    PLAIN_SIG='';;
     esac
     KEYDIR=$(mktemp -d "$OUT/keysXXXXXX")
     age-keygen -o "$KEYDIR/good.txt" 2>/dev/null
     age-keygen -o "$KEYDIR/other.txt" 2>/dev/null
     GOOD_RECIP=$(grep 'public key' "$KEYDIR/good.txt" | sed 's/.*: //')
+    # The same source arguments fresh_backup uses - built once, so the
+    # encrypted invocations cannot drift from the plain ones.
+    if [ "$ENG_NAME" = files ]; then
+        SRC_ARGS=(--path "$SRC_DIR" --db app)
+    else
+        SRC_ARGS=(--container "$SRC" --db app)
+    fi
     ENCDIR=$(mktemp -d "$OUT/encXXXXXX")
-    ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$ENCDIR" \
+    ./backup.sh --engine "$ENGINE" "${SRC_ARGS[@]}" --out "$ENCDIR" \
         --recipient "$GOOD_RECIP" --identity "$KEYDIR/good.txt" >/dev/null
     ENCMAN=$(find "$ENCDIR" -name '*.json' | head -1)
     ENCART="${ENCMAN%.json}$EXT.age"
@@ -256,7 +320,13 @@ else
     else
         fail_case "no age ciphertext at $ENCART"
     fi
-    if head -c 200 "$ENCART" | grep -q "$PLAIN_SIG"; then
+    if [ "$ENG_NAME" = files ]; then
+        if [ "$(head -c 2 "$ENCART" | od -An -tx1 | tr -d ' \n')" = "1f8b" ]; then
+            fail_case 'the artefact begins with the gzip magic - the payload is plaintext'
+        else
+            pass_case '...with no gzip magic in the clear (the payload is real ciphertext)'
+        fi
+    elif head -c 200 "$ENCART" | grep -q "$PLAIN_SIG"; then
         fail_case 'the plaintext dump header is visible in the artefact'
     else
         pass_case '...with no plaintext dump header in the clear'
@@ -299,7 +369,7 @@ else
 
     # 11: and the good encrypted backup still verifies end to end.
     ENCDIR2=$(mktemp -d "$OUT/enc2XXXXXX")
-    ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$ENCDIR2" \
+    ./backup.sh --engine "$ENGINE" "${SRC_ARGS[@]}" --out "$ENCDIR2" \
         --recipient "$GOOD_RECIP" --identity "$KEYDIR/good.txt" >/dev/null
     ENCMAN2=$(find "$ENCDIR2" -name '*.json' | head -1)
     if ./verify.sh --manifest "$ENCMAN2" --identity "$KEYDIR/good.txt" --image "$IMAGE" >"$OUT/c10.log" 2>&1; then

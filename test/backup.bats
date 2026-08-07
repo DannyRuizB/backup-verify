@@ -19,7 +19,30 @@ setup() {
 @test "backup.sh refuses to run without --container" {
     run bash -c "source '$REPO/backup.sh'; parse_args --db app"
     [ "$status" -ne 0 ]
-    [[ "$output" == *"--container is required"* ]]
+    [[ "$output" == *"--container (or --path) is required"* ]]
+}
+
+@test "backup.sh --path sets the source and derives the dataset name" {
+    dir=$(mktemp -d)
+    mkdir "$dir/webroot"
+    run bash -c "source '$REPO/backup.sh'; parse_args --engine files --path '$dir/webroot'; echo \"\$CONTAINER \$DB\""
+    [ "$status" -eq 0 ]
+    [ "$output" = "$dir/webroot webroot" ]
+    rm -rf "$dir"
+}
+
+@test "backup.sh refuses --path and --container together" {
+    dir=$(mktemp -d)
+    run bash -c "source '$REPO/backup.sh'; parse_args --container c --path '$dir'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"two different sources"* ]]
+    rm -rf "$dir"
+}
+
+@test "backup.sh refuses a --path that does not exist" {
+    run bash -c "source '$REPO/backup.sh'; parse_args --engine files --path /no/such/dir"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
 }
 
 @test "backup.sh refuses to run without --db" {
@@ -174,17 +197,69 @@ JSON
 @test "each engine module defines the whole eng_* interface" {
     # Adding an engine must not mean discovering a missing function at runtime,
     # halfway through someone's restore.
-    for engine in postgres mysql; do
-        for fn in eng_boot eng_wait_ready eng_query eng_dump eng_restore \
-                  eng_archive_parses eng_list_tables eng_table_fingerprint \
-                  eng_schema_digest eng_count_tables eng_count_relations \
-                  eng_writable_probe_failures; do
+    for engine in postgres mysql files; do
+        for fn in eng_preflight eng_boot eng_wait_ready eng_query eng_dump \
+                  eng_restore eng_archive_parses eng_list_tables \
+                  eng_table_fingerprint eng_schema_digest eng_count_tables \
+                  eng_count_relations eng_writable_probe_failures eng_teardown; do
             run grep -c "^$fn()" "$REPO/lib/$engine.sh"
             [ "$output" = "1" ]
         done
-        run bash -c "grep -c '^ENG_NAME=\|^ENG_DEFAULT_IMAGE=\|^ENG_ARTEFACT_EXT=' '$REPO/lib/$engine.sh'"
-        [ "$output" = "3" ]
+        run bash -c "grep -c '^ENG_NAME=\|^ENG_DEFAULT_IMAGE=\|^ENG_ARTEFACT_EXT=\|^ENG_UNIT=' '$REPO/lib/$engine.sh'"
+        [ "$output" = "4" ]
     done
+}
+
+@test "files engine: a probe name maps under /tmp, an absolute path stays itself" {
+    # eng_teardown does rm -rf on what files_root returns - this mapping is
+    # the one thing standing between cleanup and deleting a user's source.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/files.sh'; files_root bv-verify-123; echo; files_root /srv/app"
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "${TMPDIR:-/tmp}/bv-files-bv-verify-123" ]
+    [ "${lines[1]}" = "/srv/app" ]
+}
+
+@test "files engine: teardown never removes an absolute (user-supplied) path" {
+    dir=$(mktemp -d)
+    touch "$dir/precious"
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/files.sh'; eng_teardown '$dir'"
+    [ "$status" -eq 0 ]
+    [ -f "$dir/precious" ]
+    rm -rf "$dir"
+    # ...while a derived scratch root IS removed
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/files.sh';
+        eng_boot probe-bats-$$; [ -d \"\$(files_root probe-bats-$$)\" ] || exit 1;
+        eng_teardown probe-bats-$$; [ ! -d \"\$(files_root probe-bats-$$)\" ]"
+    [ "$status" -eq 0 ]
+}
+
+@test "files engine: fingerprints are sha256:bytes and pass the fingerprint guard" {
+    dir=$(mktemp -d)
+    printf 'hello\n' > "$dir/f.txt"
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/files.sh';
+        fp=\$(eng_table_fingerprint '$dir' ignored f.txt); assert_fingerprint f.txt \"\$fp\"; printf '%s' \"\$fp\""
+    [ "$status" -eq 0 ]
+    [ "$output" = "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03:6" ]
+    # an absent file is a non-zero return, which verify reads as "absent"
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/files.sh'; eng_table_fingerprint '$dir' ignored missing.txt"
+    [ "$status" -ne 0 ]
+    rm -rf "$dir"
+}
+
+@test "files engine: file names the manifest cannot represent are refused" {
+    dir=$(mktemp -d)
+    touch "$dir/ok.txt" "$dir/"'bad"name.txt'
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/files.sh'; eng_list_tables '$dir' ignored"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot represent"* ]]
+    rm -rf "$dir"
+}
+
+@test "manifest_for maps every artefact form, files engine included" {
+    run bash -c "source '$REPO/lib/common.sh'; manifest_for backups/app_1.tar.gz; echo; manifest_for backups/app_1.tar.gz.age"
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "backups/app_1.json" ]
+    [ "${lines[1]}" = "backups/app_1.json" ]
 }
 
 @test "Postgres compares sequences with their last_value" {

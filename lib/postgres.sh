@@ -11,12 +11,26 @@ ENG_NAME="postgres"
 ENG_DEFAULT_IMAGE="postgres:17-alpine"
 # shellcheck disable=SC2034  # read by backup.sh/verify.sh, which source this
 ENG_ARTEFACT_EXT=".dump"
+# shellcheck disable=SC2034  # used in user-facing messages
+ENG_UNIT="table"
+
+# Backup-side preconditions: the tools exist and the source is reachable.
+eng_preflight() {
+    need docker
+    docker inspect "$1" >/dev/null 2>&1 || die "container '$1' not found"
+}
 
 # Boot a throwaway instance of this engine.
 eng_boot() {
+    need docker
     local name="$1" db="$2" image="$3"
     docker run -d --name "$name" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB="$db" \
         "$image" >/dev/null
+}
+
+# Remove the throwaway instance.
+eng_teardown() {
+    docker rm -f "$1" >/dev/null 2>&1 || true
 }
 
 # Wait until the server is *really* ready.
