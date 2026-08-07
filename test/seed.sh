@@ -84,3 +84,26 @@ INSERT INTO orders (customer_id, total, note)
   SELECT (n % 500) + 1, ROUND(n * 1.37, 2), CONCAT('pedido ', n) FROM g;
 SQL
 }
+
+# The files tree gets the same treatment: everything a naive file backup is
+# MEASURED to lose. A dotfile (the glob invocation drops it), a 100KB blob
+# (a truncated archive leaves a partial copy with a plausible size), a
+# group-writable file and a setgid shared directory (extraction without -p
+# strips both), a symlink (a copy-based tool turns it into a second file) and
+# an empty directory (glob backups skip it).
+seed_files() {
+    local dir="$1"
+    mkdir -p "$dir/config" "$dir/data" "$dir/shared" "$dir/empty-dir"
+    printf 'DB_PASS=hunter2\nAPI_KEY=sk-not-really\n' > "$dir/.env"
+    chmod 600 "$dir/.env"
+    printf 'server {\n  listen 80;\n  root /var/www;\n}\n' > "$dir/config/nginx.conf"
+    # Deterministic bulk content: big enough that a half archive cuts through
+    # it, and not from /dev/urandom so reruns are comparable.
+    seq 1 20000 > "$dir/data/blob.bin"
+    printf '#!/bin/sh\necho running\n' > "$dir/run.sh"
+    chmod 755 "$dir/run.sh"
+    printf 'shared notes\n' > "$dir/shared/group-file"
+    chmod 664 "$dir/shared/group-file"
+    chmod 2775 "$dir/shared"
+    ln -s config/nginx.conf "$dir/current.conf"
+}

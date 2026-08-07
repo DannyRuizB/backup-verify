@@ -26,14 +26,28 @@ ENG_NAME="mysql"
 ENG_DEFAULT_IMAGE="mysql:8.4"
 # shellcheck disable=SC2034  # read by backup.sh/verify.sh, which source this
 ENG_ARTEFACT_EXT=".sql"
+# shellcheck disable=SC2034  # used in user-facing messages
+ENG_UNIT="table"
 
 # MYSQL_PWD is used throughout instead of -p: a password on the command line is
 # visible to every user on the box via the process list.
 
+# Backup-side preconditions: the tools exist and the source is reachable.
+eng_preflight() {
+    need docker
+    docker inspect "$1" >/dev/null 2>&1 || die "container '$1' not found"
+}
+
 eng_boot() {
+    need docker
     local name="$1" db="$2" image="$3"
     docker run -d --name "$name" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE="$db" \
         "$image" >/dev/null
+}
+
+# Remove the throwaway instance.
+eng_teardown() {
+    docker rm -f "$1" >/dev/null 2>&1 || true
 }
 
 # MySQL's official image also starts twice (init server, then the real one) -

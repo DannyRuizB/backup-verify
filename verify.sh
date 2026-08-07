@@ -2,8 +2,9 @@
 # =============================================================================
 # verify.sh - prove a backup restores, by restoring it.
 #
-# Boots a THROWAWAY database container (the engine is read from the manifest),
-# restores the artefact into it, and compares every table's content fingerprint
+# Boots a THROWAWAY instance (a database container, or a scratch directory
+# for the files engine - the engine is read from the manifest), restores the
+# artefact into it, and compares every table's or file's content fingerprint
 # against the manifest written at backup time. Nothing is trusted: not the file
 # size, not the exit code of the restore tool, not the presence of rows.
 #
@@ -79,15 +80,16 @@ manifest_section() {
 manifest_tables() { manifest_section "$1" tables; }
 
 cleanup() {
+    # The engine knows what its throwaway instance is (a container, a scratch
+    # directory) and how to remove it. It never touches a user-supplied path.
     if [ -n "$PROBE" ] && [ "$KEEP_CONTAINER" -eq 0 ]; then
-        docker rm -f "$PROBE" >/dev/null 2>&1 || true
+        eng_teardown "$PROBE"
     elif [ -n "$PROBE" ]; then
-        warn "throwaway container left running: $PROBE"
+        warn "throwaway instance left in place: $PROBE"
     fi
 }
 
 main() {
-    need docker
     need sha256sum
     [ -f "$MANIFEST" ] || die "manifest not found: $MANIFEST"
 
@@ -145,8 +147,8 @@ main() {
 
     local pre
     pre=$(eng_count_relations "$PROBE" "$db" | tr -d '\n')
-    [ "$pre" = "0" ] || die "the throwaway instance is not clean ($pre tables) - aborting"
-    ok "throwaway instance is empty (0 tables)"
+    [ "$pre" = "0" ] || die "the throwaway instance is not clean ($pre ${ENG_UNIT}s) - aborting"
+    ok "throwaway instance is empty (0 ${ENG_UNIT}s)"
 
     # --- Gate 3: the restore itself -----------------------------------------
     # The exit code is recorded but NOT treated as the answer: a truncated
@@ -190,7 +192,7 @@ main() {
         checked=$((checked + 1))
         if ! actual=$(eng_table_fingerprint "$PROBE" "$db" "$table" 2>/dev/null | tr -d '\n'); then
             missing+=("$table")
-            printf '  %sFAIL%s %s - table absent from the restored copy\n' "$c_red" "$c_reset" "$table"
+            printf '  %sFAIL%s %s - %s absent from the restored copy\n' "$c_red" "$c_reset" "$table" "$ENG_UNIT"
             failures=$((failures + 1))
             continue
         fi
@@ -205,7 +207,7 @@ main() {
         fi
     done < <(manifest_tables "$MANIFEST")
 
-    [ "$checked" -gt 0 ] || die 'the manifest lists no tables - nothing was verified, so nothing is proven'
+    [ "$checked" -gt 0 ] || die "the manifest lists no ${ENG_UNIT}s - nothing was verified, so nothing is proven"
 
     # --- Gate 5: schema objects ---------------------------------------------
     # Rows are half the database. Measured: `pg_restore -t a -t b` exits 0 with
@@ -244,14 +246,14 @@ EOF
     local restored_count
     restored_count=$(eng_count_tables "$PROBE" "$db" | tr -d '\n')
     if [ "$restored_count" != "$checked" ]; then
-        printf '  %sFAIL%s restored copy has %s tables, the manifest describes %s\n' \
-            "$c_red" "$c_reset" "$restored_count" "$checked"
+        printf '  %sFAIL%s restored copy has %s %ss, the manifest describes %s\n' \
+            "$c_red" "$c_reset" "$restored_count" "$ENG_UNIT" "$checked"
         failures=$((failures + 1))
     fi
 
     printf '\n'
     if [ "$failures" -gt 0 ]; then
-        die "VERIFICATION FAILED: $failures problem(s) across $checked table(s). This backup does NOT restore."
+        die "VERIFICATION FAILED: $failures problem(s) across $checked ${ENG_UNIT}(s). This backup does NOT restore."
     fi
     # --- Gate 6: can the application actually WRITE to it? -------------------
     # Deliberately LAST, after every comparison, because it may modify the
@@ -275,7 +277,7 @@ EOF
         die "VERIFICATION FAILED: $write_problems write problem(s) - the data is there but the next INSERT collides."
     fi
 
-    ok "VERIFIED: $checked table(s) restored byte-for-byte identical to the source."
+    ok "VERIFIED: $checked ${ENG_UNIT}(s) restored byte-for-byte identical to the source."
     if [ "$restore_rc" -ne 0 ]; then
         warn "note: the restore exited $restore_rc yet the content matched - inspect before trusting"
     fi

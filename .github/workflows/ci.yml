@@ -2,9 +2,9 @@ name: ci
 
 # Three stages, in order of how much they prove:
 #   lint      - the scripts parse, shellcheck is happy, the units pass
-#   e2e       - a real server (Postgres 17/16, MySQL 8.4; plain and encrypted)
-#               is seeded, backed up, DESTROYED, and restored
-#   negative  - every way a backup lies is caught on BOTH engines, and a good
+#   e2e       - a real source (Postgres 17/16, MySQL 8.4, a file tree; plain
+#               and encrypted) is seeded, backed up, DESTROYED, and restored
+#   negative  - every way a backup lies is caught on EVERY engine, and a good
 #               one still passes
 on:
   push:
@@ -52,6 +52,9 @@ jobs:
           - { engine: postgres, image: 'postgres:17-alpine' }
           - { engine: postgres, image: 'postgres:16-alpine' }
           - { engine: mysql, image: 'mysql:8.4' }
+          # No image at all: the files engine restores into a scratch
+          # directory. Same destruction test, no Docker involved.
+          - { engine: files, image: 'scratch-dir' }
         mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
@@ -68,11 +71,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # Both engines, because each contributes its own measured disaster to
+      # Every engine, because each contributes its own measured disaster to
       # case 6: pg_dump -t on Postgres, mysqldump's routine-dropping DEFAULT
-      # invocation on MySQL.
+      # invocation on MySQL, and the dotfile-dropping `tar czf backup.tgz *`
+      # on files.
       matrix:
-        engine: [postgres, mysql]
+        engine: [postgres, mysql, files]
     steps:
       - uses: actions/checkout@v5
       # Not optional: the encryption cases FAIL the suite if age is missing,

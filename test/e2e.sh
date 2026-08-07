@@ -23,26 +23,51 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --engine)    ENGINE="${2:-}"; shift 2;;
         --encrypted) ENCRYPTED=1; shift;;
-        *)           die "unknown option: $1 (usage: e2e.sh [--engine postgres|mysql] [--encrypted])";;
+        *)           die "unknown option: $1 (usage: e2e.sh [--engine postgres|mysql|files] [--encrypted])";;
     esac
 done
 load_engine "$ENGINE"
 
 SRC=bv-e2e-src
+SRC_DIR=""
 OUT=$(mktemp -d)
 IMAGE="${BV_IMAGE:-$ENG_DEFAULT_IMAGE}"
 
-cleanup() { docker rm -f "$SRC" >/dev/null 2>&1 || true; rm -rf "$OUT"; }
+cleanup() {
+    if [ "$ENG_NAME" = files ]; then
+        if [ -n "$SRC_DIR" ]; then rm -rf "$SRC_DIR"; fi
+    else
+        docker rm -f "$SRC" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$OUT"
+}
 trap cleanup EXIT
 
-log "booting the source database ($ENG_NAME, $IMAGE)"
-docker rm -f "$SRC" >/dev/null 2>&1 || true
-eng_boot "$SRC" app "$IMAGE"
-eng_wait_ready "$SRC"
+# The source: a database container for the DB engines, a directory tree for
+# the files engine. Same cycle either way - seed, back up, DESTROY, verify.
+if [ "$ENG_NAME" = files ]; then
+    SRC_DIR=$(mktemp -d)
+    log "seeding a deterministic file tree ($SRC_DIR)"
+    seed_files "$SRC_DIR"
+    ok "seeded: $(find "$SRC_DIR" -type f | wc -l) files, $(find "$SRC_DIR" -type l | wc -l) symlink, $(find "$SRC_DIR" -mindepth 1 -type d | wc -l) dirs (one empty, one setgid)"
+else
+    log "booting the source database ($ENG_NAME, $IMAGE)"
+    docker rm -f "$SRC" >/dev/null 2>&1 || true
+    eng_boot "$SRC" app "$IMAGE"
+    eng_wait_ready "$SRC"
 
-log "seeding deterministic data"
-"seed_$ENG_NAME" "$SRC" app
-ok "seeded: $(eng_query "$SRC" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
+    log "seeding deterministic data"
+    "seed_$ENG_NAME" "$SRC" app
+    ok "seeded: $(eng_query "$SRC" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
+fi
+
+# One invocation shape for every engine: the source arguments differ, the
+# promise does not.
+if [ "$ENG_NAME" = files ]; then
+    SRC_ARGS=(--path "$SRC_DIR")
+else
+    SRC_ARGS=(--container "$SRC" --db app)
+fi
 
 KEYFILE=""
 if [ "$ENCRYPTED" -eq 1 ]; then
@@ -51,20 +76,26 @@ if [ "$ENCRYPTED" -eq 1 ]; then
     age-keygen -o "$KEYFILE" 2>/dev/null
     RECIPIENT=$(grep 'public key' "$KEYFILE" | sed 's/.*: //')
     log "BACKUP (encrypted to $RECIPIENT)"
-    ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$OUT" \
+    ./backup.sh --engine "$ENGINE" "${SRC_ARGS[@]}" --out "$OUT" \
         --recipient "$RECIPIENT" --identity "$KEYFILE"
 else
     log "BACKUP"
-    ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$OUT"
+    ./backup.sh --engine "$ENGINE" "${SRC_ARGS[@]}" --out "$OUT"
 fi
 MANIFEST=$(find "$OUT" -name '*.json' | head -1)
 [ -n "$MANIFEST" ] || die 'backup.sh produced no manifest'
 
 # The destruction is the point. A backup nobody has restored is a hope, and the
 # only way to stop hoping is to throw the original away first.
-log "DESTROYING the source database (this is the whole point)"
-docker rm -f "$SRC" >/dev/null
-SRC=""
+if [ "$ENG_NAME" = files ]; then
+    log "DESTROYING the source tree (this is the whole point)"
+    rm -rf "$SRC_DIR"
+    SRC_DIR=""
+else
+    log "DESTROYING the source database (this is the whole point)"
+    docker rm -f "$SRC" >/dev/null
+    SRC=""
+fi
 ok 'source is gone - the artefact on disk is now the only copy'
 
 # No --engine here on purpose: verify.sh reads the engine from the manifest.

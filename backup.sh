@@ -11,11 +11,14 @@
 #
 # Usage:
 #   ./backup.sh --container <name> --db <database> [--out DIR] [--keep N]
+#   ./backup.sh --engine files --path <directory> [--out DIR] [--keep N]
 #
 # Options:
-#   --engine NAME      postgres (default) or mysql
+#   --engine NAME      postgres (default), mysql or files
 #   --container NAME   Docker container running the database (source)
 #   --db NAME          database to dump
+#   --path DIR         source directory (files engine); the dataset name in
+#                      the manifest defaults to its basename (--db overrides)
 #   --out DIR          output directory (default ./backups)
 #   --keep N           keep only the N most recent backups of this database
 #   --label TEXT       extra label in the artefact name
@@ -38,6 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE="postgres"
 CONTAINER=""
 DB=""
+SRC_PATH=""
 OUT_DIR="./backups"
 KEEP=0
 LABEL=""
@@ -52,6 +56,7 @@ parse_args() {
             --engine)    ENGINE="${2:-}"; shift 2;;
             --container) CONTAINER="${2:-}"; shift 2;;
             --db)        DB="${2:-}"; shift 2;;
+            --path)      SRC_PATH="${2:-}"; shift 2;;
             --out)       OUT_DIR="${2:-}"; shift 2;;
             --keep)      KEEP="${2:-0}"; shift 2;;
             --label)     LABEL="${2:-}"; shift 2;;
@@ -61,7 +66,16 @@ parse_args() {
             *)           printf 'unknown option: %s\n' "$1" >&2; usage 1;;
         esac
     done
-    [ -n "$CONTAINER" ] || die "--container is required"
+    # --path is the files engine's source: it takes the --container slot (it
+    # is where the data lives), made absolute so the engine never guesses, and
+    # the dataset name defaults to its basename.
+    if [ -n "$SRC_PATH" ]; then
+        [ -z "$CONTAINER" ] || die "--path and --container are two different sources - give one"
+        [ -d "$SRC_PATH" ] || die "source directory '$SRC_PATH' not found"
+        CONTAINER="$(cd "$SRC_PATH" && pwd)"
+        [ -n "$DB" ] || DB="$(basename "$CONTAINER")"
+    fi
+    [ -n "$CONTAINER" ] || die "--container (or --path) is required"
     [ -n "$DB" ] || die "--db is required"
     case "$KEEP" in
         ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
@@ -120,7 +134,15 @@ EOF
 
     local count
     count=$(printf '%s\n' "$tables" | grep -c . || true)
-    ok "manifest written: $count table fingerprint(s) + $(printf '%s' "$SCHEMA_CLASSES" | wc -w) object class(es)"
+    # A backup of NOTHING is not a backup: an empty source produces a valid
+    # 110-byte tar.gz and a 0-table dump produces a plausible archive, and
+    # verify.sh would refuse both anyway ("nothing verified proves nothing").
+    # Refusing here means nobody sleeps on an artefact that guards zero data.
+    if [ "$count" -eq 0 ]; then
+        rm -f -- "$artefact" "$manifest"
+        die "the source contains no ${ENG_UNIT}s - refusing to call that a backup"
+    fi
+    ok "manifest written: $count ${ENG_UNIT} fingerprint(s) + $(printf '%s' "$SCHEMA_CLASSES" | wc -w) object class(es)"
 }
 
 # Delete the oldest artefacts of THIS database, keeping the newest N. Only
@@ -153,10 +175,11 @@ prune_old() {
 }
 
 main() {
-    need docker
     need sha256sum
     load_engine "$ENGINE"
-    docker inspect "$CONTAINER" >/dev/null 2>&1 || die "container '$CONTAINER' not found"
+    # The engine knows what a reachable source looks like (a running container,
+    # a readable directory) and which tools it needs - docker is not a given.
+    eng_preflight "$CONTAINER"
 
     mkdir -p "$OUT_DIR"
     local stamp base artefact manifest
@@ -165,7 +188,7 @@ main() {
     artefact="$OUT_DIR/$base$ENG_ARTEFACT_EXT"
     manifest="$OUT_DIR/$base.json"
 
-    log "dumping database '$DB' from container '$CONTAINER'"
+    log "dumping '$DB' from '$CONTAINER' ($ENG_NAME)"
     # The engine module chooses the format (Postgres: custom, compressed and
     # selectively restorable; MySQL: SQL text with routines forced in).
     # A failure here must NOT leave a plausible artefact behind, hence the trap.
@@ -203,11 +226,13 @@ main() {
     fi
     trap - ERR
 
-    local size
+    # The floor is per-engine when the engine says so: a legitimate two-file
+    # tree gzips to 176 bytes (measured), which the database floor would refuse.
+    local size floor="${ENG_MIN_ARTEFACT_BYTES:-$MIN_ARTEFACT_BYTES}"
     size=$(stat -c%s "$artefact")
-    if [ "$size" -lt "$MIN_ARTEFACT_BYTES" ]; then
+    if [ "$size" -lt "$floor" ]; then
         rm -f -- "$artefact"
-        die "artefact is only ${size} bytes (< $MIN_ARTEFACT_BYTES) - refusing to call that a backup"
+        die "artefact is only ${size} bytes (< $floor) - refusing to call that a backup"
     fi
 
     # Self-check: the engine parses its own archive, so a truncated or corrupt

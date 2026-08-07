@@ -38,11 +38,13 @@ die()  { printf '%s[x]%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
 # "smaller than usual".
 : "${MIN_ARTEFACT_BYTES:=512}"
 
-# The object classes every engine reports, in report order.
+# The object classes every engine reports, in report order. This is the
+# DATABASE default; an engine whose "schema" is something else entirely
+# overrides it when loaded (files: modes, symlinks, dirs).
 # shellcheck disable=SC2034  # consumed by backup.sh/verify.sh, which source this
 SCHEMA_CLASSES="indexes constraints sequences views routines triggers"
 
-SUPPORTED_ENGINES="postgres mysql"
+SUPPORTED_ENGINES="postgres mysql files"
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
@@ -85,6 +87,7 @@ manifest_for() {
     artefact="${artefact%"$ENC_SUFFIX"}"
     artefact="${artefact%.dump}"
     artefact="${artefact%.sql}"
+    artefact="${artefact%.tar.gz}"
     printf '%s' "$artefact.json"
 }
 
