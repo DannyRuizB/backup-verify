@@ -5,7 +5,10 @@
 **A backup nobody has restored is not a backup, it is a hope.** This repo takes
 PostgreSQL, MySQL/MariaDB and plain file-tree backups and then *proves they
 restore* — by restoring them into a throwaway instance and comparing the
-result against the source, table by table (or file by file).
+result against the source, table by table (or file by file). And because a
+copy that never left the building is a hope of a different kind, `offsite.sh`
+gets the proven pair off the machine — and makes the far end prove, hash in
+hand, that what landed is what was sent.
 
 CI does the thing everyone talks about and almost nobody automates: it seeds a
 real source, backs it up, **destroys it**, restores from the artefact, and
@@ -28,6 +31,11 @@ engine.
 age-keygen -o key.txt
 ./backup.sh --container my-postgres --db app --recipient age1... --identity key.txt
 ./verify.sh --manifest ./backups/app_....json --identity key.txt
+
+# off-site, with the REMOTE hashing what actually landed:
+./offsite.sh push  --manifest ./backups/app_....json --remote bk@nas:/srv/backups --keep 14
+./offsite.sh check --remote bk@nas:/srv/backups
+./offsite.sh pull  --db app --remote bk@nas:/srv/backups --out ./restored
 ```
 
 ```
@@ -137,6 +145,53 @@ way the database engines digest theirs: **modes** (every entry's permission
 bits — the umask lie), **symlinks** (a link turned into a copy is a different
 tree), and **dirs** (an empty directory a naive tool drops is still a loss).
 
+## Off-site copies have their own ways of lying
+
+An off-site copy nobody has hashed is a hope with a network in the middle.
+Every row below was measured against a real remote (sshd, busybox at the far
+end) before `offsite.sh` was written:
+
+| What looks fine | What is actually happening |
+|---|---|
+| The nightly `rsync -a` exits 0: "up to date" | **rsync's default comparison is size + mtime.** A remote copy corrupted *in place* (same size, mtime preserved — bit rot's exact shape) is re-synced **never**: rc 0 every night, `--itemize-changes` shows nothing transferred, and the off-site copy stays corrupt forever. Only `--checksum` notices. |
+| The file is there, the size looks right | **A killed upload leaves a partial file under its final name** — measured: 261 120 bytes of a 10 485 760-byte artefact, sitting at the destination as if it were the backup. Every "is the file there?" check signs it off. |
+| `stat` at the remote agrees with the manifest | **A full remote disk produced a file with the RIGHT apparent size and the wrong bytes** — `stat` reported the full 1 048 576 (exactly what the manifest promises), `du` showed 256K of real blocks. Even a size comparison lies here; only hashing *at the remote* disagreed. |
+| Prune "the oldest" at the remote by mtime | **A remote mtime is the upload time, not the backup time** (measured: scp stamps "now"). Re-upload one old backup — after a restore drill, say — and it becomes the "newest" file on the remote: an mtime-based prune then deletes the genuinely newest backup and keeps January's. |
+| `pg_dump \| ssh nas 'cat > backup.sql'` exits 0 | The straight-to-NAS pipe from every tutorial: with the dump **failing**, the pipeline's status is the remote `cat`'s — a 20-byte file with a final-looking name lands at the remote and the cron reports success. The gzip lie, with a network in the middle. |
+
+Hence `offsite.sh`'s protocol, suspicious in both directions:
+
+- **`push`** verifies the local pair *first* (shipping bytes that rotted locally
+  would replicate the rot off-site with a clean exit code), uploads under a
+  temporary name, asks **the remote** to sha256 what actually landed, and only
+  then renames into place. The artefact commits first and the manifest **last**,
+  so a manifest visible at the remote is a receipt: its artefact arrived whole.
+  A push that dies at any point leaves nothing that looks like a backup.
+- **`pull`** re-verifies the bytes after the download — a download is a transfer
+  too — and never overwrites anything: disaster recovery is exactly when a local
+  file with that name might be the only other copy of anything. A pull that
+  catches corruption removes what it fetched instead of leaving a plausible
+  pair for someone to restore from.
+- **`check`** audits every pair at the remote **without downloading artefacts**:
+  each manifest is fetched (they are small) and the remote hashes the artefact
+  it vouches for. In-place rot, artefacts no manifest vouches for, and crashed
+  uploads (`.part` leftovers) are all named. `check` proves the remote holds the
+  right bytes; only `verify.sh` proves those bytes restore.
+- Retention at the remote (`--keep N`) counts complete pairs and decides **by
+  name** — names carry sortable UTC stamps — never by mtime, for the measured
+  reason above.
+
+A remote is `user@host:/path` (ssh, key-based — the far end needs only a POSIX
+shell and `sha256sum`, busybox qualifies) or a plain `/path` (a mounted NAS or
+USB disk — same protocol, because a mount fails in the same shapes). Both live
+behind one `rem_*` interface in `lib/remote_ssh.sh` and `lib/remote_dir.sh`:
+the engines' `eng_*` pattern, applied to the other end of the wire. Everything
+rides plain `ssh` — the probe for this feature was bitten by `scp` reading
+`-p 2299` as "preserve times, then a filename", which is the kind of footgun a
+backup tool should not keep loaded. Encryption composes untouched: the
+manifest's sha256 is the ciphertext's, so the remote hashes ciphertext and the
+whole cycle runs encrypted end to end.
+
 ## How it works
 
 **`backup.sh --engine postgres|mysql|files`** dumps with the engine's own tool
@@ -146,10 +201,12 @@ a **manifest** beside the artefact: size, sha256, the
 engine, and one content fingerprint per table (or file) — the yardstick for later.
 `verify.sh` reads the engine back from the manifest, so a Postgres backup can
 never be accidentally "verified" as MySQL. Everything engine-specific lives in
-`lib/postgres.sh` and `lib/mysql.sh` behind one `eng_*` interface — neither
-script contains an engine name, and a bats test asserts every module implements
-the complete interface, so a missing function cannot surface halfway through a
-restore.
+a `lib/<engine>.sh` module behind one `eng_*` interface — neither script
+contains an engine name, and a bats test asserts every module implements the
+complete interface, so a missing function cannot surface halfway through a
+restore. (`offsite.sh` gets the same treatment on its axis: every
+transport-specific line lives in a `lib/remote_*.sh` module behind the `rem_*`
+interface.)
 
 `backup.sh` refuses to leave a plausible-looking artefact behind: a dump that
 fails is deleted, an artefact below a floor size is deleted, and an archive
@@ -157,7 +214,7 @@ that does not parse (`pg_restore --list`; for MySQL, the header plus the
 trailing `Dump completed` line an interrupted dump never writes) is deleted.
 `--keep N` prunes old backups, counting only complete artefact+manifest pairs.
 
-**`verify.sh`** runs four gates, in cost order:
+**`verify.sh`** runs six gates, in cost order:
 
 1. **Size and checksum** against the manifest — separates "born broken" from
    "rotted on disk", two different problems with different fixes.
@@ -208,18 +265,30 @@ trailing `Dump completed` line an interrupted dump never writes) is deleted.
   FK), an index, a view, routines and a trigger. The files tree gets what a
   naive file backup is measured to lose: a dotfile, a 100 KB blob, a setgid
   shared directory, a group-writable file, a symlink and an empty directory.
-- **`test/backup.bats`** — unit tests over argument parsing, manifest
-  reading, the schema queries, the `eng_*` interface, and the regression guards
-  described below.
+- **`test/offsite.sh [--remote-kind ssh|dir]`** — the fire drill: back up,
+  push, **delete the source AND every local backup**, pull, verify — the
+  pulled copy alone must restore. Then each measured off-site lie, caught:
+  crashed uploads named by `check` and invisible to `pull`; in-place rot
+  failing `check` from the manifest alone, with `pull` refusing to hand the
+  corrupt bytes over (and cleaning up what it fetched); a full remote disk
+  failing the push with nothing plausible left behind; retention pruning by
+  name while the re-uploaded old backup's mtime says "newest"; and the
+  encrypted chain through the same fire. The ssh run boots a real sshd in
+  Docker (with a 256K tmpfs for the disk-full case); the dir run drives the
+  same protocol against a local directory, the mounted-NAS case.
+- **`test/backup.bats`** and **`test/offsite.bats`** — unit tests over argument
+  parsing, manifest reading, the schema queries, the `eng_*` and `rem_*`
+  interfaces, and the regression guards described below.
 - CI runs the e2e against **Postgres 17, Postgres 16, MySQL 8.4 and a file
-  tree, plain and encrypted** (eight combinations) plus the negative suite per
-  engine, and on a
+  tree, plain and encrypted** (eight combinations), the negative suite per
+  engine, the off-site fire drill over **both remote kinds**, and everything
+  again on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Eight bugs this harness caught in its own code
+## Nine bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -292,13 +361,28 @@ stores the asterisk verbatim; the retention loop only worked by accident through
 word splitting. ShellCheck's SC2125 was right, and the glob now goes straight
 into the `for` with `nullglob`.
 
+**The same stdin bug, one layer up.** The `docker exec -i` paragraph above ends
+by noting it is the same family as ssh eating a loop's stdin when you forget
+`-n` — and `offsite.sh` then shipped exactly that: `check` iterates the remote
+listing in a `while read` loop and calls the ssh helpers *inside* it, so the
+first `rem_get` swallowed every listing line after the first manifest. check
+counted one clean pair and exited **0 over a remote full of planted leftovers**
+— a verifier blessing what it never looked at, the exact failure this repo
+exists to kill. It passed locally because `find` happened to list the planted
+files first; CI's order exposed it (non-determinism again — third time this
+harness has been caught by it). The fix is the contract the engines already
+obey: helpers that do not need stdin must starve it (`ssh -n`; only `rem_put`
+reads stdin), pinned by the same kind of bats guard. Writing a lesson down is
+not the same as having learned it.
+
 ## Scope
 
-PostgreSQL and MySQL/MariaDB via Docker containers, and plain directory trees
-via `--engine files`: contents, schema objects (or file metadata), encryption
-at rest, and whether the restored copy is actually usable. Deliberately not
-here yet: off-site upload and point-in-time recovery with WAL archiving — on
-the roadmap, none pretended to work today.
+PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
+`--engine files`, and off-site copies over ssh or onto a mounted disk:
+contents, schema objects (or file metadata), encryption at rest, whether the
+restored copy is actually usable, and whether the remote provably holds what
+was sent. Deliberately not here yet: point-in-time recovery with WAL
+archiving — on the roadmap, not pretended to work today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

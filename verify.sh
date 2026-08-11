@@ -53,31 +53,9 @@ parse_args() {
     [ -n "$MANIFEST" ] || die "--manifest is required"
 }
 
-# Minimal JSON reading with grep/sed rather than a jq dependency: the manifest
-# is written by this repo, so its shape is known and flat.
-json_str() {
-    local file="$1" key="$2"
-    grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" \
-        | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"/\1/'
-}
-
-json_num() {
-    local file="$1" key="$2"
-    grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" "$file" \
-        | head -1 | sed 's/.*:[[:space:]]*//'
-}
-
-# Every "key": "value" pair inside one top-level object of the manifest, as
-# TAB-separated lines. Scoped to the section's line range because "tables" and
-# "objects" both indent their entries by four spaces - a plain four-space match
-# would happily mix them.
-manifest_section() {
-    local file="$1" section="$2"
-    sed -n "/^  \"$section\": {/,/^  }/p" "$file" \
-        | sed -n 's/^    "\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1\t\2/p'
-}
-
-manifest_tables() { manifest_section "$1" tables; }
+# The manifest readers (json_str, json_num, manifest_section, manifest_tables)
+# live in lib/common.sh: offsite.sh reads manifests too, and two copies of a
+# parser is how two scripts end up disagreeing about what a manifest says.
 
 cleanup() {
     # The engine knows what its throwaway instance is (a container, a scratch
@@ -93,7 +71,7 @@ main() {
     need sha256sum
     [ -f "$MANIFEST" ] || die "manifest not found: $MANIFEST"
 
-    local dir db artefact expected_sha expected_bytes engine
+    local dir db artefact engine
     # The manifest says which engine wrote it: verification never has to be told
     # twice, and a Postgres backup cannot accidentally be checked as MySQL.
     engine="$(json_str "$MANIFEST" engine)"
@@ -103,8 +81,6 @@ main() {
     dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
     db="$(json_str "$MANIFEST" database)"
     artefact="$dir/$(json_str "$MANIFEST" artefact)"
-    expected_sha="$(json_str "$MANIFEST" sha256)"
-    expected_bytes="$(json_num "$MANIFEST" bytes)"
     [ -n "$db" ] || die "manifest has no database name"
     [ -f "$artefact" ] || die "artefact named by the manifest is missing: $artefact"
 
@@ -124,15 +100,10 @@ main() {
 
     # --- Gate 1: the artefact is byte-identical to what was backed up --------
     # Cheap, and it separates "the backup was born broken" from "the file rotted
-    # on disk afterwards" - two different problems with different fixes.
-    local actual_sha actual_bytes
-    actual_bytes=$(stat -c%s "$artefact")
-    actual_sha=$(sha256_of "$artefact")
-    [ "$actual_bytes" = "$expected_bytes" ] \
-        || die "size drift: manifest says $expected_bytes bytes, file is $actual_bytes"
-    [ "$actual_sha" = "$expected_sha" ] \
-        || die "checksum drift: the artefact changed since it was written"
-    ok "artefact matches its manifest ($actual_bytes bytes, sha256 verified)"
+    # on disk afterwards" - two different problems with different fixes. The
+    # same shared gate guards offsite.sh's uploads and downloads.
+    assert_pair_intact "$MANIFEST" "$artefact" "gate 1"
+    ok "artefact matches its manifest ($(stat -c%s "$artefact") bytes, sha256 verified)"
 
     # --- Gate 2: restore into a genuinely clean instance ---------------------
     # Clean matters: restoring over existing data makes pg_restore report

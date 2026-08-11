@@ -95,6 +95,53 @@ encryption_available() {
     command -v age >/dev/null 2>&1
 }
 
+# --- Manifest reading ---------------------------------------------------------
+#
+# Minimal JSON reading with grep/sed rather than a jq dependency: the manifest
+# is written by this repo, so its shape is known and flat. Shared here because
+# verify.sh AND offsite.sh both read manifests, and two copies of a parser is
+# how the two scripts end up disagreeing about what a manifest says.
+json_str() {
+    local file="$1" key="$2"
+    grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" \
+        | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"/\1/'
+}
+
+json_num() {
+    local file="$1" key="$2"
+    grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" "$file" \
+        | head -1 | sed 's/.*:[[:space:]]*//'
+}
+
+# Every "key": "value" pair inside one top-level object of the manifest, as
+# TAB-separated lines. Scoped to the section's line range because "tables" and
+# "objects" both indent their entries by four spaces - a plain four-space match
+# would happily mix them.
+manifest_section() {
+    local file="$1" section="$2"
+    sed -n "/^  \"$section\": {/,/^  }/p" "$file" \
+        | sed -n 's/^    "\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1\t\2/p'
+}
+
+manifest_tables() { manifest_section "$1" tables; }
+
+# The size+sha256 gate, shared by everyone who is about to TRUST an artefact:
+# verify.sh before a restore, offsite.sh before an upload and after a download.
+# It answers one question - are these the exact bytes the manifest was written
+# about? - and names the caller's context in the failure.
+assert_pair_intact() {
+    local manifest="$1" artefact="$2" context="$3"
+    local expected_bytes expected_sha actual_bytes actual_sha
+    expected_bytes="$(json_num "$manifest" bytes)"
+    expected_sha="$(json_str "$manifest" sha256)"
+    actual_bytes=$(stat -c%s "$artefact")
+    actual_sha=$(sha256_of "$artefact")
+    [ "$actual_bytes" = "$expected_bytes" ] \
+        || die "$context: size drift - manifest says $expected_bytes bytes, file is $actual_bytes"
+    [ "$actual_sha" = "$expected_sha" ] \
+        || die "$context: checksum drift - these are NOT the bytes the manifest was written about"
+}
+
 # A fingerprint must LOOK like one. This guard exists because MySQL's first
 # implementation returned an EMPTY STRING (a syntax error swallowed by a
 # 2>/dev/null), the manifest recorded `"customers": ""`, and verify would have
