@@ -145,12 +145,27 @@ setup() {
     [[ "$output" == *"does not exist"* ]]
 }
 
+@test "ssh helpers starve stdin; only rem_put may read it" {
+    # Regression guard for this repo's bug #1, relearned: ssh without -n
+    # slurps the caller's stdin, and check's while-read loop feeds the ssh
+    # helpers from the listing it iterates - the first rem_get ate every
+    # remaining line and check blessed a remote full of planted leftovers.
+    # Green locally on a lucky find order; CI's order exposed it.
+    run bash -c "grep '^rem_ssh()' '$REPO/lib/remote_ssh.sh'"
+    [[ "$output" == *"ssh -n "* ]]
+    run bash -c "grep '^rem_ssh_stdin()' '$REPO/lib/remote_ssh.sh'"
+    [[ "$output" != *"ssh -n "* ]]
+    run bash -c "grep '^rem_put()' '$REPO/lib/remote_ssh.sh'"
+    [[ "$output" == *"rem_ssh_stdin"* ]]
+}
+
 @test "the ssh backend never prompts (BatchMode) and never uses scp" {
     # scp reads -p as "preserve times" and swallows the port number as a
     # filename (hit by this feature's probe); everything must ride ssh. The
     # comments may TALK about scp and rsync; the code must not call them.
+    # Both wrappers - rem_ssh and rem_ssh_stdin - must refuse to prompt.
     run grep -c 'BatchMode=yes' "$REPO/lib/remote_ssh.sh"
-    [ "$output" = "1" ]
+    [ "$output" = "2" ]
     run bash -c "grep -v '^ *#' '$REPO/lib/remote_ssh.sh' | grep -c 'scp \|rsync ' || true"
     [ "$output" = "0" ]
 }

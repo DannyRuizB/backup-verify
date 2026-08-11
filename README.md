@@ -288,7 +288,7 @@ trailing `Dump completed` line an interrupted dump never writes) is deleted.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Eight bugs this harness caught in its own code
+## Nine bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -360,6 +360,20 @@ regression test.
 stores the asterisk verbatim; the retention loop only worked by accident through
 word splitting. ShellCheck's SC2125 was right, and the glob now goes straight
 into the `for` with `nullglob`.
+
+**The same stdin bug, one layer up.** The `docker exec -i` paragraph above ends
+by noting it is the same family as ssh eating a loop's stdin when you forget
+`-n` — and `offsite.sh` then shipped exactly that: `check` iterates the remote
+listing in a `while read` loop and calls the ssh helpers *inside* it, so the
+first `rem_get` swallowed every listing line after the first manifest. check
+counted one clean pair and exited **0 over a remote full of planted leftovers**
+— a verifier blessing what it never looked at, the exact failure this repo
+exists to kill. It passed locally because `find` happened to list the planted
+files first; CI's order exposed it (non-determinism again — third time this
+harness has been caught by it). The fix is the contract the engines already
+obey: helpers that do not need stdin must starve it (`ssh -n`; only `rem_put`
+reads stdin), pinned by the same kind of bats guard. Writing a lesson down is
+not the same as having learned it.
 
 ## Scope
 

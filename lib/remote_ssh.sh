@@ -32,7 +32,16 @@ rem_describe() { printf '%s:%s (ssh)' "$REM_HOST" "$REM_DIR"; }
 # arguments at the far end.
 rem_path() { printf '%q' "$REM_DIR/$1"; }
 
-rem_ssh() { ssh "${REM_SSH_OPTS[@]}" -o BatchMode=yes "$REM_HOST" "$@"; }
+# -n is not decoration: ssh without it SLURPS the caller's stdin, and check's
+# while-read loop feeds these helpers from the very listing it is iterating -
+# the first rem_get ate every line after the first manifest, check counted one
+# clean pair and exited 0 over a remote full of planted leftovers. This repo
+# already knew the lesson as bug #1 (docker exec -i eating a read loop) and
+# wrote it down; CI caught the re-run because the runner's find order put the
+# good manifest first, while the local order had hidden it. Only rem_put may
+# read stdin - the file rides it.
+rem_ssh()       { ssh -n "${REM_SSH_OPTS[@]}" -o BatchMode=yes "$REM_HOST" "$@"; }
+rem_ssh_stdin() { ssh "${REM_SSH_OPTS[@]}" -o BatchMode=yes "$REM_HOST" "$@"; }
 
 rem_preflight() {
     local mode="$1" qdir
@@ -49,7 +58,7 @@ rem_preflight() {
     fi
 }
 
-rem_put()    { rem_ssh "cat > $(rem_path "$2")" < "$1"; }
+rem_put()    { rem_ssh_stdin "cat > $(rem_path "$2")" < "$1"; }
 rem_get()    { rem_ssh "cat $(rem_path "$1")" > "$2"; }
 rem_rename() { rem_ssh "mv -f $(rem_path "$1") $(rem_path "$2")"; }
 rem_delete() { rem_ssh "rm -f $(rem_path "$1")"; }
