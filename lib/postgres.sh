@@ -181,21 +181,26 @@ wal_index_name() {
 # file recovers to a FATAL - but only on the day you recover; this makes it
 # loud today). No content is read: the segments land 0600, owned by the
 # server's user - size and presence are what the archive's landlord can see.
+# Optional 5th/6th args: a filename suffix (an encrypted archive holds
+# NAME.age) and the expected on-disk size of a completed file when it differs
+# from seg_bytes - a full segment's age ciphertext is plaintext plus a
+# CONSTANT overhead (measured: 16781496 for every 16777216-byte segment, one
+# recipient), so the exact-size gate survives encryption unchanged.
 wal_range_problems() {
-    local dir="$1" first="$2" last="$3" seg_bytes="$4"
+    local dir="$1" first="$2" last="$3" seg_bytes="$4" suffix="${5:-}" expect_bytes="${6:-$4}"
     local timeline i i0 i1 name size
     timeline=$(wal_name_timeline "$first")
     i0=$(wal_name_index "$first" "$seg_bytes")
     i1=$(wal_name_index "$last" "$seg_bytes")
     for ((i = i0; i <= i1; i++)); do
-        name=$(wal_index_name "$timeline" "$i" "$seg_bytes")
+        name=$(wal_index_name "$timeline" "$i" "$seg_bytes")$suffix
         if [ ! -f "$dir/$name" ]; then
             printf 'missing segment %s - the chain is broken here\n' "$name"
         else
             size=$(stat -c%s "$dir/$name")
-            if [ "$size" -ne "$seg_bytes" ]; then
+            if [ "$size" -ne "$expect_bytes" ]; then
                 printf 'segment %s is %s bytes - a completed segment is exactly %s\n' \
-                    "$name" "$size" "$seg_bytes"
+                    "$name" "$size" "$expect_bytes"
             fi
         fi
     done

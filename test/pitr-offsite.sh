@@ -24,10 +24,12 @@ cd "$(dirname "$0")/.."
 load_engine postgres
 
 KIND="ssh"
+ENCRYPTED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --remote-kind) KIND="${2:-}"; shift 2;;
-        *)             die "unknown option: $1 (usage: pitr-offsite.sh [--remote-kind ssh|dir])";;
+        --encrypted)   ENCRYPTED=1; shift;;
+        *)             die "unknown option: $1 (usage: pitr-offsite.sh [--remote-kind ssh|dir] [--encrypted])";;
     esac
 done
 case "$KIND" in ssh|dir) ;; *) die "--remote-kind must be ssh or dir, got '$KIND'";; esac
@@ -101,18 +103,44 @@ traffic() {
 }
 
 # --- the source, archiving for real -------------------------------------------
-log "booting the source database ($IMAGE) with WAL archiving on"
+# --encrypted: every segment leaves the server as age ciphertext, and the
+# whole off-site protocol must compose untouched - the inventory hashes
+# ciphertext, so push, pull and check move opaque names and never need a key.
+# Only verify does, at the very end.
 mkdir -p "$ARCHIVE" "$BK"
 chmod 777 "$ARCHIVE"   # the container's postgres user writes it
 docker rm -f "$SRC" >/dev/null 2>&1 || true
-docker run -d --name "$SRC" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
-    -v "$ARCHIVE:/archive" "$IMAGE" \
-    -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
+SEGSFX=""
+VF=()
+BASE_ENC=()
+if [ "$ENCRYPTED" -eq 1 ]; then
+    encryption_available || die '--encrypted requires age'
+    # The runner's age rides INTO containers, so it must be a static binary
+    # (the release build is; a distro build might not be). A drill that
+    # assumes is not a drill: prove it before booting anything.
+    docker run --rm -v "$(command -v age):/usr/local/bin/age:ro" --entrypoint age "$IMAGE" --version >/dev/null 2>&1 \
+        || die "the age at $(command -v age) does not run inside $IMAGE (dynamically linked?) - the encrypted drill needs a static age"
+    age-keygen -o "$OUT/key.txt" 2>/dev/null
+    RECIPIENT=$(grep -o 'age1.*' "$OUT/key.txt")
+    SEGSFX=".age"
+    VF=(--identity "$OUT/key.txt")
+    BASE_ENC=(--recipient "$RECIPIENT" --identity "$OUT/key.txt")
+    log "booting the source database ($IMAGE) with ENCRYPTED WAL archiving on"
+    docker run -d --name "$SRC" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+        -v "$ARCHIVE:/archive" -v "$(command -v age):/usr/local/bin/age:ro" "$IMAGE" \
+        -c archive_mode=on \
+        -c "archive_command=test ! -f /archive/%f.age && age -r $RECIPIENT -o /archive/%f.age %p" >/dev/null
+else
+    log "booting the source database ($IMAGE) with WAL archiving on"
+    docker run -d --name "$SRC" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+        -v "$ARCHIVE:/archive" "$IMAGE" \
+        -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
+fi
 eng_wait_ready "$SRC"
 seed_postgres "$SRC" app >/dev/null
 ok "seeded: $(eng_query "$SRC" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
 
-./pitr.sh base --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" >"$OUT/base.log" 2>&1 \
+./pitr.sh base --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" ${BASE_ENC[@]+"${BASE_ENC[@]}"} >"$OUT/base.log" 2>&1 \
     || { fail_case 'taking the base backup failed'; sed -n '1,10p' "$OUT/base.log" | sed 's/^/        /'; exit 1; }
 B=$(ls "$BK"/*_base.json)
 traffic case1
@@ -177,7 +205,7 @@ fi
 
 printf '\n'
 echo '== Case 4: rot in place at the remote - named today, refused by pull, repaired by push =='
-VICTIM=$(json_str "$B" wal_start_file)
+VICTIM=$(json_str "$B" wal_start_file)$SEGSFX
 remote_rot "$VICTIM"
 if ./pitr.sh check --remote "$REMOTE" "${OS[@]}" >"$OUT/check4.log" 2>&1; then
     fail_case 'check --remote blessed a remote with rotten bytes'
@@ -236,7 +264,7 @@ ok "the machine is bare - the remote is the only copy of anything"
 if ./pitr.sh pull --db app --remote "$REMOTE" --archive "$OUT/fire-archive" --out "$OUT/fire" "${OS[@]}" >"$OUT/pull6.log" 2>&1; then
     FB=$(find "$OUT/fire" -name '*_base.json')
     FM=$(find "$OUT/fire" -name '*_mark.json')
-    if ./pitr.sh verify --base "$FB" --mark "$FM" --archive "$OUT/fire-archive" --image "$IMAGE" >"$OUT/verify6.log" 2>&1; then
+    if ./pitr.sh verify --base "$FB" --mark "$FM" --archive "$OUT/fire-archive" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify6.log" 2>&1; then
         pass_case 'the pulled base + chain reproduced the pushed instant EXACTLY - the off-site copy was a recovery, not a hope'
     else
         fail_case 'the pulled pair did not verify'

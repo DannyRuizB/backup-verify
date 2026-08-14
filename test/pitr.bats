@@ -377,3 +377,57 @@ fabricate_pair() {
     grep -q 'records no WAL inventory (an older mark)' "$REPO/pitr.sh"
     grep -q 'invisible until a recovery trips over it' "$REPO/pitr.sh"
 }
+
+# --- the encrypted archive -------------------------------------------------------
+
+@test "base --recipient without --identity is refused, with the backup_label reason" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/pitr.sh'; parse_args base --archive '$tmp' --container c --db app --recipient age1xyz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"requires --identity"* ]]
+    [[ "$output" == *"backup_label"* ]]
+    rm -rf "$tmp"
+}
+
+@test "verify refuses an encrypted base without the key, before anything boots" {
+    tmp=$(mktemp -d)
+    printf 'not really ciphertext' > "$tmp/b_base.tar.age"
+    sha=$(sha256sum "$tmp/b_base.tar.age" | cut -d' ' -f1)
+    bytes=$(stat -c%s "$tmp/b_base.tar.age")
+    printf '{\n  "schema": 3,\n  "kind": "pitr-base",\n  "database": "app",\n  "artefact": "b_base.tar.age",\n  "bytes": %s,\n  "sha256": "%s",\n  "server_version": "17",\n  "wal_segment_bytes": 16777216,\n  "wal_start_file": "000000010000000000000003"\n}\n' \
+        "$bytes" "$sha" > "$tmp/b_base.json"
+    printf '{\n  "schema": 3,\n  "kind": "pitr-mark",\n  "database": "app",\n  "mark_name": "bv_app_x",\n  "lsn": "0/1",\n  "wal_file": "000000010000000000000005",\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        > "$tmp/m_mark.json"
+    run bash "$REPO/pitr.sh" verify --base "$tmp/b_base.json" --mark "$tmp/m_mark.json" --archive "$tmp"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not guess"* ]]
+    [[ "$output" != *"booting"* ]]
+    rm -rf "$tmp"
+}
+
+@test "wal_range_problems audits suffixed ciphertext names against the ciphertext size" {
+    tmp=$(mktemp -d)
+    truncate -s 16781496 "$tmp/000000010000000000000001.age"
+    truncate -s 16781496 "$tmp/000000010000000000000002.age"
+    source "$REPO/lib/postgres.sh"
+    run wal_range_problems "$tmp" 000000010000000000000001 000000010000000000000002 16777216 .age 16781496
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    truncate -s 8000000 "$tmp/000000010000000000000002.age"
+    run wal_range_problems "$tmp" 000000010000000000000001 000000010000000000000002 16777216 .age 16781496
+    [[ "$output" == *"000000010000000000000002.age is 8000000 bytes"* ]]
+    [[ "$output" == *"exactly 16781496"* ]]
+    rm -rf "$tmp"
+}
+
+@test "push refuses an encrypted mark that records no ciphertext size" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote" "$tmp/archive"
+    fabricate_pair "$tmp" 000000010000000000000005 000000010000000000000005
+    sed -i 's/  "tables": {/  "wal_files_encrypted": "yes",\n  "wal": {\n    "000000010000000000000005.age": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n  },\n  "tables": {/' "$tmp/m_mark.json"
+    run bash "$REPO/pitr.sh" push --base "$tmp/b_base.json" --mark "$tmp/m_mark.json" \
+        --archive "$tmp/archive" --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"records no ciphertext size"* ]]
+    rm -rf "$tmp"
+}

@@ -27,6 +27,14 @@ cd "$(dirname "$0")/.."
 . test/seed.sh
 load_engine postgres
 
+ENCRYPTED=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --encrypted) ENCRYPTED=1; shift;;
+        *)           die "unknown option: $1 (usage: pitr.sh [--encrypted])";;
+    esac
+done
+
 IMAGE="${BV_IMAGE:-$ENG_DEFAULT_IMAGE}"
 SRC=bv-pitr-drill-src
 OUT=$(mktemp -d)
@@ -49,15 +57,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-log "booting the source database ($IMAGE) with WAL archiving on"
 mkdir -p "$ARCHIVE"
 chmod 777 "$ARCHIVE"   # the container's postgres user writes it
 docker rm -f "$SRC" >/dev/null 2>&1 || true
 # The archive_command is the documentation's own suggestion, on purpose: the
 # lies this suite catches are the ones that ship with the standard recipe.
-docker run -d --name "$SRC" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
-    -v "$ARCHIVE:/archive" "$IMAGE" \
-    -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
+# --encrypted swaps cp for age (the static binary rides into the container
+# read-only), so every segment lands as ciphertext - and the whole suite must
+# still hold, key in hand.
+SEGSFX=""
+VF=()          # extra verify args
+BASE_ENC=()    # extra base args
+if [ "$ENCRYPTED" -eq 1 ]; then
+    encryption_available || die '--encrypted requires age'
+    # The runner's age rides INTO containers, so it must be a static binary
+    # (the release build is; a distro build might not be). A drill that
+    # assumes is not a drill: prove it before booting anything.
+    docker run --rm -v "$(command -v age):/usr/local/bin/age:ro" --entrypoint age "$IMAGE" --version >/dev/null 2>&1 \
+        || die "the age at $(command -v age) does not run inside $IMAGE (dynamically linked?) - the encrypted drill needs a static age"
+    age-keygen -o "$OUT/key.txt" 2>/dev/null
+    RECIPIENT=$(grep -o 'age1.*' "$OUT/key.txt")
+    SEGSFX=".age"
+    VF=(--identity "$OUT/key.txt")
+    BASE_ENC=(--recipient "$RECIPIENT" --identity "$OUT/key.txt")
+    log "booting the source database ($IMAGE) with ENCRYPTED WAL archiving on"
+    docker run -d --name "$SRC" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+        -v "$ARCHIVE:/archive" -v "$(command -v age):/usr/local/bin/age:ro" "$IMAGE" \
+        -c archive_mode=on \
+        -c "archive_command=test ! -f /archive/%f.age && age -r $RECIPIENT -o /archive/%f.age %p" >/dev/null
+else
+    log "booting the source database ($IMAGE) with WAL archiving on"
+    docker run -d --name "$SRC" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+        -v "$ARCHIVE:/archive" "$IMAGE" \
+        -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
+fi
 eng_wait_ready "$SRC"
 seed_postgres "$SRC" app
 ok "seeded: $(eng_query "$SRC" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
@@ -70,7 +103,7 @@ echo '== Case 1: the drill - base, mark, disaster, destruction, recovery to the 
     || { fail_case 'the pre-base mark itself failed'; sed -n '1,10p' "$OUT/early.log" | sed 's/^/        /'; }
 M_EARLY=$(find "$OUT/early" -name '*_mark.json' | head -1)
 
-./pitr.sh base --container "$SRC" --db app --archive "$ARCHIVE" --out "$OUT/backups" >"$OUT/base.log" 2>&1 \
+./pitr.sh base --container "$SRC" --db app --archive "$ARCHIVE" --out "$OUT/backups" ${BASE_ENC[@]+"${BASE_ENC[@]}"} >"$OUT/base.log" 2>&1 \
     || { fail_case 'base backup failed'; sed -n '1,12p' "$OUT/base.log" | sed 's/^/        /'; }
 B=$(find "$OUT/backups" -name '*_base.json' | head -1)
 [ -n "$B" ] || die 'no base manifest was written - nothing else can run'
@@ -168,7 +201,7 @@ sleep 2
 log 'DESTROYING the source database (this is the whole point)'
 docker rm -f "$SRC" >/dev/null
 ok 'source is gone - the base backup and the archive are now the only copy'
-if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/verify.log" 2>&1; then
+if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify.log" 2>&1; then
     if grep -q 'PITR VERIFIED' "$OUT/verify.log" \
        && grep -q 'recovery stopping at restore point' "$OUT/verify.log"; then
         pass_case 'the archive reproduced the marked instant, fingerprints and all - the archived disaster excluded'
@@ -191,8 +224,8 @@ MIDDLE=$(wal_index_name "$(wal_name_timeline "$START_FILE")" \
     "$(( $(wal_name_index "$START_FILE" "$SEG_BYTES") + 1 ))" "$SEG_BYTES")
 
 echo "== Case 3: a hole in the chain ($MIDDLE removed) - refused before anything boots =="
-mv "$ARCHIVE/$MIDDLE" "$OUT/hidden-$MIDDLE"
-if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/hole.log" 2>&1; then
+mv "$ARCHIVE/$MIDDLE$SEGSFX" "$OUT/hidden-$MIDDLE"
+if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/hole.log" 2>&1; then
     fail_case 'verify blessed an archive with a hole in the chain'
 else
     if grep -q "missing segment $MIDDLE" "$OUT/hole.log" && grep -q 'refusing to boot' "$OUT/hole.log"; then
@@ -205,7 +238,7 @@ else
         fail_case 'verify booted a container the chain already refuted'
     fi
 fi
-mv "$OUT/hidden-$MIDDLE" "$ARCHIVE/$MIDDLE"
+mv "$OUT/hidden-$MIDDLE" "$ARCHIVE/$MIDDLE$SEGSFX"
 printf '\n'
 
 echo '== Case 4: rot in place - right size, rotten bytes, so the chain looks whole =='
@@ -216,12 +249,12 @@ echo '== Case 4: rot in place - right size, rotten bytes, so the chain looks who
 # because every recovery here has a NAME it must reach - the server boots,
 # replay hits garbage and dies. cat > and dd conv=notrunc keep the inode,
 # owner and mode.
-root_sh "cat /work/archive/$MIDDLE > /work/pristine
-         dd if=/dev/zero of=/work/archive/$MIDDLE bs=8192 seek=1 count=4 conv=notrunc 2>/dev/null"
-if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/rot.log" 2>&1; then
+root_sh "cat /work/archive/$MIDDLE$SEGSFX > /work/pristine
+         dd if=/dev/zero of=/work/archive/$MIDDLE$SEGSFX bs=8192 seek=1 count=4 conv=notrunc 2>/dev/null"
+if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/rot.log" 2>&1; then
     fail_case 'verify promoted through a segment full of zeros'
 else
-    if grep -q "$MIDDLE - these are not the bytes the mark stood on" "$OUT/rot.log" \
+    if grep -q "$MIDDLE$SEGSFX - these are not the bytes the mark stood on" "$OUT/rot.log" \
         && ! grep -q 'booting a throwaway' "$OUT/rot.log"; then
         pass_case 'the inventory names the rotten segment TODAY - nothing ever boots'
     else
@@ -233,7 +266,7 @@ fi
 # manifest, reconstructed) - the reported-not-skipped warning must fire, and
 # the recovery must DIE at the garbage instead of promoting short of the mark.
 sed '/^  "wal": {/,/^  },$/d' "$M" > "$OUT/old_mark.json"
-if ./pitr.sh verify --base "$B" --mark "$OUT/old_mark.json" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/rot-old.log" 2>&1; then
+if ./pitr.sh verify --base "$B" --mark "$OUT/old_mark.json" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/rot-old.log" 2>&1; then
     fail_case 'an inventory-less verify promoted through a segment full of zeros'
 else
     if grep -q 'records no WAL inventory' "$OUT/rot-old.log" && grep -q 'recovery DIED' "$OUT/rot-old.log"; then
@@ -243,13 +276,13 @@ else
         sed -n '1,20p' "$OUT/rot-old.log" | sed 's/^/        /'
     fi
 fi
-root_sh "cat /work/pristine > /work/archive/$MIDDLE && rm /work/pristine"
+root_sh "cat /work/pristine > /work/archive/$MIDDLE$SEGSFX && rm /work/pristine"
 printf '\n'
 
 echo '== Case 5: a mark that predates its base backup can never be reached =='
 if [ -z "$M_EARLY" ]; then
     fail_case 'the pre-base mark was never written, so this case cannot run'
-elif ./pitr.sh verify --base "$B" --mark "$M_EARLY" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/early-verify.log" 2>&1; then
+elif ./pitr.sh verify --base "$B" --mark "$M_EARLY" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/early-verify.log" 2>&1; then
     fail_case 'verify accepted a mark from before the base backup'
 else
     if grep -q 'predates the base backup' "$OUT/early-verify.log" \
@@ -270,28 +303,55 @@ echo '== Case 6: squatters and debris in the archive - named from the directory 
 # Its name comes from the LAST segment actually present: the archive kept
 # growing after the mark (the drill's own switches), and squatting an
 # occupied name is just vandalism, not this lie.
-LAST_SEG=$(find "$ARCHIVE" -maxdepth 1 -type f -printf '%f\n' | grep -E '^[0-9A-F]{24}$' | sort | tail -1)
+LAST_SEG=$(find "$ARCHIVE" -maxdepth 1 -type f -printf '%f\n' | grep -E '^[0-9A-F]{24}(\.age)?$' | grep -oE '^[0-9A-F]{24}' | sort | tail -1)
 POISON=$(wal_index_name "$(wal_name_timeline "$LAST_SEG")" \
     "$(( $(wal_name_index "$LAST_SEG" "$SEG_BYTES") + 2 ))" "$SEG_BYTES")
-printf 'VENENO: not a WAL segment' > "$ARCHIVE/$POISON"
+printf 'VENENO: not a WAL segment' > "$ARCHIVE/$POISON$SEGSFX"
 printf 'half an archive copy' > "$ARCHIVE/000000010000000000000042.partial"
 if ./pitr.sh check --archive "$ARCHIVE" >"$OUT/poison.log" 2>&1; then
     fail_case 'check blessed an archive with a squatter and a .partial in it'
 else
-    if grep -q "$POISON is " "$OUT/poison.log" && grep -q 'not a WAL segment' "$OUT/poison.log"; then
+    if grep -q "$POISON$SEGSFX is " "$OUT/poison.log" && grep -q 'not a WAL segment' "$OUT/poison.log"; then
         pass_case 'the squatted name is betrayed by its size, the .partial by its shape'
     else
         fail_case 'check failed, but did not name both leftovers'
         sed -n '1,15p' "$OUT/poison.log" | sed 's/^/        /'
     fi
 fi
-rm -f "$ARCHIVE/$POISON" "$ARCHIVE/000000010000000000000042.partial"
+rm -f "$ARCHIVE/$POISON$SEGSFX" "$ARCHIVE/000000010000000000000042.partial"
 printf '\n'
+
+if [ "$ENCRYPTED" -eq 1 ]; then
+    echo '== Case 8 (encrypted only): no key, no drill - and the wrong key dies fast =='
+    # No comforting green tick without the identity: refusing is the feature.
+    if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/nokey.log" 2>&1; then
+        fail_case 'verify ran an encrypted drill without the key'
+    else
+        if grep -q 'does not guess' "$OUT/nokey.log" && ! grep -q 'booting a throwaway' "$OUT/nokey.log"; then
+            pass_case 'verification without the key is refused outright - a drill that guesses is not a drill'
+        else
+            fail_case 'verify failed without the key, but not by the refusal path'
+            sed -n '1,10p' "$OUT/nokey.log" | sed 's/^/        /'
+        fi
+    fi
+    age-keygen -o "$OUT/wrong.txt" 2>/dev/null
+    if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" --identity "$OUT/wrong.txt" >"$OUT/wrongkey.log" 2>&1; then
+        fail_case 'verify recovered with a key that cannot open the backup'
+    else
+        if grep -q 'does not decrypt with the given identity' "$OUT/wrongkey.log"; then
+            pass_case 'the wrong key dies at the base artefact, named for what it is'
+        else
+            fail_case 'the wrong key failed some other way'
+            sed -n '1,12p' "$OUT/wrongkey.log" | sed 's/^/        /'
+        fi
+    fi
+    printf '\n'
+fi
 
 echo '== Case 7: after every mutation was undone, the drill still passes =='
 # The suite must leave the archive as it found it - proven the only honest
 # way: the same recovery, byte-for-byte, one more time.
-if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/verify2.log" 2>&1; then
+if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify2.log" 2>&1; then
     pass_case 'the archive still reproduces the mark exactly'
 else
     fail_case 'the harness broke the archive it was testing'

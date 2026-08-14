@@ -51,6 +51,14 @@ age-keygen -o key.txt
                 --archive /srv/wal-archive --remote bk@nas:/srv/pitr
 ./pitr.sh check --remote bk@nas:/srv/pitr
 ./pitr.sh pull  --db app --remote bk@nas:/srv/pitr --archive ./recovered-wal --out ./recovered
+
+# encrypted end to end: segments leave the server as ciphertext...
+#   archive_command = 'test ! -f /srv/wal-archive/%f.age &&
+#                      age -r age1... -o /srv/wal-archive/%f.age %p'
+# ...the base travels encrypted too, and verify decrypts inside the drill:
+./pitr.sh base   --container my-postgres --db app --archive /srv/wal-archive \
+                 --recipient age1... --identity key.txt
+./pitr.sh verify --base ... --mark ... --archive /srv/wal-archive --identity key.txt
 ```
 
 ```
@@ -273,6 +281,19 @@ files. What the drill proves end to end: mark, push, lose the *machine* —
 source, local archive, every manifest — pull, and recover the named instant
 exactly, on nothing but the remote's contents.
 
+### And the archive is your data, in cleartext
+
+Encrypting the dump and shipping the WAL archive plain is a locked front door
+with the back door open — measured, like everything here:
+
+| What looks fine | What is actually happening |
+|---|---|
+| The base backup travels encrypted, so the data is safe | **WAL segments carry row data in cleartext.** Measured: a seeded email address greps straight out of a raw archived segment. An off-site WAL archive is an off-site copy of your rows, whatever the base artefact does. |
+| Encrypt each segment when it is uploaded | **age is non-deterministic: the same segment encrypted twice yields different bytes** (same size, different sha — measured). Re-encrypting can never reproduce an archived file, so a segment's identity is its ciphertext **as archived**: encrypt once, in `archive_command`, and let the mark's inventory hash exactly that. Push, pull and `check --remote` then compose **untouched** — they move opaque names and hashes and never need a key. |
+| The `.age` file exists, so the segment is archived | **This probe was caught by its own measurement**: a stat milliseconds after the file appeared found 7.8 MB of a 16.8 MB ciphertext — age writes progressively, and "the file exists" blesses a half-written one. The encrypted `mark` wait demands a size past the plaintext AND stable across two polls. |
+| Corruption in an encrypted archive needs the inventory to catch | The inventory still catches it **today** — but authenticated encryption adds a second, free line of defence: a truncated *or* bit-flipped `.age` refuses to decrypt at all (*"failed to decrypt and authenticate payload chunk"* — measured both ways), so even an old mark without an inventory dies loudly instead of replaying garbage. And every complete ciphertext measures the same (plaintext + constant overhead; 16 781 496 bytes for every 16 MiB segment), so the exact-size gate survives encryption unchanged. |
+| The key question waits until recovery day | **`verify` refuses to run without `--identity`** — no key, no drill, no comforting green tick — and a wrong key dies at the base artefact, named for what it is. Inside the drill the throwaway decrypts each segment itself (`restore_command` pipes through a static `age` that rides into the container read-only); the wrong key there is FATAL and immediate: *"no identity matched any of the recipients"* (measured). `base --recipient` requires `--identity` for the same reason `backup.sh` offers it: the key gets proven **today**. |
+
 ## How it works
 
 **`backup.sh --engine postgres|mysql|files`** dumps with the engine's own tool
@@ -362,7 +383,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   encrypted chain through the same fire. The ssh run boots a real sshd in
   Docker (with a 256K tmpfs for the disk-full case); the dir run drives the
   same protocol against a local directory, the mounted-NAS case.
-- **`test/pitr.sh`** — the point-in-time fire drill: seed, base backup, mark —
+- **`test/pitr.sh [--encrypted]`** — the point-in-time fire drill: seed, base
+  backup, mark —
   then commit a **disaster after the mark**, destroy the source, and recover.
   The recovered instant must contain everything the mark saw and **nothing**
   the disaster wrote (recovering "everything" here would be a *failure*: the
@@ -373,7 +395,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   milliseconds; squatters and debris named from the directory alone; and,
   after every mutation is undone, the full drill again — a suite that only
   rejects is as useless as one that only accepts.
-- **`test/pitr-offsite.sh [--remote-kind ssh|dir]`** — the strongest disaster
+- **`test/pitr-offsite.sh [--remote-kind ssh|dir] [--encrypted]`** — the
+  strongest disaster
   simulated here: mark, push, then lose the **machine** — source container,
   local WAL archive, every local manifest — pull, and the named instant must
   come back exactly. Around it, each measured off-site archive lie as a
@@ -392,7 +415,9 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   engine, the off-site fire drill over **both remote kinds**, the PITR fire
   drill on **both Postgres majors** (a base backup is bytes from one major
   version, so a recovery is a compatibility promise too), the PITR off-site
-  fire drill over **both remote kinds again**, and everything
+  fire drill over **both remote kinds again** — the PITR drills each run
+  **plain and encrypted**, because encryption must not change the promise —
+  and everything
   again on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
@@ -531,14 +556,14 @@ explicitly, so both transports tell the same story.
 
 PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
 `--engine files`, off-site copies over ssh or onto a mounted disk, and
-point-in-time recovery over a WAL archive (PostgreSQL) — including the archive
-itself pushed off-site, audited at the remote, and pulled back onto a bare
-machine: contents, schema objects (or file metadata), encryption at rest,
-whether the restored copy is actually usable, whether the remote provably
-holds what was sent, and whether a named instant provably comes back.
-Deliberately not here yet: point-in-time for MySQL (binlogs are a different
-mechanism, not a flag away) and encryption of the WAL archive itself — on the
-roadmap, not pretended to work today.
+point-in-time recovery over a WAL archive (PostgreSQL) — the archive pushed
+off-site, audited at the remote, pulled back onto a bare machine, and the
+whole chain optionally encrypted end to end (base backup and every segment):
+contents, schema objects (or file metadata), encryption at rest, whether the
+restored copy is actually usable, whether the remote provably holds what was
+sent, and whether a named instant provably comes back. Deliberately not here
+yet: point-in-time for MySQL — binlogs are a different mechanism, not a flag
+away; on the roadmap, not pretended to work today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)
