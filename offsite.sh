@@ -99,45 +99,10 @@ parse_args() {
     esac
 }
 
-# ssh or a directory, decided by the one character that cannot be both: a
-# colon. Both backends implement the same rem_* interface, so everything below
-# this line has no idea which transport it is talking through - the engines'
-# eng_* pattern, applied to the other end of the wire.
-load_remote() {
-    case "$REMOTE" in
-        *:*)
-            REM_HOST="${REMOTE%%:*}"
-            REM_DIR="${REMOTE#*:}"
-            # shellcheck source=lib/remote_ssh.sh
-            . "$SCRIPT_DIR/lib/remote_ssh.sh";;
-        *)
-            REM_DIR="$REMOTE"
-            # shellcheck source=lib/remote_dir.sh
-            . "$SCRIPT_DIR/lib/remote_dir.sh";;
-    esac
-    [ -n "$REM_DIR" ] || die "the remote spec '$REMOTE' names no directory"
-    # --ssh-opts arrives as one string; ssh wants words.
-    read -ra REM_SSH_OPTS <<< "$SSH_OPTS_STR"
-}
-
-# Upload to a temporary name, make the REMOTE hash what landed, and only then
-# rename into place. The hash is not optional and the size is not consulted:
-# the disk-full measurement produced a remote file whose SIZE matched the
-# manifest exactly while a quarter of its bytes existed.
-upload_checked() {
-    local local_path="$1" name="$2" expected_sha="$3" landed
-    if ! rem_put "$local_path" "$name.part"; then
-        rem_delete "$name.part" || true
-        die "upload of $name died mid-flight - the partial temporary was removed, nothing at the remote pretends to be this backup"
-    fi
-    landed=$(rem_sha256 "$name.part" || true)
-    if [ "$landed" != "$expected_sha" ]; then
-        rem_delete "$name.part" || true
-        die "the remote's copy of $name does not hash back to what was sent (got '${landed:-nothing}') - upload rejected and removed"
-    fi
-    rem_rename "$name.part" "$name"
-    ok "  $name - uploaded, hashed AT the remote, renamed into place"
-}
+# load_remote (the transport selection) and upload_checked (the
+# temp-name/remote-hash/rename protocol) live in lib/common.sh since pitr.sh
+# learned to ship a WAL archive: two copies of "what is a remote" is how two
+# scripts end up disagreeing about one.
 
 # Remote retention, decided by NAME. Artefact names carry a sortable UTC
 # stamp, so lexical order is chronological no matter when anything was

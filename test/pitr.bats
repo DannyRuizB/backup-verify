@@ -237,3 +237,143 @@ fabricate_pair() {
     [[ "$output" == *"archive is continuous: 1 segment(s)"* ]]
     rm -rf "$tmp"
 }
+
+# --- the off-site archive: push / pull / check --remote -------------------------
+
+@test "help lists push, pull and the remote options" {
+    run bash "$REPO/pitr.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"push"* ]]
+    [[ "$output" == *"pull"* ]]
+    [[ "$output" == *"--remote"* ]]
+    [[ "$output" == *"--ssh-opts"* ]]
+}
+
+@test "push and pull name every input they refuse to run without" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/pitr.sh'; parse_args push --archive '$tmp'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"push needs --base"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args push --archive '$tmp' --base b"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"push needs --mark"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args push --archive '$tmp' --base b --mark m"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"push needs --remote"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args pull --archive '$tmp' --remote r"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"pull needs --db"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args pull --archive '$tmp' --db app"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"pull needs --remote"* ]]
+    rm -rf "$tmp"
+}
+
+@test "check audits the local archive or the remote, never both at once" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/pitr.sh'; parse_args check --archive '$tmp' --remote '$tmp'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not both at once"* ]]
+    # and a remote check needs no --archive at all
+    run bash -c "source '$REPO/pitr.sh'; parse_args check --remote '$tmp' && echo PARSED"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PARSED"* ]]
+    rm -rf "$tmp"
+}
+
+@test "pull creates its archive directory - disaster recovery starts with nothing" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/pitr.sh'; parse_args pull --db app --remote r --archive '$tmp/fresh/archive' && echo PARSED"
+    [ "$status" -eq 0 ]
+    [ -d "$tmp/fresh/archive" ]
+    rm -rf "$tmp"
+}
+
+@test "push refuses a mark with no WAL inventory - it cannot promise what nothing can audit" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote" "$tmp/archive"
+    fabricate_pair "$tmp" 000000010000000000000005 000000010000000000000005
+    run bash "$REPO/pitr.sh" push --base "$tmp/b_base.json" --mark "$tmp/m_mark.json" \
+        --archive "$tmp/archive" --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"records no WAL inventory"* ]]
+    rm -rf "$tmp"
+}
+
+@test "push refuses to replicate a hole off-site" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote" "$tmp/archive"
+    fabricate_pair "$tmp" 000000010000000000000007 000000010000000000000005
+    sed -i 's/  "tables": {/  "wal": {\n    "000000010000000000000005": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n  },\n  "tables": {/' "$tmp/m_mark.json"
+    truncate -s 16777216 "$tmp/archive/000000010000000000000005"
+    truncate -s 16777216 "$tmp/archive/000000010000000000000007"   # 06 missing
+    run bash "$REPO/pitr.sh" push --base "$tmp/b_base.json" --mark "$tmp/m_mark.json" \
+        --archive "$tmp/archive" --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing segment 000000010000000000000006"* ]]
+    [[ "$output" == *"replicate the hole off-site"* ]]
+    rm -rf "$tmp"
+}
+
+@test "pull refuses a remote that cannot prove any instant of the database" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    run bash "$REPO/pitr.sh" pull --db app --remote "$tmp/remote" \
+        --archive "$tmp/archive" --out "$tmp/out"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no mark manifest for 'app'"* ]]
+    rm -rf "$tmp"
+}
+
+@test "pull removes a fetched mark that records no inventory, instead of trusting it" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    printf '{\n  "schema": 3,\n  "kind": "pitr-mark",\n  "database": "app",\n  "mark_name": "bv_app_x",\n  "wal_file": "000000010000000000000005",\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        > "$tmp/remote/app_20260101T000000Z_mark.json"
+    run bash "$REPO/pitr.sh" pull --db app --remote "$tmp/remote" \
+        --archive "$tmp/archive" --out "$tmp/out"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"records no WAL inventory"* ]]
+    [ ! -e "$tmp/out/app_20260101T000000Z_mark.json" ]
+    rm -rf "$tmp"
+}
+
+@test "check --remote names the crashed upload, the missing segment and the missing base" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    printf 'crashed' > "$tmp/remote/000000010000000000000009.part"
+    printf '{\n  "schema": 3,\n  "kind": "pitr-mark",\n  "database": "app",\n  "mark_name": "bv_app_x",\n  "wal_file": "000000010000000000000005",\n  "wal": {\n    "000000010000000000000005": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n  },\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        > "$tmp/remote/app_20260101T000000Z_mark.json"
+    run bash "$REPO/pitr.sh" check --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"000000010000000000000009.part - a crashed upload"* ]]
+    [[ "$output" == *"the remote does not hold it"* ]]
+    [[ "$output" == *"no intact base backup at the remote"* ]]
+    [[ "$output" == *"REMOTE ARCHIVE CHECK FAILED"* ]]
+    rm -rf "$tmp"
+}
+
+@test "check --remote blesses a remote whose newest mark provably stands on what it holds" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    printf 'not really a base backup' > "$tmp/remote/b_base.tar"
+    local_sha=$(sha256sum "$tmp/remote/b_base.tar" | cut -d' ' -f1)
+    local_bytes=$(stat -c%s "$tmp/remote/b_base.tar")
+    printf '{\n  "schema": 3,\n  "kind": "pitr-base",\n  "database": "app",\n  "artefact": "b_base.tar",\n  "bytes": %s,\n  "sha256": "%s",\n  "server_version": "17",\n  "wal_segment_bytes": 16777216,\n  "wal_start_file": "000000010000000000000005"\n}\n' \
+        "$local_bytes" "$local_sha" > "$tmp/remote/app_20260101T000000Z_base.json"
+    printf 'segment bytes' > "$tmp/remote/000000010000000000000005"
+    seg_sha=$(sha256sum "$tmp/remote/000000010000000000000005" | cut -d' ' -f1)
+    printf '{\n  "schema": 3,\n  "kind": "pitr-mark",\n  "database": "app",\n  "mark_name": "bv_app_x",\n  "wal_file": "000000010000000000000005",\n  "wal": {\n    "000000010000000000000005": "%s"\n  },\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        "$seg_sha" > "$tmp/remote/app_20260101T000000Z_mark.json"
+    run bash "$REPO/pitr.sh" check --remote "$tmp/remote"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"can prove every instant it claims"* ]]
+    rm -rf "$tmp"
+}
+
+@test "an old mark without an inventory is reported by verify, never silently skipped" {
+    # The retrocompat contract, testable without Docker: the warning text must
+    # exist in the script verbatim, tied to the empty-inventory branch.
+    grep -q 'records no WAL inventory (an older mark)' "$REPO/pitr.sh"
+    grep -q 'invisible until a recovery trips over it' "$REPO/pitr.sh"
+}
