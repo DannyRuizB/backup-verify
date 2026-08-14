@@ -23,6 +23,11 @@ name: ci
 #                  destroyed - and the named instant comes back exactly,
 #                  with arrival proven by CONTENT, because a replay that
 #                  never arrives exits 0 in silence (measured)
+#   binlog-offsite - the same instant pushed to a remote, the MACHINE lost,
+#                  and the remote alone bringing it back - where even
+#                  truncation is shapeless (a binlog cut at an event
+#                  boundary decodes clean - measured), so the inventory
+#                  hash carries everything, over both transports
 on:
   push:
     branches: [main]
@@ -182,3 +187,15 @@ jobs:
       # exact-version official build is an honest replay tool.
       - name: fire drill + every measured binlog lie
         run: ./test/binlog.sh
+
+  binlog-offsite:
+    name: MySQL binlog off-site fire drill (${{ matrix.remote }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        remote: [ssh, dir]
+    steps:
+      - uses: actions/checkout@v5
+      - name: fire drill + every measured off-site binlog lie
+        run: ./test/binlog-offsite.sh --remote-kind ${{ matrix.remote }}
