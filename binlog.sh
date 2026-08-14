@@ -30,8 +30,11 @@
 #   ./binlog.sh base   --container NAME --db NAME [--out DIR]
 #   ./binlog.sh mark   --container NAME --db NAME --archive DIR [--out DIR]
 #   ./binlog.sh check  --archive DIR [--container NAME]
+#   ./binlog.sh check  --remote REMOTE [--db NAME]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
 #                      [--image IMAGE]
+#   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE
+#   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
 #
 # Subcommands:
 #   base    mysqldump with --source-data: the dump plus its ANCHOR (the
@@ -49,6 +52,11 @@
 #           chain from the anchor to the mark position (checksums verified),
 #           then prove ARRIVAL with the mark's fingerprints - because the
 #           replay's own exit code cannot be trusted (measured).
+#   push    ship a provable instant off the machine: the anchored dump, the
+#           chain its mark replays (each file hashed at the remote before it
+#           is named), and the mark manifest LAST - the receipt
+#   pull    bring the newest provable instant back: dump + mark + chain,
+#           re-hashed after the transfer, never overwriting anything
 #
 # Options:
 #   --container NAME  Docker container running the source database
@@ -66,6 +74,9 @@
 #   --label TEXT      extra label in the base artefact name
 #   --timeout SECONDS how long mark/verify wait (default 90)
 #   --keep-container  leave the throwaway instance running (for debugging)
+#   --remote REMOTE   user@host:/path (ssh) or /path (a mounted disk) -
+#                     same remotes, same rem_* modules as offsite.sh
+#   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
 #   -h, --help        this help
 #
 # Exit codes: 0 the claim was proven, non-zero otherwise. A mark or a base
@@ -89,14 +100,16 @@ TIMEOUT=90
 KEEP_CONTAINER=0
 TOOLS_DIR=""
 PROBE=""
+REMOTE=""
+SSH_OPTS_STR=""
 
 usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 parse_args() {
     case "${1:-}" in
-        base|mark|check|verify) SUBCMD="$1"; shift;;
+        base|mark|check|verify|push|pull) SUBCMD="$1"; shift;;
         -h|--help) usage 0;;
-        '')        printf 'a subcommand is required: base, mark, check or verify\n' >&2; usage 1;;
+        '')        printf 'a subcommand is required: base, mark, check, verify, push or pull\n' >&2; usage 1;;
         *)         printf 'unknown subcommand: %s\n' "$1" >&2; usage 1;;
     esac
     while [ $# -gt 0 ]; do
@@ -111,6 +124,8 @@ parse_args() {
             --label)          LABEL="${2:-}"; shift 2;;
             --timeout)        TIMEOUT="${2:-}"; shift 2;;
             --tools)          TOOLS_DIR="${2:-}"; shift 2;;
+            --remote)         REMOTE="${2:-}"; shift 2;;
+            --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
             --keep-container) KEEP_CONTAINER=1; shift;;
             -h|--help)        usage 0;;
             *)                printf 'unknown option: %s\n' "$1" >&2; usage 1;;
@@ -120,12 +135,17 @@ parse_args() {
         ''|*[!0-9]*) die "--timeout must be a non-negative integer, got '$TIMEOUT'";;
     esac
     # base needs no archive: the dump carries its anchor, the binlogs come
-    # with the first mark.
-    if [ "$SUBCMD" != base ]; then
+    # with the first mark. A remote check audits the off-site copy; pull
+    # CREATES its archive directory - disaster recovery starts with nothing.
+    if [ "$SUBCMD" = check ] && [ -n "$REMOTE" ]; then
+        [ -z "$ARCHIVE_DIR" ] || die "check audits either --archive (local) or --remote (off-site), not both at once"
+    elif [ "$SUBCMD" != base ]; then
         [ -n "$ARCHIVE_DIR" ] || die "--archive is required (the archived binlogs are the other half of the backup)"
         if [ ! -d "$ARCHIVE_DIR" ]; then
-            [ "$SUBCMD" = mark ] || die "archive directory not found: $ARCHIVE_DIR"
-            mkdir -p "$ARCHIVE_DIR" || die "could not create archive directory: $ARCHIVE_DIR"
+            case "$SUBCMD" in
+                mark|pull) mkdir -p "$ARCHIVE_DIR" || die "could not create archive directory: $ARCHIVE_DIR";;
+                *)         die "archive directory not found: $ARCHIVE_DIR";;
+            esac
         fi
         ARCHIVE_DIR="$(cd "$ARCHIVE_DIR" && pwd)"
     fi
@@ -138,6 +158,13 @@ parse_args() {
             [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove)"
             [ -n "$TOOLS_DIR" ] || die "verify needs --tools (a directory holding mysqlbinlog - the official image ships none; see the header)"
             [ -x "$TOOLS_DIR/mysqlbinlog" ] || die "no executable mysqlbinlog in $TOOLS_DIR";;
+        push)
+            [ -n "$BASE_MANIFEST" ] || die "push needs --base (the base-dump manifest)"
+            [ -n "$MARK_MANIFEST" ] || die "push needs --mark (the instant the remote must be able to prove)"
+            [ -n "$REMOTE" ] || die "push needs --remote (where the copy is going)";;
+        pull)
+            [ -n "$DB" ] || die "pull needs --db (which database to bring back)"
+            [ -n "$REMOTE" ] || die "pull needs --remote (where the copy lives)";;
     esac
 }
 
@@ -357,6 +384,10 @@ EOF
 # --- check -------------------------------------------------------------------
 
 cmd_check() {
+    if [ -n "$REMOTE" ]; then
+        cmd_check_remote
+        return
+    fi
     local problems=0 name prefix=""
     local -a files=() strays=()
     while IFS= read -r name; do
@@ -431,6 +462,348 @@ cmd_check() {
     fi
     ok "archive is continuous: ${#files[@]} binlog(s), $prefix.$(printf '%06d' "$i0") .. $prefix.$(printf '%06d' "$i1")"
     log 'continuous is not recoverable - prove an instant with: ./binlog.sh verify'
+}
+
+# --- push ----------------------------------------------------------------------
+
+# Ship a provable instant: the anchored dump, every binlog in the range the
+# pair replays, and the manifests - the mark LAST, so a mark at the remote is
+# a receipt that everything it needs arrived whole (the offsite.sh protocol).
+# Incremental by HASH, never by name: at a binlog archive even TRUNCATION has
+# no shape - sizes vary by nature, and a binlog cut at an event boundary
+# decodes clean, rc 0, stderr empty (measured). Only the hash sees anything.
+cmd_push() {
+    load_remote
+    rem_preflight rw
+
+    local kind db base_db dir artefact anchor_file anchor_pos mark_file mark_pos
+    [ -f "$BASE_MANIFEST" ] || die "base manifest not found: $BASE_MANIFEST"
+    [ -f "$MARK_MANIFEST" ] || die "mark manifest not found: $MARK_MANIFEST"
+    kind="$(json_str "$BASE_MANIFEST" kind)"
+    [ "$kind" = "binlog-base" ] \
+        || die "'$BASE_MANIFEST' is not a binlog-base manifest (kind '${kind:-none}') - dump backups travel with ./offsite.sh, WAL pairs with ./pitr.sh push"
+    kind="$(json_str "$MARK_MANIFEST" kind)"
+    [ "$kind" = "binlog-mark" ] \
+        || die "'$MARK_MANIFEST' is not a binlog-mark manifest (kind '${kind:-none}') - pass the instant the remote must be able to prove"
+    db="$(json_str "$MARK_MANIFEST" database)"
+    base_db="$(json_str "$BASE_MANIFEST" database)"
+    [ "$db" = "$base_db" ] \
+        || die "the base dump is of '$base_db' but the mark is of '$db' - these describe different databases"
+    dir="$(cd "$(dirname "$BASE_MANIFEST")" && pwd)"
+    artefact="$dir/$(json_str "$BASE_MANIFEST" artefact)"
+    [ -f "$artefact" ] || die "artefact named by the base manifest is missing: $artefact"
+    anchor_file="$(json_str "$BASE_MANIFEST" anchor_file)"
+    anchor_pos="$(json_num "$BASE_MANIFEST" anchor_pos)"
+    mark_file="$(json_str "$MARK_MANIFEST" mark_file)"
+    mark_pos="$(json_num "$MARK_MANIFEST" mark_pos)"
+
+    # The same refusals verify makes: a pair that can never replay must not
+    # be shipped looking like one that can.
+    [ "$(binlog_prefix_of "$mark_file")" = "$(binlog_prefix_of "$anchor_file")" ] \
+        || die "the mark and the anchor name two different servers' histories - pushing this pair would ship that fiction off-site"
+    local a_idx m_idx
+    a_idx=$(binlog_index_of "$anchor_file")
+    m_idx=$(binlog_index_of "$mark_file")
+    if [ "$m_idx" -lt "$a_idx" ] || { [ "$m_idx" -eq "$a_idx" ] && [ "$mark_pos" -lt "$anchor_pos" ]; }; then
+        die "the mark predates the base's anchor - this pair can never replay; nothing was pushed"
+    fi
+    assert_pair_intact "$BASE_MANIFEST" "$artefact" "push"
+
+    local -a inv_lines=()
+    local line
+    mapfile -t inv_lines < <(manifest_section "$MARK_MANIFEST" binlogs)
+    [ "${#inv_lines[@]}" -gt 0 ] \
+        || die "this mark records no binlog inventory - push cannot promise what nothing can audit"
+    local -A inv=()
+    for line in "${inv_lines[@]}"; do
+        inv["${line%%$'\t'*}"]="${line##*$'\t'}"
+    done
+
+    # The chain the pair replays, proven LOCALLY first: present, vouched for
+    # by the inventory, and hashing true - rot replicates as happily as data.
+    local idx name prefix
+    prefix=$(binlog_prefix_of "$anchor_file")
+    local -a to_ship=()
+    for ((idx = a_idx; idx <= m_idx; idx++)); do
+        name=$(binlog_name "$prefix" "$idx")
+        to_ship+=("$name")
+        [ -e "$ARCHIVE_DIR/$name" ] \
+            || die "the chain needs $name and the local archive does not hold it - pushing would replicate the hole off-site (a replay stitches over holes with rc 0 - measured)"
+        [ -n "${inv[$name]:-}" ] \
+            || die "the chain needs $name and the mark's inventory never stood on it - take a fresh mark"
+        [ "$(sha256_of "$ARCHIVE_DIR/$name")" = "${inv[$name]%%:*}" ] \
+            || die "$name does not hash back to the mark's inventory IN THE LOCAL ARCHIVE - refusing to replicate rot off-site"
+    done
+    ok "the local chain hashes back to the mark's inventory (${#to_ship[@]} file(s))"
+
+    local listing pushed=0 skipped=0
+    listing=$(rem_list)
+    for name in "${to_ship[@]}"; do
+        if printf '%s\n' "$listing" | grep -qxF "$name"; then
+            if [ "$(rem_sha256 "$name" || true)" = "${inv[$name]%%:*}" ]; then
+                skipped=$((skipped + 1))
+                continue
+            fi
+            warn "$name sits at the remote with the WRONG bytes (rot, truncation or a crashed upload - all shapeless here; only the hash sees them) - re-shipping it"
+        fi
+        upload_checked "$ARCHIVE_DIR/$name" "$name" "${inv[$name]%%:*}"
+        pushed=$((pushed + 1))
+    done
+
+    local aname asha
+    aname=$(json_str "$BASE_MANIFEST" artefact)
+    asha=$(json_str "$BASE_MANIFEST" sha256)
+    if printf '%s\n' "$listing" | grep -qxF "$aname" && [ "$(rem_sha256 "$aname" || true)" = "$asha" ]; then
+        ok "base dump already at the remote, hashed true there"
+    else
+        upload_checked "$artefact" "$aname" "$asha"
+    fi
+
+    # Manifests last, mark VERY last: the receipt.
+    upload_checked "$BASE_MANIFEST" "$(basename "$BASE_MANIFEST")" "$(sha256_of "$BASE_MANIFEST")"
+    upload_checked "$MARK_MANIFEST" "$(basename "$MARK_MANIFEST")" "$(sha256_of "$MARK_MANIFEST")"
+    ok "PUSHED: $pushed file(s) shipped, $skipped already proven at the remote - it can now prove $mark_file:$mark_pos"
+}
+
+# --- pull ----------------------------------------------------------------------
+
+# Disaster recovery: bring back the newest instant the remote can PROVE - the
+# newest mark manifest by NAME, because push writes the mark last. Everything
+# is re-hashed after the transfer and nothing is ever overwritten.
+cmd_pull() {
+    load_remote
+    rem_preflight ro
+    mkdir -p "$OUT_DIR"
+
+    local listing newest_mark mark_local
+    listing=$(rem_list)
+    newest_mark=$(printf '%s\n' "$listing" | { grep -E "^${DB}_[0-9]{8}T[0-9]{6}Z_binlogmark\.json$" || true; } | LC_ALL=C sort | tail -1)
+    [ -n "$newest_mark" ] || die "the remote holds no binlog mark manifest for '$DB' - it cannot prove any instant of it"
+    mark_local="$OUT_DIR/$newest_mark"
+    [ ! -e "$mark_local" ] || die "refusing to overwrite $mark_local - it may be the only other copy of anything"
+    rem_get "$newest_mark" "$mark_local" || die "could not fetch $newest_mark"
+    if [ "$(json_str "$mark_local" kind)" != "binlog-mark" ]; then
+        rm -f "$mark_local"
+        die "$newest_mark is not a binlog-mark manifest - the fetched copy was removed"
+    fi
+    local mark_file mark_pos
+    mark_file=$(json_str "$mark_local" mark_file)
+    mark_pos=$(json_num "$mark_local" mark_pos)
+    local -a inv_lines=()
+    local line
+    mapfile -t inv_lines < <(manifest_section "$mark_local" binlogs)
+    if [ "${#inv_lines[@]}" -eq 0 ]; then
+        rm -f "$mark_local"
+        die "$newest_mark records no binlog inventory - nothing can vouch for its chain; the fetched copy was removed"
+    fi
+    ok "newest provable instant of '$DB' at the remote: $mark_file:$mark_pos"
+
+    # The newest base this mark can replay from: same prefix, anchor at or
+    # before the mark. Manifests are small - fetch newest-first until one fits.
+    local base_local="" bname btmp bfile bpos
+    while IFS= read -r bname; do
+        [ -n "$bname" ] || continue
+        btmp="$OUT_DIR/.$bname.pulling"
+        rem_get "$bname" "$btmp" 2>/dev/null || { rm -f "$btmp"; continue; }
+        bfile=$(json_str "$btmp" anchor_file)
+        bpos=$(json_num "$btmp" anchor_pos)
+        if [ "$(json_str "$btmp" kind)" = "binlog-base" ] && [ -n "$bfile" ] && [ -n "$bpos" ] \
+            && [ "$(binlog_prefix_of "$bfile")" = "$(binlog_prefix_of "$mark_file")" ] \
+            && { [ "$(binlog_index_of "$bfile")" -lt "$(binlog_index_of "$mark_file")" ] \
+                 || { [ "$(binlog_index_of "$bfile")" -eq "$(binlog_index_of "$mark_file")" ] && [ "$bpos" -le "$mark_pos" ]; }; }; then
+            if [ -e "$OUT_DIR/$bname" ]; then
+                rm -f "$btmp"
+                die "refusing to overwrite $OUT_DIR/$bname - it may be the only other copy of anything"
+            fi
+            mv "$btmp" "$OUT_DIR/$bname"
+            base_local="$OUT_DIR/$bname"
+            break
+        fi
+        rm -f "$btmp"
+    done < <(printf '%s\n' "$listing" | { grep -E "^${DB}_[0-9]{8}T[0-9]{6}Z(_.*)?_binlogbase\.json$" || true; } | LC_ALL=C sort -r)
+    if [ -z "$base_local" ]; then
+        rm -f "$mark_local"
+        die "no base dump at the remote can reach this mark - the remote holds a claim it cannot honor (run ./binlog.sh check --remote)"
+    fi
+
+    local aname asha artefact_tmp
+    aname=$(json_str "$base_local" artefact)
+    asha=$(json_str "$base_local" sha256)
+    [ ! -e "$OUT_DIR/$aname" ] || die "refusing to overwrite $OUT_DIR/$aname - it may be the only other copy of anything"
+    artefact_tmp="$OUT_DIR/.$aname.pulling"
+    if ! rem_get "$aname" "$artefact_tmp"; then
+        rm -f "$artefact_tmp"
+        die "could not fetch $aname"
+    fi
+    if [ "$(sha256_of "$artefact_tmp")" != "$asha" ]; then
+        rm -f "$artefact_tmp"
+        die "$aname did not survive the transfer (or rotted at the remote) - the fetched copy was removed"
+    fi
+    mv "$artefact_tmp" "$OUT_DIR/$aname"
+    ok "base dump fetched and re-hashed: $aname"
+
+    # The chain the pair replays: anchor..mark, re-hashed against the
+    # inventory - the same set push ships and check --remote audits. A file
+    # already in the local archive must hash true too.
+    local -A inv=()
+    for line in "${inv_lines[@]}"; do
+        inv["${line%%$'\t'*}"]="${line##*$'\t'}"
+    done
+    local idx name isha fetched=0 already=0 tmpf prefix
+    prefix=$(binlog_prefix_of "$mark_file")
+    local a_idx m_idx
+    a_idx=$(binlog_index_of "$(json_str "$base_local" anchor_file)")
+    m_idx=$(binlog_index_of "$mark_file")
+    for ((idx = a_idx; idx <= m_idx; idx++)); do
+        name=$(binlog_name "$prefix" "$idx")
+        isha="${inv[$name]:-}"
+        [ -n "$isha" ] \
+            || die "the pair needs $name and the mark's inventory never stood on it - pull refuses to guess"
+        isha="${isha%%:*}"
+        if [ -e "$ARCHIVE_DIR/$name" ]; then
+            [ "$(sha256_of "$ARCHIVE_DIR/$name" 2>/dev/null || echo unreadable)" = "$isha" ] \
+                || die "$ARCHIVE_DIR/$name already exists and is NOT the file the mark stands on - refusing to overwrite it or to trust it"
+            already=$((already + 1))
+            continue
+        fi
+        tmpf="$ARCHIVE_DIR/.$name.pulling"
+        if ! rem_get "$name" "$tmpf"; then
+            rm -f "$tmpf"
+            die "could not fetch $name - the chain is incomplete, and a replay would stitch over the hole silently (measured)"
+        fi
+        if [ "$(sha256_of "$tmpf")" != "$isha" ]; then
+            rm -f "$tmpf"
+            die "$name did not survive the transfer (or rotted at the remote) - the fetched copy was removed"
+        fi
+        mv "$tmpf" "$ARCHIVE_DIR/$name"
+        chmod 644 "$ARCHIVE_DIR/$name"
+        fetched=$((fetched + 1))
+    done
+    ok "PULLED: chain of $((m_idx - a_idx + 1)) file(s) ($fetched fetched, $already already here and hashing true)"
+    ok "Prove the instant:"
+    printf '      ./binlog.sh verify --base %s --mark %s --archive %s --tools TOOLS_DIR\n' "$base_local" "$mark_local" "$ARCHIVE_DIR"
+}
+
+# --- check --remote --------------------------------------------------------------
+
+# The off-site audit: for the newest mark of each database (or --db), every
+# file the PAIR replays must be at the remote and hash back to the mark's
+# inventory - hashed AT the remote. Size says nothing here even about
+# truncation: a binlog cut at an event boundary decodes clean (measured), so
+# the hash carries everything.
+cmd_check_remote() {
+    load_remote
+    rem_preflight ro
+    local listing problems=0 name mark tmp
+    listing=$(rem_list)
+
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        case "$name" in
+            *.part)
+                printf '  %sFAIL%s %s - a crashed upload nothing vouches for\n' "$c_red" "$c_reset" "$name"
+                problems=$((problems + 1));;
+        esac
+    done <<< "$listing"
+
+    local mark_list
+    mark_list=$(printf '%s\n' "$listing" | { grep -E '_[0-9]{8}T[0-9]{6}Z_binlogmark\.json$' || true; })
+    if [ -n "$DB" ]; then
+        mark_list=$(printf '%s\n' "$mark_list" | { grep -E "^${DB}_[0-9]{8}T[0-9]{6}Z_binlogmark\.json$" || true; })
+        [ -n "$mark_list" ] || die "the remote holds no binlog mark manifest for '$DB' - it cannot prove any instant of it"
+    else
+        [ -n "$mark_list" ] || die "the remote holds no binlog mark manifests at all - it cannot prove any instant"
+    fi
+
+    local -a newest=()
+    while IFS= read -r mark; do
+        [ -n "$mark" ] || continue
+        newest+=("$mark")
+    done < <(printf '%s\n' "$mark_list" | LC_ALL=C sort \
+        | awk '{db = $0; sub(/_[0-9]{8}T[0-9]{6}Z_binlogmark\.json$/, "", db); latest[db] = $0}
+               END {for (d in latest) print latest[d]}' | LC_ALL=C sort)
+
+    tmp=$(mktemp -d)
+    local entries iname isha before mark_db
+    for mark in "${newest[@]}"; do
+        before=$problems
+        if ! rem_get "$mark" "$tmp/$mark"; then
+            printf '  %sFAIL%s %s - named by the remote listing but it could not be fetched\n' "$c_red" "$c_reset" "$mark"
+            problems=$((problems + 1))
+            continue
+        fi
+        mark_db=$(json_str "$tmp/$mark" database)
+        entries=$(manifest_section "$tmp/$mark" binlogs)
+        if [ -z "$entries" ]; then
+            printf '  %sFAIL%s %s - records no binlog inventory, so nothing can vouch for its chain\n' "$c_red" "$c_reset" "$mark"
+            problems=$((problems + 1))
+            continue
+        fi
+        local -A inv=()
+        while IFS=$'\t' read -r iname isha; do
+            [ -n "$iname" ] || continue
+            inv["$iname"]="$isha"
+        done <<< "$entries"
+
+        # Something for the chain to replay from: the newest intact base at
+        # the remote that can reach this mark. Its anchor decides WHAT to
+        # audit - the same range push ships and pull fetches.
+        local mark_file mark_pos base_ok=0 bname bfile bpos
+        mark_file=$(json_str "$tmp/$mark" mark_file)
+        mark_pos=$(json_num "$tmp/$mark" mark_pos)
+        while IFS= read -r bname; do
+            [ -n "$bname" ] || continue
+            rem_get "$bname" "$tmp/$bname" 2>/dev/null || continue
+            bfile=$(json_str "$tmp/$bname" anchor_file)
+            bpos=$(json_num "$tmp/$bname" anchor_pos)
+            [ "$(json_str "$tmp/$bname" kind)" = "binlog-base" ] || continue
+            if [ -z "$bfile" ] || [ -z "$bpos" ]; then continue; fi
+            [ "$(binlog_prefix_of "$bfile")" = "$(binlog_prefix_of "$mark_file")" ] || continue
+            if [ "$(binlog_index_of "$bfile")" -lt "$(binlog_index_of "$mark_file")" ] \
+                || { [ "$(binlog_index_of "$bfile")" -eq "$(binlog_index_of "$mark_file")" ] && [ "$bpos" -le "$mark_pos" ]; }; then
+                if [ "$(rem_sha256 "$(json_str "$tmp/$bname" artefact)" || true)" = "$(json_str "$tmp/$bname" sha256)" ]; then
+                    base_ok=1
+                    break
+                fi
+            fi
+        done < <(printf '%s\n' "$listing" | { grep -E "^${mark_db}_[0-9]{8}T[0-9]{6}Z(_.*)?_binlogbase\.json$" || true; } | LC_ALL=C sort -r)
+
+        local -a audit=()
+        local idx
+        if [ "$base_ok" -eq 1 ]; then
+            for ((idx = $(binlog_index_of "$bfile"); idx <= $(binlog_index_of "$mark_file"); idx++)); do
+                audit+=("$(binlog_name "$(binlog_prefix_of "$mark_file")" "$idx")")
+            done
+        else
+            printf '  %sFAIL%s %s - no intact base dump at the remote can reach this mark, so its chain has nothing to replay from\n' "$c_red" "$c_reset" "$mark"
+            problems=$((problems + 1))
+            for iname in "${!inv[@]}"; do audit+=("$iname"); done
+        fi
+        while IFS= read -r iname; do
+            [ -n "$iname" ] || continue
+            isha="${inv[$iname]:-}"
+            if [ -z "$isha" ]; then
+                printf '  %sFAIL%s %s - the pair needs it and the mark'\''s inventory never stood on it\n' "$c_red" "$c_reset" "$iname"
+                problems=$((problems + 1))
+            elif ! printf '%s\n' "$listing" | grep -qxF "$iname"; then
+                printf '  %sFAIL%s %s - the mark stands on it and the remote does not hold it\n' "$c_red" "$c_reset" "$iname"
+                problems=$((problems + 1))
+            elif [ "$(rem_sha256 "$iname" || true)" != "${isha%%:*}" ]; then
+                printf '  %sFAIL%s %s - the remote'\''s bytes do not hash back to the mark'\''s inventory (rot, truncation or a partial upload - all shapeless at a binlog archive; only the hash sees them)\n' "$c_red" "$c_reset" "$iname"
+                problems=$((problems + 1))
+            fi
+        done < <(printf '%s\n' "${audit[@]}" | LC_ALL=C sort -u)
+        if [ "$problems" -eq "$before" ]; then
+            printf '  %sOK%s   %s - base intact, every file the pair replays present and hashing true at the remote\n' "$c_green" "$c_reset" "$mark"
+        fi
+    done
+    rm -rf "$tmp"
+
+    printf '\n'
+    if [ "$problems" -gt 0 ]; then
+        die "REMOTE ARCHIVE CHECK FAILED: $problems problem(s). A disaster recovery from this remote would stitch, rot or stop short - this is the cheap day to find out."
+    fi
+    ok "the remote can prove every instant it claims (${#newest[@]} mark(s) audited)"
 }
 
 # --- verify ------------------------------------------------------------------
@@ -623,6 +996,8 @@ main() {
         mark)   cmd_mark;;
         check)  cmd_check;;
         verify) cmd_verify;;
+        push)   cmd_push;;
+        pull)   cmd_pull;;
     esac
 }
 

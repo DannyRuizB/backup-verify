@@ -67,6 +67,13 @@ age-keygen -o key.txt
 ./binlog.sh verify --base ./backups/app_..._binlogbase.json \
                    --mark ./backups/app_..._binlogmark.json \
                    --archive /srv/binlog-archive --tools ./tools
+
+# ...and off the machine too, same remotes, same receipts:
+./binlog.sh push  --base ./backups/app_..._binlogbase.json \
+                  --mark ./backups/app_..._binlogmark.json \
+                  --archive /srv/binlog-archive --remote bk@nas:/srv/binlogs
+./binlog.sh check --remote bk@nas:/srv/binlogs
+./binlog.sh pull  --db app --remote bk@nas:/srv/binlogs --archive ./recovered-binlogs
 ```
 
 ```
@@ -324,6 +331,27 @@ archiving but in places its exact opposite:
 Measured with `gtid_mode=OFF`, the 8.4 default; GTID-mode PITR changes the
 replay rules and is not claimed here.
 
+### The binlog archive has to leave the building too
+
+`push`, `pull` and `check --remote` work exactly as `pitr.sh`'s do — same
+`rem_*` transports, upload to `.part` with the remote hashing before the
+rename, the mark manifest travelling last as the receipt, everything
+incremental by hash and re-hashed after every transfer, and all three
+operating on the same set: the range the pair replays. One measured fact
+makes the binlog remote *more* treacherous than the WAL one:
+
+> At a WAL archive, truncation at least had a shape — every complete segment
+> measures exactly `wal_segment_size`, so a short file is loud. **A binlog
+> truncated exactly at an event boundary decodes clean: rc 0, stderr EMPTY,
+> half the history amputated** — measured: 3 of 6 commits survived a cut
+> after a commit event, checksums verified, not one word of complaint. And
+> sizes vary by nature, so the size says nothing either. At a binlog archive
+> the mark's inventory hash is not the best defence — it is the *only* one.
+
+The fire drill is the same as the WAL's: mark, push, lose the machine —
+source, local archive, every manifest — pull, and the instant comes back
+exactly, arrival proven by content on a bare machine.
+
 ## How it works
 
 **`backup.sh --engine postgres|mysql|files`** dumps with the engine's own tool
@@ -443,6 +471,12 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   and the rot are named before anything boots; the pre-anchor mark is
   refused in milliseconds; and the drill to the second mark proves the
   archived disaster is also a recoverable instant.
+- **`test/binlog-offsite.sh [--remote-kind ssh|dir]`** — the binlog archive's
+  own fire drill: push, lose the machine, pull, and verify on nothing but
+  the remote's contents — plus the incremental push, the unpushed mark being
+  unclaimable, rot at the remote (shapeless here even as truncation —
+  measured) named by `check --remote`, refused by `pull` and repaired by the
+  next `push`, and the `.part` debris named.
 - **`test/backup.bats`**, **`test/offsite.bats`**, **`test/pitr.bats`** and
   **`test/binlog.bats`** —
   unit tests over argument
@@ -457,7 +491,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
   **plain and encrypted**, because encryption must not change the promise —
-  the MySQL binlog fire drill, and everything
+  the MySQL binlog fire drill and its off-site drill over **both remote
+  kinds**, and everything
   again on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
@@ -597,15 +632,16 @@ explicitly, so both transports tell the same story.
 PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
 `--engine files`, off-site copies over ssh or onto a mounted disk, and
 point-in-time recovery for both database engines — Postgres over a WAL
-archive (pushed off-site, audited at the remote, pulled back onto a bare
-machine, optionally encrypted end to end) and MySQL over archived binlogs:
-contents, schema objects (or file metadata), encryption at rest, whether the
-restored copy is actually usable, whether the remote provably holds what was
-sent, and whether a named instant provably comes back. Deliberately not here
-yet: binlog PITR under GTID mode (measured with the 8.4 default, `gtid_mode=OFF`),
-and the binlog archive off-site or encrypted — the WAL archive earned both
-one measured campaign at a time, and the binlog archive will earn them the same way. On the
-roadmap, not pretended to work today.
+archive (optionally encrypted end to end) and MySQL over archived binlogs,
+both pushed off-site, audited at the remote, and pulled back onto a bare
+machine: contents, schema objects (or file metadata), encryption at rest,
+whether the restored copy is actually usable, whether the remote provably
+holds what was sent, and whether a named instant provably comes back.
+Deliberately not here yet: binlog PITR under GTID mode (measured with the
+8.4 default, `gtid_mode=OFF`), and the binlog archive encrypted — the WAL
+archive earned encryption through its own measured campaign, and the binlog
+archive will earn it the same way. On the roadmap, not pretended to work
+today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

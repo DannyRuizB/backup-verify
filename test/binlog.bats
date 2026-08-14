@@ -174,3 +174,103 @@ fabricate_pair() {
     [[ "$output" == *"TWO prefixes"* ]]
     rm -rf "$tmp"
 }
+
+# --- the off-site binlog archive ---------------------------------------------------
+
+@test "binlog help lists push, pull and the remote options" {
+    run bash "$REPO/binlog.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"push"* ]]
+    [[ "$output" == *"pull"* ]]
+    [[ "$output" == *"--remote"* ]]
+    [[ "$output" == *"--ssh-opts"* ]]
+}
+
+@test "binlog push and pull name every input they refuse to run without" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/binlog.sh'; parse_args push --archive '$tmp'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"push needs --base"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args push --archive '$tmp' --base b --mark m"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"push needs --remote"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args pull --archive '$tmp' --remote r"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"pull needs --db"* ]]
+    rm -rf "$tmp"
+}
+
+@test "binlog check audits the local archive or the remote, never both at once" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/binlog.sh'; parse_args check --archive '$tmp' --remote '$tmp'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not both at once"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args check --remote '$tmp' && echo PARSED"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PARSED"* ]]
+    rm -rf "$tmp"
+}
+
+@test "binlog pull creates its archive directory - disaster recovery starts with nothing" {
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/binlog.sh'; parse_args pull --db app --remote r --archive '$tmp/fresh/archive' && echo PARSED"
+    [ "$status" -eq 0 ]
+    [ -d "$tmp/fresh/archive" ]
+    rm -rf "$tmp"
+}
+
+@test "binlog push refuses to replicate a local hole off-site" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote" "$tmp/archive"
+    fabricate_pair "$tmp" binlog.000003 158 binlog.000005 200
+    printf 'log bytes' > "$tmp/archive/binlog.000003"
+    printf 'log bytes' > "$tmp/archive/binlog.000005"   # 000004 missing locally
+    run bash "$REPO/binlog.sh" push --base "$tmp/b_binlogbase.json" --mark "$tmp/m_binlogmark.json" \
+        --archive "$tmp/archive" --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"binlog.000003"* || "$output" == *"binlog.000004"* ]]
+    [[ "$output" == *"replicate"* || "$output" == *"inventory"* ]]
+    rm -rf "$tmp"
+}
+
+@test "binlog pull refuses a remote that cannot prove any instant of the database" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    run bash "$REPO/binlog.sh" pull --db app --remote "$tmp/remote" \
+        --archive "$tmp/archive" --out "$tmp/out"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no binlog mark manifest for 'app'"* ]]
+    rm -rf "$tmp"
+}
+
+@test "binlog check --remote names the crashed upload, the missing file and the missing base" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    printf 'crashed' > "$tmp/remote/binlog.000009.part"
+    printf '{\n  "schema": 3,\n  "kind": "binlog-mark",\n  "database": "app",\n  "mark_file": "binlog.000005",\n  "mark_pos": 200,\n  "binlogs": {\n    "binlog.000005": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:158"\n  },\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        > "$tmp/remote/app_20260101T000000Z_binlogmark.json"
+    run bash "$REPO/binlog.sh" check --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"binlog.000009.part - a crashed upload"* ]]
+    [[ "$output" == *"does not hold it"* ]]
+    [[ "$output" == *"no intact base dump at the remote"* ]]
+    rm -rf "$tmp"
+}
+
+@test "binlog check --remote blesses a remote whose newest mark provably replays" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    printf 'not really a mysqldump' > "$tmp/remote/b.sql"
+    bsha=$(sha256sum "$tmp/remote/b.sql" | cut -d' ' -f1)
+    bbytes=$(stat -c%s "$tmp/remote/b.sql")
+    printf '{\n  "schema": 3,\n  "kind": "binlog-base",\n  "database": "app",\n  "artefact": "b.sql",\n  "bytes": %s,\n  "sha256": "%s",\n  "engine": "mysql",\n  "server_version": "8.4",\n  "anchor_file": "binlog.000005",\n  "anchor_pos": 100\n}\n' \
+        "$bbytes" "$bsha" > "$tmp/remote/app_20260101T000000Z_binlogbase.json"
+    printf 'log bytes' > "$tmp/remote/binlog.000005"
+    ssha=$(sha256sum "$tmp/remote/binlog.000005" | cut -d' ' -f1)
+    printf '{\n  "schema": 3,\n  "kind": "binlog-mark",\n  "database": "app",\n  "mark_file": "binlog.000005",\n  "mark_pos": 200,\n  "binlogs": {\n    "binlog.000005": "%s:9"\n  },\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        "$ssha" > "$tmp/remote/app_20260101T000000Z_binlogmark.json"
+    run bash "$REPO/binlog.sh" check --remote "$tmp/remote"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"can prove every instant it claims"* ]]
+    rm -rf "$tmp"
+}
