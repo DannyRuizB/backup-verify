@@ -12,11 +12,12 @@ name: ci
 #   pitr         - the point-in-time drill: base backup + WAL archive, disaster
 #                  committed AFTER the mark, source destroyed - and the named
 #                  instant comes back exactly, with every measured archive lie
-#                  caught
+#                  caught; plain and with the whole chain encrypted through age
 #   pitr-offsite - the strongest disaster simulated here: mark, push, then
 #                  lose the MACHINE (source, archive, manifests) - the remote
 #                  alone brings the named instant back, and every measured way
-#                  an off-site WAL archive lies is caught, over both remotes
+#                  an off-site WAL archive lies is caught, over both remotes,
+#                  plain and encrypted end to end
 on:
   push:
     branches: [main]
@@ -116,32 +117,52 @@ jobs:
         run: ./test/offsite.sh --remote-kind ${{ matrix.remote }}
 
   pitr:
-    name: PITR fire drill (${{ matrix.image }})
+    name: PITR fire drill (${{ matrix.image }} ${{ matrix.mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       # A recovery is a compatibility promise too: base backups are bytes from
-      # ONE major version, so the drill runs on both supported majors.
+      # ONE major version, so the drill runs on both supported majors - and
+      # encryption must not change the promise, so the same drill also runs
+      # with every segment leaving the server as age ciphertext.
       matrix:
         image: ['postgres:17-alpine', 'postgres:16-alpine']
+        mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
+      # The static RELEASE build, not apt: this binary rides INTO alpine
+      # containers, and Ubuntu's packaged age does not run there (the
+      # harness's preflight caught exactly that on this job's first run).
+      - name: Install age (static release build)
+        if: matrix.mode == '--encrypted'
+        run: |
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar -xz
+          sudo install age/age age/age-keygen /usr/local/bin/
       - name: fire drill + every measured WAL archive lie
         env:
           BV_IMAGE: ${{ matrix.image }}
-        run: ./test/pitr.sh
+        run: ./test/pitr.sh ${{ matrix.mode }}
 
   pitr-offsite:
-    name: PITR off-site fire drill (${{ matrix.remote }})
+    name: PITR off-site fire drill (${{ matrix.remote }} ${{ matrix.mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       # Same protocol over both transports on purpose: the harness caught a
       # recovery that worked over ssh and died over a directory remote with
-      # the SAME bytes (a copied 0600 mode vs a redirect's 0644).
+      # the SAME bytes (a copied 0600 mode vs a redirect's 0644). And the
+      # encrypted chain must survive the same fire untouched.
       matrix:
         remote: [ssh, dir]
+        mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
+      # Static release build, same reason as the pitr job: apt's age cannot
+      # run inside the alpine containers the drill mounts it into.
+      - name: Install age (static release build)
+        if: matrix.mode == '--encrypted'
+        run: |
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar -xz
+          sudo install age/age age/age-keygen /usr/local/bin/
       - name: fire drill + every measured off-site WAL archive lie
-        run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }}
+        run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }} ${{ matrix.mode }}

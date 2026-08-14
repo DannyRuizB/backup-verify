@@ -73,6 +73,15 @@
 #   --remote REMOTE   user@host:/path (ssh) or /path (a mounted disk) -
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
+#   --recipient KEY   (base) encrypt the base backup with age; KEY is an age
+#                     public key or a file of them. Requires --identity: a
+#                     base whose backup_label cannot be read is not a base,
+#                     and the key gets proven TODAY, not at restore time.
+#   --identity FILE   age identity. Required by base --recipient, and by
+#                     verify whenever the base artefact or the WAL archive is
+#                     encrypted - no key, no drill, no comforting green tick.
+#                     (The archive's own files say whether it is encrypted:
+#                     an archive_command piping through age delivers %f.age.)
 #   -h, --help        this help
 #
 # Exit codes: 0 the claim was proven, non-zero otherwise. A mark or a base
@@ -98,6 +107,9 @@ PROBE=""
 SCRATCH=""
 REMOTE=""
 SSH_OPTS_STR=""
+RECIPIENT=""
+IDENTITY=""
+KEYDIR=""
 
 usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -122,6 +134,8 @@ parse_args() {
             --keep-container) KEEP_CONTAINER=1; shift;;
             --remote)         REMOTE="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
+            --recipient)      RECIPIENT="${2:-}"; shift 2;;
+            --identity)       IDENTITY="${2:-}"; shift 2;;
             -h|--help)        usage 0;;
             *)                printf 'unknown option: %s\n' "$1" >&2; usage 1;;
         esac
@@ -142,10 +156,16 @@ parse_args() {
     case "$TIMEOUT" in
         ''|*[!0-9]*) die "--timeout must be a non-negative integer, got '$TIMEOUT'";;
     esac
+    if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
+        die "identity file not found: $IDENTITY"
+    fi
     case "$SUBCMD" in
         base|mark)
             [ -n "$CONTAINER" ] || die "$SUBCMD needs --container (where the database lives)"
-            [ -n "$DB" ] || die "$SUBCMD needs --db";;
+            [ -n "$DB" ] || die "$SUBCMD needs --db"
+            if [ "$SUBCMD" = base ] && [ -n "$RECIPIENT" ] && [ -z "$IDENTITY" ]; then
+                die "base --recipient requires --identity: the backup_label (which WAL segment recovery starts at) lives INSIDE the artefact, and a base whose birth certificate cannot be read is not a base - and the key gets proven today, not at restore time"
+            fi;;
         verify)
             [ -n "$BASE_MANIFEST" ] || die "verify needs --base (the base-backup manifest)"
             [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove)";;
@@ -185,6 +205,20 @@ wal_segment_bytes() {
     eng_query "$CONTAINER" postgres "SELECT setting FROM pg_settings WHERE name = 'wal_segment_size';" | tr -d '\n'
 }
 
+# The archive's own files say whether it is encrypted: an archive_command that
+# pipes through age delivers %f.age. Mixed contents mean two different
+# archive_commands have written here - recovery through such a chain is a
+# coin toss, so it is a refusal, not a warning.
+archive_wal_suffix() {
+    local plain enc
+    plain=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' | { grep -cE '^[0-9A-F]{24}$' || true; })
+    enc=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' | { grep -cE '^[0-9A-F]{24}\.age$' || true; })
+    if [ "$enc" -gt 0 ] && [ "$plain" -gt 0 ]; then
+        die "the archive holds BOTH plain and .age segments - two archive_commands have written here, and a recovery through a mixed chain is a coin toss; refusing"
+    fi
+    if [ "$enc" -gt 0 ]; then printf '.age'; fi
+}
+
 # --- base ---------------------------------------------------------------------
 
 cmd_base() {
@@ -212,15 +246,42 @@ cmd_base() {
     # failure with a name.
     trap 'rm -f -- "$artefact"' ERR
     local rc=0 errfile="$OUT_DIR/.bb-stderr.$$"
-    timeout "$TIMEOUT" docker exec "$CONTAINER" pg_basebackup -U postgres -Ft -X none -D - \
-        > "$artefact" 2> "$errfile" < /dev/null || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        sed 's/^/      /' "$errfile"; rm -f -- "$errfile" "$artefact"
-        if [ "$rc" -eq 124 ]; then
-            archiver_diagnosis
-            die "pg_basebackup did not finish in ${TIMEOUT}s. With -X none it waits for its WAL to be ARCHIVED - a failing archiver hangs it, and hanging here is the honest outcome: the archive could not hold this backup's other half."
+    if [ -n "$RECIPIENT" ]; then
+        encryption_available || die "--recipient given but 'age' is not installed"
+        artefact="$artefact$ENC_SUFFIX"
+        local -a recip_args=()
+        if [ -f "$RECIPIENT" ]; then
+            recip_args=(-R "$RECIPIENT")
+        else
+            recip_args=(-r "$RECIPIENT")
         fi
-        die "pg_basebackup failed (rc $rc) - no artefact was left behind"
+        # The backup.sh pipe, replayed: the PLAINTEXT tar never touches disk,
+        # PIPESTATUS names which side broke, and rc 124 still means the
+        # archiver wedged pg_basebackup's -X none wait.
+        set +e
+        timeout "$TIMEOUT" docker exec "$CONTAINER" pg_basebackup -U postgres -Ft -X none -D - \
+            2> "$errfile" < /dev/null | age "${recip_args[@]}" > "$artefact"
+        local -a st=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${st[0]}" -ne 0 ] || [ "${st[1]}" -ne 0 ]; then
+            sed 's/^/      /' "$errfile"; rm -f -- "$errfile" "$artefact"
+            if [ "${st[0]}" -eq 124 ]; then
+                archiver_diagnosis
+                die "pg_basebackup did not finish in ${TIMEOUT}s. With -X none it waits for its WAL to be ARCHIVED - a failing archiver hangs it, and hanging here is the honest outcome: the archive could not hold this backup's other half."
+            fi
+            die "encrypted base backup failed (pg_basebackup rc=${st[0]}, age rc=${st[1]}) - no artefact was left behind"
+        fi
+    else
+        timeout "$TIMEOUT" docker exec "$CONTAINER" pg_basebackup -U postgres -Ft -X none -D - \
+            > "$artefact" 2> "$errfile" < /dev/null || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            sed 's/^/      /' "$errfile"; rm -f -- "$errfile" "$artefact"
+            if [ "$rc" -eq 124 ]; then
+                archiver_diagnosis
+                die "pg_basebackup did not finish in ${TIMEOUT}s. With -X none it waits for its WAL to be ARCHIVED - a failing archiver hangs it, and hanging here is the honest outcome: the archive could not hold this backup's other half."
+            fi
+            die "pg_basebackup failed (rc $rc) - no artefact was left behind"
+        fi
     fi
     sed 's/^/      /' "$errfile"   # the measured NOTICE: "all required WAL segments have been archived"
     rm -f -- "$errfile"
@@ -232,16 +293,34 @@ cmd_base() {
         rm -f -- "$artefact"
         die "base backup is only ${size} bytes (< $floor) - refusing to call that a base backup"
     fi
-    if ! tar -tf "$artefact" > /dev/null 2>&1; then
-        rm -f -- "$artefact"
-        die "the base backup does not parse as a tar archive - removed"
-    fi
-
-    # backup_label is the base's birth certificate: the first WAL segment
-    # recovery will ask the archive for. The continuity gate starts there.
+    # The parse check, and the base's birth certificate (backup_label: the
+    # first WAL segment recovery will ask the archive for), both read the tar
+    # - through the identity when encrypted, which is exactly why base
+    # --recipient requires it: this is also the key being proven TODAY.
     local label_text wal_start_file
-    label_text=$(tar -xOf "$artefact" backup_label 2>/dev/null) \
-        || { rm -f -- "$artefact"; die "the base backup contains no backup_label - removed"; }
+    if [ -n "$RECIPIENT" ]; then
+        set +e
+        age -d -i "$IDENTITY" "$artefact" | tar -t > /dev/null 2>&1
+        local -a pst=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${pst[0]}" -ne 0 ]; then
+            rm -f -- "$artefact"
+            die "the artefact does not decrypt with the given identity (age rc=${pst[0]}) - removed"
+        fi
+        if [ "${pst[1]}" -ne 0 ]; then
+            rm -f -- "$artefact"
+            die "the decrypted base backup does not parse as a tar archive - removed"
+        fi
+        label_text=$(age -d -i "$IDENTITY" "$artefact" 2>/dev/null | tar -xO backup_label 2>/dev/null) \
+            || { rm -f -- "$artefact"; die "the base backup contains no backup_label - removed"; }
+    else
+        if ! tar -tf "$artefact" > /dev/null 2>&1; then
+            rm -f -- "$artefact"
+            die "the base backup does not parse as a tar archive - removed"
+        fi
+        label_text=$(tar -xOf "$artefact" backup_label 2>/dev/null) \
+            || { rm -f -- "$artefact"; die "the base backup contains no backup_label - removed"; }
+    fi
     wal_start_file=$(printf '%s\n' "$label_text" | sed -n 's/^START WAL LOCATION: .* (file \([0-9A-F]*\)).*/\1/p')
     [ -n "$wal_start_file" ] || { rm -f -- "$artefact"; die "backup_label names no start WAL file - removed"; }
 
@@ -338,11 +417,25 @@ EOF
     # for DAYS while everything reports success.
     eng_query "$CONTAINER" "$DB" 'SELECT pg_walfile_name(pg_switch_wal());' > /dev/null
     log "waiting for $mark_file to land in the archive (a mark you cannot recover to must not exist)"
-    local waited=0 size
+    # The archive decides the form: a plain archive_command delivers %f (done
+    # at exactly seg_bytes), an encrypting one delivers %f.age - LARGER than
+    # the plaintext by a constant, and this probe itself once stamped a
+    # half-written .age (measured: 7.8MB of a 16.8MB ciphertext, milliseconds
+    # after "the file exists"), so the encrypted wait demands a size that is
+    # past the plaintext AND stable across two polls.
+    local waited=0 size last_size=-1 wal_suffix="" wal_enc_bytes=""
     while :; do
         if [ -f "$ARCHIVE_DIR/$mark_file" ]; then
             size=$(stat -c%s "$ARCHIVE_DIR/$mark_file")
             [ "$size" -eq "$seg_bytes" ] && break   # a growing file is a copy in flight
+        elif [ -f "$ARCHIVE_DIR/$mark_file.age" ]; then
+            size=$(stat -c%s "$ARCHIVE_DIR/$mark_file.age")
+            if [ "$size" -gt "$seg_bytes" ] && [ "$size" -eq "$last_size" ]; then
+                wal_suffix=".age"
+                wal_enc_bytes=$size
+                break
+            fi
+            last_size=$size
         fi
         waited=$((waited + 1))
         if [ "$waited" -gt "$TIMEOUT" ]; then
@@ -351,7 +444,12 @@ EOF
         fi
         sleep 1
     done
-    ok "segment $mark_file is in the archive, all $seg_bytes bytes of it"
+    archive_wal_suffix > /dev/null   # dies loudly on a MIXED plain/.age archive
+    if [ -n "$wal_suffix" ]; then
+        ok "segment $mark_file.age is in the archive, all $wal_enc_bytes ciphertext bytes of it"
+    else
+        ok "segment $mark_file is in the archive, all $seg_bytes bytes of it"
+    fi
 
     # The mark doubles as the archive's INVENTORY: one sha256 per segment it
     # stands on (everything on its timeline up to and including its own
@@ -365,10 +463,21 @@ EOF
     local sidecar mark_tl inv_files wal_block="" first_wal=1 hline
     sidecar=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER")
     mark_tl=$(wal_name_timeline "$mark_file")
+    # In an encrypted archive the inventory hashes the CIPHERTEXT as archived:
+    # age is non-deterministic (measured: same segment encrypted twice gives
+    # different bytes), so the archived file IS the identity - re-encrypting
+    # can never reproduce it, only the inventory can vouch for it.
     inv_files=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort \
-        | awk -v tl="$mark_tl" -v mark="$mark_file" '
-            /^[0-9A-F]{24}$/ { if (substr($0, 1, 8) == tl && $0 <= mark) print; next }
-            /^[0-9A-F]{8}\.history$/ { print }')
+        | awk -v tl="$mark_tl" -v mark="$mark_file" -v sfx="$wal_suffix" '
+            {
+                name = $0
+                if (sfx != "" && substr(name, length(name) - length(sfx) + 1) == sfx)
+                    name = substr(name, 1, length(name) - length(sfx))
+                else if (sfx != "")
+                    next
+            }
+            name ~ /^[0-9A-F]{24}$/ { if (substr(name, 1, 8) == tl && name <= mark) print $0; next }
+            name ~ /^[0-9A-F]{8}\.history$/ { print $0 }')
     log "fingerprinting the chain the mark stands on ($(printf '%s\n' "$inv_files" | grep -c .) file(s), hashed in a $sidecar sidecar)"
     while IFS= read -r hline; do
         [ -n "$hline" ] || continue
@@ -378,8 +487,8 @@ EOF
     done < <(printf '%s\n' "$inv_files" | sed 's|^|/archive/|' \
         | docker run --rm -i -u root --entrypoint sh -v "$ARCHIVE_DIR:/archive:ro" "$sidecar" \
             -c 'xargs -r sha256sum' | sed 's|/archive/||')
-    printf '%s' "$wal_block" | grep -qF "\"$mark_file\":" \
-        || die "the sidecar never hashed $mark_file - refusing to write a mark whose own segment is missing from its inventory"
+    printf '%s' "$wal_block" | grep -qF "\"$mark_file$wal_suffix\":" \
+        || die "the sidecar never hashed $mark_file$wal_suffix - refusing to write a mark whose own segment is missing from its inventory"
 
     {
         printf '{\n'
@@ -392,6 +501,8 @@ EOF
         printf '  "lsn": "%s",\n' "$mark_lsn"
         printf '  "wal_file": "%s",\n' "$mark_file"
         printf '  "quiesced": "%s",\n' "$quiesced"
+        printf '  "wal_files_encrypted": "%s",\n' "$([ -n "$wal_suffix" ] && echo yes || echo no)"
+        [ -z "$wal_enc_bytes" ] || printf '  "wal_ciphertext_bytes": %s,\n' "$wal_enc_bytes"
         printf '  "wal": {\n%s\n  },\n' "$wal_block"
         printf '  "tables": {\n%s\n  },\n' "$tables_block"
         printf '  "objects": {\n%s\n  }\n' "$objects_block"
@@ -493,13 +604,14 @@ cmd_check_remote() {
             inv["$iname"]="$isha"
         done <<< "$entries"
         local -a audit=()
-        local idx
+        local idx rsfx=""
+        [ "$(json_str "$tmp/$mark" wal_files_encrypted)" != "yes" ] || rsfx=".age"
         if [ "$base_ok" -eq 1 ]; then
             for ((idx = $(wal_name_index "$bstart" "$bbytes"); idx <= $(wal_name_index "$mark_file" "$bbytes"); idx++)); do
-                audit+=("$(wal_index_name "$(wal_name_timeline "$mark_file")" "$idx" "$bbytes")")
+                audit+=("$(wal_index_name "$(wal_name_timeline "$mark_file")" "$idx" "$bbytes")$rsfx")
             done
             for iname in "${!inv[@]}"; do
-                case "$iname" in *.history) audit+=("$iname");; esac
+                case "$iname" in *.history|*.history.age) audit+=("$iname");; esac
             done
         else
             printf '  %sFAIL%s %s - no intact base backup at the remote can reach this mark, so its chain has nothing to stand on\n' "$c_red" "$c_reset" "$mark"
@@ -538,14 +650,26 @@ cmd_check() {
         cmd_check_remote
         return
     fi
-    local problems=0 name size seg_bytes=""
+    local problems=0 name size seg_bytes="" bare
     local -a segments=() strays=()
 
+    # An encrypted archive holds NAME.age for every form below; a plain file
+    # in an encrypted archive (or vice versa) is a stray like any other
+    # squatter. Classification works on the bare name, sizes on the real one.
+    local suffix
+    suffix=$(archive_wal_suffix)
     while IFS= read -r name; do
         [ -n "$name" ] || continue
-        if [[ "$name" =~ ^[0-9A-F]{24}$ ]]; then
-            segments+=("$name")
-        elif [[ "$name" =~ ^[0-9A-F]{24}\.[0-9A-F]{8}\.backup$ ]] || [[ "$name" =~ ^[0-9A-F]{8}\.history$ ]]; then
+        bare="$name"
+        if [ -n "$suffix" ]; then
+            case "$name" in
+                *"$suffix") bare="${name%"$suffix"}";;
+                *)          strays+=("$name"); continue;;
+            esac
+        fi
+        if [[ "$bare" =~ ^[0-9A-F]{24}$ ]]; then
+            segments+=("$bare")
+        elif [[ "$bare" =~ ^[0-9A-F]{24}\.[0-9A-F]{8}\.backup$ ]] || [[ "$bare" =~ ^[0-9A-F]{8}\.history$ ]]; then
             :   # backup history and timeline history files: small by design, expected
         else
             strays+=("$name")
@@ -567,16 +691,28 @@ cmd_check() {
     done
 
     # The segment size: asked of the server when one is offered, otherwise the
-    # largest present (a segment cannot be larger than the true size).
+    # largest present (a segment cannot be larger than the true size). An
+    # encrypted archive needs both numbers: the on-disk size of a complete
+    # ciphertext (largest present - measured constant across segments) and the
+    # PLAINTEXT segment size for the name arithmetic, which is the power of
+    # two just below the ciphertext (WAL segments are powers of two; the age
+    # overhead is a few KB, far smaller than the gap to the next power).
+    local expect_bytes=""
+    for name in "${segments[@]}"; do
+        size=$(stat -c%s "$ARCHIVE_DIR/$name$suffix")
+        [ -n "$expect_bytes" ] && [ "$size" -le "$expect_bytes" ] || expect_bytes=$size
+    done
     if [ -n "$CONTAINER" ]; then
         seg_bytes=$(wal_segment_bytes)
-    else
-        for name in "${segments[@]}"; do
-            size=$(stat -c%s "$ARCHIVE_DIR/$name")
-            [ -n "$seg_bytes" ] && [ "$size" -le "$seg_bytes" ] || seg_bytes=$size
-        done
+    elif [ -z "$suffix" ]; then
+        seg_bytes=$expect_bytes
         log "assuming ${seg_bytes}-byte segments (largest present; pass --container to ask the server)"
+    else
+        seg_bytes=1
+        while [ $((seg_bytes * 2)) -le "$expect_bytes" ]; do seg_bytes=$((seg_bytes * 2)); done
+        log "assuming ${seg_bytes}-byte segments under ${expect_bytes}-byte ciphertexts (largest present; pass --container to ask the server)"
     fi
+    [ -n "$suffix" ] || expect_bytes=$seg_bytes
 
     # Continuity, per timeline: every segment between the oldest and newest
     # present, each one exactly full-size. This is the cheap version of the
@@ -592,7 +728,7 @@ cmd_check() {
                     last="$name";;
             esac
         done
-        mapfile -t range_problems < <(wal_range_problems "$ARCHIVE_DIR" "$first" "$last" "$seg_bytes")
+        mapfile -t range_problems < <(wal_range_problems "$ARCHIVE_DIR" "$first" "$last" "$seg_bytes" "$suffix" "$expect_bytes")
         for line in ${range_problems[@]+"${range_problems[@]}"}; do
             printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$line"
             problems=$((problems + 1))
@@ -635,7 +771,7 @@ cmd_check() {
     if [ "$problems" -gt 0 ]; then
         die "ARCHIVE CHECK FAILED: $problems problem(s). A recovery through this archive would stop early or die - this is the cheap day to find out."
     fi
-    ok "archive is continuous: ${#segments[@]} segment(s), every one the full $seg_bytes bytes"
+    ok "archive is continuous: ${#segments[@]} segment(s), every one the full $expect_bytes bytes$([ -n "$suffix" ] && echo ' of ciphertext')"
     log 'continuous is not recoverable - prove an instant with: ./pitr.sh verify'
 }
 
@@ -691,8 +827,15 @@ cmd_push() {
         inv["${line%%$'\t'*}"]="${line##*$'\t'}"
     done
 
+    local wal_suffix="" wal_expect_bytes="$seg_bytes"
+    if [ "$(json_str "$MARK_MANIFEST" wal_files_encrypted)" = "yes" ]; then
+        wal_suffix=".age"
+        wal_expect_bytes="$(json_num "$MARK_MANIFEST" wal_ciphertext_bytes)"
+        [ -n "$wal_expect_bytes" ] \
+            || die "the mark says the archive is encrypted but records no ciphertext size - was it written by an older pitr.sh?"
+    fi
     local -a range_problems=()
-    mapfile -t range_problems < <(wal_range_problems "$ARCHIVE_DIR" "$start_file" "$mark_file" "$seg_bytes")
+    mapfile -t range_problems < <(wal_range_problems "$ARCHIVE_DIR" "$start_file" "$mark_file" "$seg_bytes" "$wal_suffix" "$wal_expect_bytes")
     if [ "${#range_problems[@]}" -gt 0 ]; then
         for line in "${range_problems[@]}"; do
             printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$line"
@@ -709,10 +852,10 @@ cmd_push() {
     start_idx=$(wal_name_index "$start_file" "$seg_bytes")
     mark_idx=$(wal_name_index "$mark_file" "$seg_bytes")
     for ((idx = start_idx; idx <= mark_idx; idx++)); do
-        to_ship+=("$(wal_index_name "$tl" "$idx" "$seg_bytes")")
+        to_ship+=("$(wal_index_name "$tl" "$idx" "$seg_bytes")$wal_suffix")
     done
     for line in "${inv_lines[@]}"; do
-        case "${line%%$'\t'*}" in *.history) to_ship+=("${line%%$'\t'*}");; esac
+        case "${line%%$'\t'*}" in *.history|*.history.age) to_ship+=("${line%%$'\t'*}");; esac
     done
     for fname in "${to_ship[@]}"; do
         [ -n "${inv[$fname]:-}" ] \
@@ -858,14 +1001,15 @@ cmd_pull() {
         inv["${line%%$'\t'*}"]="${line##*$'\t'}"
     done
     local -a needed=()
-    local idx bstart_idx bmark_idx
+    local idx bstart_idx bmark_idx pull_suffix=""
+    [ "$(json_str "$mark_local" wal_files_encrypted)" != "yes" ] || pull_suffix=".age"
     bstart_idx=$(wal_name_index "$(json_str "$base_local" wal_start_file)" "$(json_num "$base_local" wal_segment_bytes)")
     bmark_idx=$(wal_name_index "$mark_file" "$(json_num "$base_local" wal_segment_bytes)")
     for ((idx = bstart_idx; idx <= bmark_idx; idx++)); do
-        needed+=("$(wal_index_name "$mark_tl" "$idx" "$(json_num "$base_local" wal_segment_bytes)")")
+        needed+=("$(wal_index_name "$mark_tl" "$idx" "$(json_num "$base_local" wal_segment_bytes)")$pull_suffix")
     done
     for line in "${inv_lines[@]}"; do
-        case "${line%%$'\t'*}" in *.history) needed+=("${line%%$'\t'*}");; esac
+        case "${line%%$'\t'*}" in *.history|*.history.age) needed+=("${line%%$'\t'*}");; esac
     done
     local iname isha fetched=0 already=0 tmpf
     for iname in "${needed[@]}"; do
@@ -898,8 +1042,11 @@ cmd_pull() {
         fetched=$((fetched + 1))
     done
     ok "PULLED: chain of ${#needed[@]} file(s) ($fetched fetched, $already already here and hashing true)"
+    local id_hint=""
+    case "$(json_str "$base_local" artefact)" in *"$ENC_SUFFIX") id_hint=" --identity KEYFILE";; esac
+    [ -z "$pull_suffix" ] || id_hint=" --identity KEYFILE"
     ok "Prove the instant:"
-    printf '      ./pitr.sh verify --base %s --mark %s --archive %s\n' "$base_local" "$mark_local" "$ARCHIVE_DIR"
+    printf '      ./pitr.sh verify --base %s --mark %s --archive %s%s\n' "$base_local" "$mark_local" "$ARCHIVE_DIR" "$id_hint"
 }
 
 # --- verify --------------------------------------------------------------------
@@ -922,6 +1069,10 @@ cleanup() {
                 -c "rm -rf /wipe/* /wipe/.[!.]* /wipe/..?* && chown $(id -u):$(id -g) /wipe" > /dev/null 2>&1 || true
             rm -rf -- "$SCRATCH" 2>/dev/null || warn "could not remove $SCRATCH"
         }
+    fi
+    # The identity copy the throwaway read - world-readable, so first to go.
+    if [ -n "$KEYDIR" ] && [ -d "$KEYDIR" ]; then
+        rm -rf -- "$KEYDIR" 2>/dev/null || warn "could not remove the identity copy in $KEYDIR"
     fi
 }
 
@@ -960,6 +1111,23 @@ cmd_verify() {
         IMAGE="postgres:$(json_str "$BASE_MANIFEST" server_version)-alpine"
     fi
 
+    # Encryption is read from the facts, not from flags: the artefact's name
+    # says whether the base is ciphertext, the mark says whether the archive
+    # is. Either one means: no key, no drill, no comforting green tick.
+    local base_enc=0 wal_suffix="" wal_expect_bytes="$seg_bytes"
+    case "$artefact" in *"$ENC_SUFFIX") base_enc=1;; esac
+    if [ "$(json_str "$MARK_MANIFEST" wal_files_encrypted)" = "yes" ]; then
+        wal_suffix=".age"
+        wal_expect_bytes="$(json_num "$MARK_MANIFEST" wal_ciphertext_bytes)"
+        [ -n "$wal_expect_bytes" ] \
+            || die "the mark says the archive is encrypted but records no ciphertext size - was it written by an older pitr.sh?"
+    fi
+    if [ "$base_enc" -eq 1 ] || [ -n "$wal_suffix" ]; then
+        encryption_available || die "this backup is encrypted and 'age' is not installed"
+        [ -n "$IDENTITY" ] \
+            || die "this backup is encrypted (base: $([ "$base_enc" -eq 1 ] && echo yes || echo no), WAL archive: $([ -n "$wal_suffix" ] && echo yes || echo no)) - verification without --identity would be a guess, and this tool does not guess"
+    fi
+
     log "verifying that base + archive reproduce '$mark_name' ($db)"
 
     # --- Gate 1: the base backup is byte-identical to what was taken ---------
@@ -980,14 +1148,14 @@ cmd_verify() {
     # --- Gate 3: the chain between them actually exists ----------------------
     local -a range_problems=()
     local line
-    mapfile -t range_problems < <(wal_range_problems "$ARCHIVE_DIR" "$start_file" "$mark_file" "$seg_bytes")
+    mapfile -t range_problems < <(wal_range_problems "$ARCHIVE_DIR" "$start_file" "$mark_file" "$seg_bytes" "$wal_suffix" "$wal_expect_bytes")
     if [ "${#range_problems[@]}" -gt 0 ]; then
         for line in "${range_problems[@]}"; do
             printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$line"
         done
         die "PITR VERIFICATION FAILED: the WAL chain $start_file .. $mark_file cannot replay (${#range_problems[@]} problem(s)) - refusing to boot what the archive already refutes"
     fi
-    ok "WAL chain $start_file .. $mark_file is present, every segment the full $seg_bytes bytes"
+    ok "WAL chain $start_file .. $mark_file is present, every segment the full $wal_expect_bytes bytes"
 
     # --- Gate 3b: the bytes are the ones the mark stood on --------------------
     # Continuity proves the chain LOOKS whole - and that is all it can prove:
@@ -1013,7 +1181,7 @@ cmd_verify() {
         mark_idx=$(wal_name_index "$mark_file" "$seg_bytes")
         local -a range_names=()
         for ((idx = start_idx; idx <= mark_idx; idx++)); do
-            range_names+=("$(wal_index_name "$tl" "$idx" "$seg_bytes")")
+            range_names+=("$(wal_index_name "$tl" "$idx" "$seg_bytes")$wal_suffix")
         done
         while IFS= read -r hline; do
             [ -n "$hline" ] || continue
@@ -1041,9 +1209,35 @@ cmd_verify() {
     SCRATCH=$(mktemp -d)
     PROBE="bv-pitr-$$"
     trap cleanup EXIT
-    tar -xf "$artefact" -C "$SCRATCH"
+    if [ "$base_enc" -eq 1 ]; then
+        # The decrypt-and-extract pipe: the plaintext tar never touches disk
+        # as a file, and PIPESTATUS tells a wrong key apart from a bad tar.
+        set +e
+        age -d -i "$IDENTITY" "$artefact" | tar -x -C "$SCRATCH"
+        local -a xst=("${PIPESTATUS[@]}")
+        set -e
+        [ "${xst[0]}" -eq 0 ] \
+            || die "the base artefact does not decrypt with the given identity (age rc=${xst[0]}) - wrong key, or ciphertext damage the sha256 gate somehow missed"
+        [ "${xst[1]}" -eq 0 ] \
+            || die "the decrypted base backup does not extract as a tar archive (tar rc=${xst[1]})"
+    else
+        tar -xf "$artefact" -C "$SCRATCH"
+    fi
+    local -a key_mounts=()
+    if [ -n "$wal_suffix" ]; then
+        # The throwaway decrypts each segment itself: a static age binary and
+        # a COPY of the identity ride in read-only. The copy is briefly
+        # world-readable on the host (the container's postgres user must read
+        # it); it lives in its own scratch dir and dies with the drill.
+        KEYDIR=$(mktemp -d)
+        cp "$IDENTITY" "$KEYDIR/identity"
+        chmod 755 "$KEYDIR"; chmod 644 "$KEYDIR/identity"
+        key_mounts=(-v "$(command -v age)":/usr/local/bin/age:ro -v "$KEYDIR:/run/bvkey:ro")
+        printf "restore_command = 'age -d -i /run/bvkey/identity -o \"%%p\" /archive/\"%%f\".age'\n" >> "$SCRATCH/postgresql.auto.conf"
+    else
+        printf "restore_command = 'cp /archive/%%f %%p'\n" >> "$SCRATCH/postgresql.auto.conf"
+    fi
     {
-        printf "restore_command = 'cp /archive/%%f %%p'\n"
         printf "recovery_target_name = '%s'\n" "$mark_name"
         printf "recovery_target_action = 'promote'\n"
     } >> "$SCRATCH/postgresql.auto.conf"
@@ -1052,6 +1246,7 @@ cmd_verify() {
     log "booting a throwaway $IMAGE as '$PROBE' - recovery must reach '$mark_name' or die trying"
     docker run -d --name "$PROBE" -e POSTGRES_PASSWORD=verify \
         -v "$SCRATCH:/var/lib/postgresql/data" -v "$ARCHIVE_DIR:/archive:ro" \
+        ${key_mounts[@]+"${key_mounts[@]}"} \
         "$IMAGE" -c archive_mode=off > /dev/null
 
     local waited=0 state in_recovery
