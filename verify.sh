@@ -71,6 +71,14 @@ main() {
     need sha256sum
     [ -f "$MANIFEST" ] || die "manifest not found: $MANIFEST"
 
+    # A PITR manifest describes a base backup bound to a WAL archive, not a
+    # dump artefact - restoring it needs a recovery, not a pg_restore.
+    local kind
+    kind="$(json_str "$MANIFEST" kind)"
+    case "$kind" in
+        pitr-*) die "this is a PITR manifest (kind '$kind') - prove it with: ./pitr.sh verify";;
+    esac
+
     local dir db artefact engine
     # The manifest says which engine wrote it: verification never has to be told
     # twice, and a Postgres backup cannot accidentally be checked as MySQL.
@@ -155,72 +163,28 @@ main() {
     fi
     rm -f /tmp/bv-restore-$$.log
 
+    # --- Gates 4-6 live in lib/common.sh ------------------------------------
+    # The comparison gates (content, schema objects, extra tables, writability)
+    # are shared with pitr.sh: this repo has exactly ONE definition of "the
+    # restored copy matches the manifest", because two comparison loops is how
+    # two verifiers end up believing different things.
+
     # --- Gate 4: content, table by table ------------------------------------
-    local failures=0 checked=0 table expected actual wline
-    local -a missing=()
-    while IFS=$'\t' read -r table expected; do
-        [ -n "$table" ] || continue
-        checked=$((checked + 1))
-        if ! actual=$(eng_table_fingerprint "$PROBE" "$db" "$table" 2>/dev/null | tr -d '\n'); then
-            missing+=("$table")
-            printf '  %sFAIL%s %s - %s absent from the restored copy\n' "$c_red" "$c_reset" "$table" "$ENG_UNIT"
-            failures=$((failures + 1))
-            continue
-        fi
-        assert_fingerprint "$table (restored copy)" "$actual"
-        assert_fingerprint "$table (manifest)" "$expected"
-        if [ "$actual" = "$expected" ]; then
-            printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$table"
-        else
-            printf '  %sFAIL%s %s - fingerprint differs\n' "$c_red" "$c_reset" "$table"
-            printf '        expected %s\n        restored %s\n' "$expected" "$actual"
-            failures=$((failures + 1))
-        fi
-    done < <(manifest_tables "$MANIFEST")
+    local failures=0 gate_fail=0 checked
+    compare_tables "$PROBE" "$db" "$MANIFEST" || gate_fail=$?
+    failures=$((failures + gate_fail))
+    checked=$COMPARED_TABLES
 
     [ "$checked" -gt 0 ] || die "the manifest lists no ${ENG_UNIT}s - nothing was verified, so nothing is proven"
 
-    # --- Gate 5: schema objects ---------------------------------------------
-    # Rows are half the database. Measured: `pg_restore -t a -t b` exits 0 with
-    # every row present and silently drops the indexes, constraints, view,
-    # function and trigger. A restored copy that cannot enforce a unique key is
-    # not a restored copy.
-    local obj_lines obj_class obj_expected obj_actual exp_count act_count
-    obj_lines=$(manifest_section "$MANIFEST" objects)
-    if [ -z "$obj_lines" ]; then
-        warn 'this manifest predates schema verification (schema 1) - only data was compared'
-    else
-        printf '\n'
-        while IFS=$'\t' read -r obj_class obj_expected; do
-            [ -n "$obj_class" ] || continue
-            obj_actual=$(eng_schema_digest "$PROBE" "$db" "$obj_class")
-            exp_count=${obj_expected%%:*}
-            act_count=${obj_actual%%:*}
-            if [ "$obj_actual" = "$obj_expected" ]; then
-                printf '  %sOK%s   %s (%s)\n' "$c_green" "$c_reset" "$obj_class" "$act_count"
-            elif [ "$exp_count" != "$act_count" ]; then
-                printf '  %sFAIL%s %s - expected %s, restored copy has %s\n' \
-                    "$c_red" "$c_reset" "$obj_class" "$exp_count" "$act_count"
-                failures=$((failures + 1))
-            else
-                printf '  %sFAIL%s %s - same count (%s) but the definitions differ\n' \
-                    "$c_red" "$c_reset" "$obj_class" "$act_count"
-                failures=$((failures + 1))
-            fi
-        done <<EOF
-$obj_lines
-EOF
-    fi
+    # --- Gate 5: schema objects, then the extra-table guard ------------------
+    gate_fail=0
+    compare_objects "$PROBE" "$db" "$MANIFEST" || gate_fail=$?
+    failures=$((failures + gate_fail))
 
-    # A restored copy with EXTRA tables is also a mismatch: it means the
-    # artefact and the manifest describe different moments.
-    local restored_count
-    restored_count=$(eng_count_tables "$PROBE" "$db" | tr -d '\n')
-    if [ "$restored_count" != "$checked" ]; then
-        printf '  %sFAIL%s restored copy has %s %ss, the manifest describes %s\n' \
-            "$c_red" "$c_reset" "$restored_count" "$ENG_UNIT" "$checked"
-        failures=$((failures + 1))
-    fi
+    gate_fail=0
+    compare_extra_tables "$PROBE" "$db" "$checked" || gate_fail=$?
+    failures=$((failures + gate_fail))
 
     printf '\n'
     if [ "$failures" -gt 0 ]; then
@@ -234,17 +198,8 @@ EOF
     # restored BEHIND its data means every row is present and the application
     # breaks on its first INSERT.
     local write_problems=0
-    local -a write_msgs=()
-    while IFS= read -r wline; do
-        [ -n "$wline" ] || continue
-        write_msgs+=("$wline")
-    done < <(eng_writable_probe_failures "$PROBE" "$db" || true)
-    write_problems=${#write_msgs[@]}
+    writable_probe_report "$PROBE" "$db" || write_problems=$?
     if [ "$write_problems" -gt 0 ]; then
-        printf '\n'
-        for wline in "${write_msgs[@]}"; do
-            printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$wline"
-        done
         die "VERIFICATION FAILED: $write_problems write problem(s) - the data is there but the next INSERT collides."
     fi
 
