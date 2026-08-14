@@ -130,9 +130,14 @@ jobs:
         mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
-      - name: Install age
+      # The static RELEASE build, not apt: this binary rides INTO alpine
+      # containers, and Ubuntu's packaged age does not run there (the
+      # harness's preflight caught exactly that on this job's first run).
+      - name: Install age (static release build)
         if: matrix.mode == '--encrypted'
-        run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
+        run: |
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar -xz
+          sudo install age/age age/age-keygen /usr/local/bin/
       - name: fire drill + every measured WAL archive lie
         env:
           BV_IMAGE: ${{ matrix.image }}
@@ -152,8 +157,12 @@ jobs:
         mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
-      - name: Install age
+      # Static release build, same reason as the pitr job: apt's age cannot
+      # run inside the alpine containers the drill mounts it into.
+      - name: Install age (static release build)
         if: matrix.mode == '--encrypted'
-        run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
+        run: |
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar -xz
+          sudo install age/age age/age-keygen /usr/local/bin/
       - name: fire drill + every measured off-site WAL archive lie
         run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }} ${{ matrix.mode }}
