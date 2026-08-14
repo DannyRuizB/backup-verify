@@ -45,6 +45,12 @@ age-keygen -o key.txt
 ./pitr.sh check  --archive /srv/wal-archive --container my-postgres
 ./pitr.sh verify --base ./backups/app_..._base.json \
                  --mark ./backups/app_..._mark.json --archive /srv/wal-archive
+
+# ...and get the instant off the machine, chain and all:
+./pitr.sh push  --base ./backups/app_..._base.json --mark ./backups/app_..._mark.json \
+                --archive /srv/wal-archive --remote bk@nas:/srv/pitr
+./pitr.sh check --remote bk@nas:/srv/pitr
+./pitr.sh pull  --db app --remote bk@nas:/srv/pitr --archive ./recovered-wal --out ./recovered
 ```
 
 ```
@@ -216,7 +222,7 @@ line of `pitr.sh` was written:
 | Every segment file is present, names contiguous | **A truncated segment only fails on the day you recover** — `invalid segment file size`, FATAL — which is the worst possible day to learn it. Every *complete* segment measures exactly `wal_segment_size`, so `check` makes that lie loud **today**, by size, from the directory alone (`.backup` and `.history` files are legitimately small and exempt). |
 | The archive directory accepts files | **One planted file bearing the name of the *next* segment jams the documented `archive_command` forever**: `test ! -f ... && cp ...` refuses to overwrite, so the real segment can never land (measured: `failed_count` +6 per 70 s, indefinitely — the poison pill). And a `pg_basebackup -X none` artefact alone does not even boot (`could not locate required checkpoint record`): it is **half** a backup whose other half *is* the archive — which is why `base` waits for that WAL to be archived, and a hung `base` is the honest symptom of a dead archiver. |
 
-Hence the four subcommands, suspicious at every step:
+Hence the subcommands, suspicious at every step:
 
 - **`base`** — `pg_basebackup` (tar, `-X none` on purpose: bundling WAL into
   the artefact would let the drill pass with a dead archive) plus a manifest
@@ -225,7 +231,9 @@ Hence the four subcommands, suspicious at every step:
 - **`mark`** — fingerprint every table, drop a named restore point, switch the
   segment out, and **wait until the mark's segment is whole in the archive**.
   If it never lands, no manifest is written: a mark you cannot recover to is
-  not a mark, and pretending otherwise is the "to the latest" lie again.
+  not a mark, and pretending otherwise is the "to the latest" lie again. The
+  mark also records **one sha256 per archived file it stands on** — the
+  inventory every later audit hashes against, for the measured reason below.
 - **`check`** — audit the archive *today*: holes in the chain, wrong-size
   segments, strays and squatters, all from the directory alone — and, with
   `--container`, whether the archiver is behind or failing right now.
@@ -239,6 +247,31 @@ Hence the four subcommands, suspicious at every step:
 PostgreSQL only, on purpose: WAL archiving is a PostgreSQL mechanism, and
 MySQL's binlogs are a different animal — one interface pretending to cover
 both would claim a generality this repo has not measured.
+
+### The archive has to leave the building too
+
+A WAL archive that never left the machine dies in the same fire as the
+database. But an off-site WAL archive lies in shapes even the off-site
+artefact copies above don't — each one measured before `push`, `pull` and
+`check --remote` were written:
+
+| What looks fine | What is actually happening |
+|---|---|
+| Every segment is at the remote, every size matches | **Every complete segment measures exactly `wal_segment_size`, so a size audit of a WAL archive is blind to rot BY CONSTRUCTION.** Measured: a segment corrupted in place kept identical `stat` output — same 16 777 216 bytes, same mtime. At the artefact copies above, size at least catches truncation; here even that discriminates nothing between complete segments. Only a hash says anything at all. |
+| The fire drill passed | **Rot past the mark leaves that mark's drill green.** Measured: with a segment rotted *after* mark 1's stop point, verify to mark 1 exits 0 with every fingerprint true — and verify to mark 2, straight through the rot, dies FATAL (`invalid magic number`). A passing recovery proves the chain it replayed, not the archive. Hence the mark's **inventory**: one sha256 per file, so `check --remote` can hash the remote's bytes against a recorded claim *today*, and `verify` refuses rot in its range in milliseconds instead of discovering it mid-replay. |
+| The archive was synced an hour ago | **An archive pushed at 12:00 cannot prove a 12:05 mark** — the mark's segment never travelled. Measured: recovery against the stale copy, newer mark named = refused, `missing segment ... the chain is broken here`. So the mark manifest travels **last**, behind everything it stands on: a mark at the remote is a receipt, and `pull` returns the newest instant the remote can *prove*, never the newest that merely exists. |
+| The segment is there, the "skip existing" sync is fast | **A killed upload leaves a partial under the segment's final name, and an exists-check never repairs it** — measured: 262 144 of 16 777 216 bytes squatting as the segment, invisible to `test -f`-style syncs forever. `push` uploads under a temporary name, has the **remote** hash it, renames only on a match — and re-ships anything whose remote hash disagrees with the inventory, because "the file is already there" is a claim about a name, not about bytes. |
+
+The protocol is offsite.sh's, applied per file: the same `rem_*` transports
+(ssh, or a mounted directory), upload to `.part`, hash at the remote, rename;
+base artefact and segments first, manifests after, the mark at the very end.
+`pull` re-hashes everything after the download, never overwrites, and removes
+what it fetched if the bytes disagree — and `push`, `pull` and `check
+--remote` all operate on the same set, **the range the pair actually
+replays**: from the base's first segment to the mark, plus timeline history
+files. What the drill proves end to end: mark, push, lose the *machine* —
+source, local archive, every manifest — pull, and recover the named instant
+exactly, on nothing but the remote's contents.
 
 ## How it works
 
@@ -340,6 +373,15 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   milliseconds; squatters and debris named from the directory alone; and,
   after every mutation is undone, the full drill again — a suite that only
   rejects is as useless as one that only accepts.
+- **`test/pitr-offsite.sh [--remote-kind ssh|dir]`** — the strongest disaster
+  simulated here: mark, push, then lose the **machine** — source container,
+  local WAL archive, every local manifest — pull, and the named instant must
+  come back exactly. Around it, each measured off-site archive lie as a
+  caught case: the second push shipping only what the remote cannot already
+  prove; an unpushed mark being unclaimable (pull returns the newest instant
+  the remote can *prove*); in-place rot named by `check --remote` from the
+  inventory alone, refused and cleaned up by `pull`, and *repaired* by the
+  next `push`; and the crashed `.part` upload named for what it is.
 - **`test/backup.bats`**, **`test/offsite.bats`** and **`test/pitr.bats`** —
   unit tests over argument
   parsing, manifest reading, the schema queries, the `eng_*` and `rem_*`
@@ -349,14 +391,15 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   tree, plain and encrypted** (eight combinations), the negative suite per
   engine, the off-site fire drill over **both remote kinds**, the PITR fire
   drill on **both Postgres majors** (a base backup is bytes from one major
-  version, so a recovery is a compatibility promise too), and everything
+  version, so a recovery is a compatibility promise too), the PITR off-site
+  fire drill over **both remote kinds again**, and everything
   again on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Twelve bugs this harness caught in its own code
+## Thirteen bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -473,17 +516,29 @@ rounded-`AUTO_INCREMENT` lesson wearing Postgres clothes. The mark therefore
 records sequence *names* only, and usability is what the writable probe
 proves.
 
+**The same bytes recovered on one transport and died on the other.** The
+PITR off-site fire drill passed over ssh and failed over a directory remote —
+`could not locate required checkpoint record`, a recovery that never got to
+read its first segment. A dir remote's `cp` carries the source's `0600` mode
+through push and pull, and the throwaway instance's postgres user cannot read
+a `0600` file owned by the host; ssh's `cat >` redirect mints fresh `0644`
+files and sails through. Same bytes, same hashes, different mode bits — the
+fourth time a transport- or order-dependent difference has been caught by
+running everything on more than one of them. `pull` now sets the mode
+explicitly, so both transports tell the same story.
+
 ## Scope
 
 PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
 `--engine files`, off-site copies over ssh or onto a mounted disk, and
-point-in-time recovery over a WAL archive (PostgreSQL): contents, schema
-objects (or file metadata), encryption at rest, whether the restored copy is
-actually usable, whether the remote provably holds what was sent, and whether
-a named instant provably comes back. Deliberately not here yet: point-in-time
-for MySQL (binlogs are a different mechanism, not a flag away), encryption of
-the WAL archive itself, and pushing the archive off-site — on the roadmap, not
-pretended to work today.
+point-in-time recovery over a WAL archive (PostgreSQL) — including the archive
+itself pushed off-site, audited at the remote, and pulled back onto a bare
+machine: contents, schema objects (or file metadata), encryption at rest,
+whether the restored copy is actually usable, whether the remote provably
+holds what was sent, and whether a named instant provably comes back.
+Deliberately not here yet: point-in-time for MySQL (binlogs are a different
+mechanism, not a flag away) and encryption of the WAL archive itself — on the
+roadmap, not pretended to work today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

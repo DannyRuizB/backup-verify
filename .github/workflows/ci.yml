@@ -1,18 +1,22 @@
 name: ci
 
-# Five stages, in order of how much they prove:
-#   lint      - the scripts parse, shellcheck is happy, the units pass
-#   e2e       - a real source (Postgres 17/16, MySQL 8.4, a file tree; plain
-#               and encrypted) is seeded, backed up, DESTROYED, and restored
-#   negative  - every way a backup lies is caught on EVERY engine, and a good
-#               one still passes
-#   offsite   - the fire drill: push, lose everything local, pull, restore -
-#               and every measured way an off-site copy lies is caught, over
-#               a real sshd and over a plain directory
-#   pitr      - the point-in-time drill: base backup + WAL archive, disaster
-#               committed AFTER the mark, source destroyed - and the named
-#               instant comes back exactly, with every measured archive lie
-#               caught
+# Six stages, in order of how much they prove:
+#   lint         - the scripts parse, shellcheck is happy, the units pass
+#   e2e          - a real source (Postgres 17/16, MySQL 8.4, a file tree; plain
+#                  and encrypted) is seeded, backed up, DESTROYED, and restored
+#   negative     - every way a backup lies is caught on EVERY engine, and a
+#                  good one still passes
+#   offsite      - the fire drill: push, lose everything local, pull, restore -
+#                  and every measured way an off-site copy lies is caught, over
+#                  a real sshd and over a plain directory
+#   pitr         - the point-in-time drill: base backup + WAL archive, disaster
+#                  committed AFTER the mark, source destroyed - and the named
+#                  instant comes back exactly, with every measured archive lie
+#                  caught
+#   pitr-offsite - the strongest disaster simulated here: mark, push, then
+#                  lose the MACHINE (source, archive, manifests) - the remote
+#                  alone brings the named instant back, and every measured way
+#                  an off-site WAL archive lies is caught, over both remotes
 on:
   push:
     branches: [main]
@@ -126,3 +130,18 @@ jobs:
         env:
           BV_IMAGE: ${{ matrix.image }}
         run: ./test/pitr.sh
+
+  pitr-offsite:
+    name: PITR off-site fire drill (${{ matrix.remote }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Same protocol over both transports on purpose: the harness caught a
+      # recovery that worked over ssh and died over a directory remote with
+      # the SAME bytes (a copied 0600 mode vs a redirect's 0644).
+      matrix:
+        remote: [ssh, dir]
+    steps:
+      - uses: actions/checkout@v5
+      - name: fire drill + every measured off-site WAL archive lie
+        run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }}

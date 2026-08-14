@@ -209,20 +209,38 @@ mv "$OUT/hidden-$MIDDLE" "$ARCHIVE/$MIDDLE"
 printf '\n'
 
 echo '== Case 4: rot in place - right size, rotten bytes, so the chain looks whole =='
-# The offsite suite met this shape at the file level; here it must fail at
-# recovery: the size gate passes, the server boots, replay hits garbage and -
-# because every recovery here has a NAME it must reach - dies instead of
-# promoting short. cat > and dd conv=notrunc keep the inode, owner and mode.
+# The offsite suite met this shape at the file level. Two eras of defence,
+# both asserted: a mark WITH an inventory refuses in milliseconds, before
+# anything boots (every complete segment has the same size, so only the hash
+# sees rot - measured); an OLD mark without one still cannot promote short,
+# because every recovery here has a NAME it must reach - the server boots,
+# replay hits garbage and dies. cat > and dd conv=notrunc keep the inode,
+# owner and mode.
 root_sh "cat /work/archive/$MIDDLE > /work/pristine
          dd if=/dev/zero of=/work/archive/$MIDDLE bs=8192 seek=1 count=4 conv=notrunc 2>/dev/null"
 if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/rot.log" 2>&1; then
     fail_case 'verify promoted through a segment full of zeros'
 else
-    if grep -q 'recovery DIED' "$OUT/rot.log"; then
-        pass_case 'recovery died reaching for the mark instead of promoting short of it'
+    if grep -q "$MIDDLE - these are not the bytes the mark stood on" "$OUT/rot.log" \
+        && ! grep -q 'booting a throwaway' "$OUT/rot.log"; then
+        pass_case 'the inventory names the rotten segment TODAY - nothing ever boots'
     else
-        fail_case 'verify failed, but not by the recovery-died path'
+        fail_case 'verify failed, but not by the inventory path (or it booted first)'
         sed -n '1,15p' "$OUT/rot.log" | sed 's/^/        /'
+    fi
+fi
+# The retrocompat era: strip the inventory from a COPY of the mark (an old
+# manifest, reconstructed) - the reported-not-skipped warning must fire, and
+# the recovery must DIE at the garbage instead of promoting short of the mark.
+sed '/^  "wal": {/,/^  },$/d' "$M" > "$OUT/old_mark.json"
+if ./pitr.sh verify --base "$B" --mark "$OUT/old_mark.json" --archive "$ARCHIVE" --image "$IMAGE" >"$OUT/rot-old.log" 2>&1; then
+    fail_case 'an inventory-less verify promoted through a segment full of zeros'
+else
+    if grep -q 'records no WAL inventory' "$OUT/rot-old.log" && grep -q 'recovery DIED' "$OUT/rot-old.log"; then
+        pass_case 'an old mark is warned about, and its recovery still dies reaching for the mark instead of promoting short'
+    else
+        fail_case 'the inventory-less path failed differently'
+        sed -n '1,20p' "$OUT/rot-old.log" | sed 's/^/        /'
     fi
 fi
 root_sh "cat /work/pristine > /work/archive/$MIDDLE && rm /work/pristine"
