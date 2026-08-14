@@ -101,15 +101,21 @@ encryption_available() {
 # is written by this repo, so its shape is known and flat. Shared here because
 # verify.sh AND offsite.sh both read manifests, and two copies of a parser is
 # how the two scripts end up disagreeing about what a manifest says.
+# An absent key is an ANSWER (the empty string), never an error: under
+# pipefail a matchless grep fails the whole pipeline, and `var="$(json_str …)"`
+# under set -e then kills the caller with no message at all. That landmine sat
+# here unarmed until the first manifest was asked for a key it legitimately
+# lacks (a dump manifest asked for "kind"); the || true disarms it for every
+# caller at once.
 json_str() {
     local file="$1" key="$2"
-    grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" \
+    { grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" || true; } \
         | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"/\1/'
 }
 
 json_num() {
     local file="$1" key="$2"
-    grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" "$file" \
+    { grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" "$file" || true; } \
         | head -1 | sed 's/.*:[[:space:]]*//'
 }
 
@@ -159,4 +165,103 @@ assert_fingerprint() {
 
 sha256_of() {
     sha256sum "$1" | awk '{print $1}'
+}
+
+# --- Comparing a live instance against a manifest -----------------------------
+#
+# These four gates are THE verdict of this repo, so there is exactly one copy
+# of them: verify.sh measures a restored dump with them, pitr.sh measures a
+# recovered instance with them. Two verifiers with two comparison loops is how
+# two verifiers end up believing different things. Each prints its findings and
+# returns its failure count (call under `|| var=$?`).
+
+# Content, table by table. Sets COMPARED_TABLES so the caller can refuse a
+# manifest that lists nothing (a return value only carries the failure count).
+compare_tables() {
+    local container="$1" db="$2" manifest="$3"
+    local failures=0 table expected actual
+    COMPARED_TABLES=0
+    while IFS=$'\t' read -r table expected; do
+        [ -n "$table" ] || continue
+        COMPARED_TABLES=$((COMPARED_TABLES + 1))
+        if ! actual=$(eng_table_fingerprint "$container" "$db" "$table" 2>/dev/null | tr -d '\n'); then
+            printf '  %sFAIL%s %s - %s absent from the restored copy\n' "$c_red" "$c_reset" "$table" "$ENG_UNIT"
+            failures=$((failures + 1))
+            continue
+        fi
+        assert_fingerprint "$table (restored copy)" "$actual"
+        assert_fingerprint "$table (manifest)" "$expected"
+        if [ "$actual" = "$expected" ]; then
+            printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$table"
+        else
+            printf '  %sFAIL%s %s - fingerprint differs\n' "$c_red" "$c_reset" "$table"
+            printf '        expected %s\n        restored %s\n' "$expected" "$actual"
+            failures=$((failures + 1))
+        fi
+    done < <(manifest_tables "$manifest")
+    return "$failures"
+}
+
+# Schema objects: the half a row-count comparison cannot see. Measured:
+# `pg_restore -t a -t b` exits 0 with every row present and silently drops the
+# indexes, constraints, view, function and trigger.
+compare_objects() {
+    local container="$1" db="$2" manifest="$3"
+    local failures=0 obj_lines obj_class obj_expected obj_actual exp_count act_count
+    obj_lines=$(manifest_section "$manifest" objects)
+    if [ -z "$obj_lines" ]; then
+        warn 'this manifest predates schema verification (schema 1) - only data was compared'
+        return 0
+    fi
+    printf '\n'
+    while IFS=$'\t' read -r obj_class obj_expected; do
+        [ -n "$obj_class" ] || continue
+        obj_actual=$(eng_schema_digest "$container" "$db" "$obj_class")
+        exp_count=${obj_expected%%:*}
+        act_count=${obj_actual%%:*}
+        if [ "$obj_actual" = "$obj_expected" ]; then
+            printf '  %sOK%s   %s (%s)\n' "$c_green" "$c_reset" "$obj_class" "$act_count"
+        elif [ "$exp_count" != "$act_count" ]; then
+            printf '  %sFAIL%s %s - expected %s, restored copy has %s\n' \
+                "$c_red" "$c_reset" "$obj_class" "$exp_count" "$act_count"
+            failures=$((failures + 1))
+        else
+            printf '  %sFAIL%s %s - same count (%s) but the definitions differ\n' \
+                "$c_red" "$c_reset" "$obj_class" "$act_count"
+            failures=$((failures + 1))
+        fi
+    done <<EOF
+$obj_lines
+EOF
+    return "$failures"
+}
+
+# A restored copy with EXTRA tables is also a mismatch: it means the artefact
+# and the manifest describe different moments.
+compare_extra_tables() {
+    local container="$1" db="$2" expected="$3" restored_count
+    restored_count=$(eng_count_tables "$container" "$db" | tr -d '\n')
+    if [ "$restored_count" != "$expected" ]; then
+        printf '  %sFAIL%s restored copy has %s %ss, the manifest describes %s\n' \
+            "$c_red" "$c_reset" "$restored_count" "$ENG_UNIT" "$expected"
+        return 1
+    fi
+    return 0
+}
+
+# Can the application actually WRITE to it? Deliberately run LAST by every
+# caller, after every comparison, because it may modify the instance.
+writable_probe_report() {
+    local container="$1" db="$2" wline
+    local -a msgs=()
+    while IFS= read -r wline; do
+        [ -n "$wline" ] || continue
+        msgs+=("$wline")
+    done < <(eng_writable_probe_failures "$container" "$db" || true)
+    [ "${#msgs[@]}" -gt 0 ] || return 0
+    printf '\n'
+    for wline in "${msgs[@]}"; do
+        printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$wline"
+    done
+    return "${#msgs[@]}"
 }

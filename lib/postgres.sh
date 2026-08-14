@@ -118,6 +118,14 @@ eng_schema_digest() {
         # last_value included on purpose: a sequence restored behind its data
         # means the next INSERT collides with the primary key.
         sequences)   sql="SELECT sequencename||'='||coalesce(last_value::text,'unset') FROM pg_sequences WHERE schemaname='public' ORDER BY 1;";;
+        # PITR's sequences class: names only, no last_value. Measured: a
+        # recovered instance brings sequences back up to 32 AHEAD of the
+        # marked instant, because nextval pre-logs 32 values at a time so a
+        # crash can never repeat one. Demanding last_value equality would fail
+        # every exact recovery; the writable probe proves usability instead -
+        # the same reasoning that keeps MySQL's rounded auto_increment out of
+        # its digest.
+        sequence_names) sql="SELECT sequencename FROM pg_sequences WHERE schemaname='public' ORDER BY 1;";;
         views)       sql="SELECT table_name||' '||md5(coalesce(view_definition,'')) FROM information_schema.views WHERE table_schema='public' ORDER BY 1;";;
         routines)    sql="SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' ORDER BY 1;";;
         triggers)    sql="SELECT t.tgname||' on '||c.relname FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal AND n.nspname='public' ORDER BY 1;";;
@@ -139,6 +147,58 @@ eng_count_tables() {
 eng_count_relations() {
     local container="$1" db="$2"
     eng_query "$container" "$db" "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+}
+
+# --- WAL archive arithmetic (PITR) -------------------------------------------
+#
+# A WAL segment name is TTTTTTTTLLLLLLLLSSSSSSSS: timeline, "log" number and
+# segment-within-log, zero-padded uppercase hex. How many segments share one
+# log number depends on the segment size (4GB worth: 256 for the default 16MB),
+# so the arithmetic takes the size instead of assuming it. Pure functions on
+# purpose: the unit tests exercise the log-boundary carry without Docker.
+
+wal_name_timeline() { printf '%s' "${1:0:8}"; }
+
+# Absolute segment position of a name, timeline ignored.
+wal_name_index() {
+    local name="$1" seg_bytes="$2" per_log
+    per_log=$((4294967296 / seg_bytes))
+    printf '%s' $((16#${name:8:8} * per_log + 16#${name:16:8}))
+}
+
+# The name a segment position carries on a timeline - the inverse of the above.
+wal_index_name() {
+    local timeline="$1" index="$2" seg_bytes="$3" per_log
+    per_log=$((4294967296 / seg_bytes))
+    printf '%s%08X%08X' "$timeline" $((index / per_log)) $((index % per_log))
+}
+
+# Every problem in the archive between two segments (inclusive), one line per
+# problem on stdout; the CALLER counts lines. Two checks only, both cheap and
+# both measured: a segment that is absent breaks the chain (recovery without a
+# target sails past the hole and calls the truncation success), and a segment
+# whose size is not exactly the segment size is not a segment (a half-copied
+# file recovers to a FATAL - but only on the day you recover; this makes it
+# loud today). No content is read: the segments land 0600, owned by the
+# server's user - size and presence are what the archive's landlord can see.
+wal_range_problems() {
+    local dir="$1" first="$2" last="$3" seg_bytes="$4"
+    local timeline i i0 i1 name size
+    timeline=$(wal_name_timeline "$first")
+    i0=$(wal_name_index "$first" "$seg_bytes")
+    i1=$(wal_name_index "$last" "$seg_bytes")
+    for ((i = i0; i <= i1; i++)); do
+        name=$(wal_index_name "$timeline" "$i" "$seg_bytes")
+        if [ ! -f "$dir/$name" ]; then
+            printf 'missing segment %s - the chain is broken here\n' "$name"
+        else
+            size=$(stat -c%s "$dir/$name")
+            if [ "$size" -ne "$seg_bytes" ]; then
+                printf 'segment %s is %s bytes - a completed segment is exactly %s\n' \
+                    "$name" "$size" "$seg_bytes"
+            fi
+        fi
+    done
 }
 
 # Can the application WRITE after the restore? A sequence left behind its data

@@ -1,6 +1,6 @@
 name: ci
 
-# Four stages, in order of how much they prove:
+# Five stages, in order of how much they prove:
 #   lint      - the scripts parse, shellcheck is happy, the units pass
 #   e2e       - a real source (Postgres 17/16, MySQL 8.4, a file tree; plain
 #               and encrypted) is seeded, backed up, DESTROYED, and restored
@@ -9,6 +9,10 @@ name: ci
 #   offsite   - the fire drill: push, lose everything local, pull, restore -
 #               and every measured way an off-site copy lies is caught, over
 #               a real sshd and over a plain directory
+#   pitr      - the point-in-time drill: base backup + WAL archive, disaster
+#               committed AFTER the mark, source destroyed - and the named
+#               instant comes back exactly, with every measured archive lie
+#               caught
 on:
   push:
     branches: [main]
@@ -29,12 +33,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Bash syntax
-        run: for f in backup.sh verify.sh offsite.sh lib/*.sh test/*.sh; do bash -n "$f"; done
+        run: for f in backup.sh verify.sh offsite.sh pitr.sh lib/*.sh test/*.sh; do bash -n "$f"; done
 
       - name: ShellCheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck >/dev/null
-          shellcheck -x backup.sh verify.sh offsite.sh lib/*.sh test/*.sh
+          shellcheck -x backup.sh verify.sh offsite.sh pitr.sh lib/*.sh test/*.sh
 
       - name: Unit tests (bats)
         run: |
@@ -106,3 +110,19 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
       - name: fire drill + every measured off-site lie
         run: ./test/offsite.sh --remote-kind ${{ matrix.remote }}
+
+  pitr:
+    name: PITR fire drill (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # A recovery is a compatibility promise too: base backups are bytes from
+      # ONE major version, so the drill runs on both supported majors.
+      matrix:
+        image: ['postgres:17-alpine', 'postgres:16-alpine']
+    steps:
+      - uses: actions/checkout@v5
+      - name: fire drill + every measured WAL archive lie
+        env:
+          BV_IMAGE: ${{ matrix.image }}
+        run: ./test/pitr.sh
