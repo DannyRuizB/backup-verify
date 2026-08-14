@@ -10,7 +10,8 @@ copy that never left the building is a hope of a different kind, `offsite.sh`
 gets the proven pair off the machine — and makes the far end prove, hash in
 hand, that what landed is what was sent. And `pitr.sh` proves the strongest
 promise a backup can make: that a base backup plus a WAL archive reproduce a
-**named instant**, exactly.
+**named instant**, exactly — with `binlog.sh` proving the same for MySQL,
+through the binary log, against reflexes measured to be the exact opposite.
 
 CI does the thing everyone talks about and almost nobody automates: it seeds a
 real source, backs it up, **destroys it**, restores from the artefact, and
@@ -59,6 +60,13 @@ age-keygen -o key.txt
 ./pitr.sh base   --container my-postgres --db app --archive /srv/wal-archive \
                  --recipient age1... --identity key.txt
 ./pitr.sh verify --base ... --mark ... --archive /srv/wal-archive --identity key.txt
+
+# MySQL point-in-time, through the binary log (a different animal, measured):
+./binlog.sh base   --container my-mysql --db app
+./binlog.sh mark   --container my-mysql --db app --archive /srv/binlog-archive
+./binlog.sh verify --base ./backups/app_..._binlogbase.json \
+                   --mark ./backups/app_..._binlogmark.json \
+                   --archive /srv/binlog-archive --tools ./tools
 ```
 
 ```
@@ -253,8 +261,10 @@ Hence the subcommands, suspicious at every step:
   rejected before anything boots.
 
 PostgreSQL only, on purpose: WAL archiving is a PostgreSQL mechanism, and
-MySQL's binlogs are a different animal — one interface pretending to cover
-both would claim a generality this repo has not measured.
+MySQL's binlogs are a different animal. Once that animal was measured it got
+its own script — `binlog.sh`, below — rather than a flag on this one, because
+the measurements disagree at the spine: Postgres dies loudly when a named
+target is unreachable, MySQL says nothing at all.
 
 ### The archive has to leave the building too
 
@@ -293,6 +303,26 @@ with the back door open — measured, like everything here:
 | The `.age` file exists, so the segment is archived | **This probe was caught by its own measurement**: a stat milliseconds after the file appeared found 7.8 MB of a 16.8 MB ciphertext — age writes progressively, and "the file exists" blesses a half-written one. The encrypted `mark` wait demands a size past the plaintext AND stable across two polls. |
 | Corruption in an encrypted archive needs the inventory to catch | The inventory still catches it **today** — but authenticated encryption adds a second, free line of defence: a truncated *or* bit-flipped `.age` refuses to decrypt at all (*"failed to decrypt and authenticate payload chunk"* — measured both ways), so even an old mark without an inventory dies loudly instead of replaying garbage. And every complete ciphertext measures the same (plaintext + constant overhead; 16 781 496 bytes for every 16 MiB segment), so the exact-size gate survives encryption unchanged. |
 | The key question waits until recovery day | **`verify` refuses to run without `--identity`** — no key, no drill, no comforting green tick — and a wrong key dies at the base artefact, named for what it is. Inside the drill the throwaway decrypts each segment itself (`restore_command` pipes through a static `age` that rides into the container read-only); the wrong key there is FATAL and immediate: *"no identity matched any of the recipients"* (measured). `base --recipient` requires `--identity` for the same reason `backup.sh` offers it: the key gets proven **today**. |
+
+## MySQL point-in-time has its own ways of lying
+
+`pitr.sh` declared MySQL out of its reach until the animal was measured — and
+the measurements say it deserved its own script. `binlog.sh` is `pitr.sh`'s
+sibling for the binary log, with the same four subcommands (`base`, `mark`,
+`check`, `verify`) built on findings that are not just different from WAL
+archiving but in places its exact opposite:
+
+| What looks fine | What is actually happening |
+|---|---|
+| The replay to an exact position exited 0 | **A `--stop-position` past the end of history exits 0 with an EMPTY stderr** (measured). Postgres dies FATAL when a named target is not reached; MySQL says *nothing* — the position is a hint, not a promise. So `verify` proves **arrival by content**: the mark's fingerprints, the same yardstick every other verifier here uses, because here no exit code can be trusted to mean "we got there". |
+| Replay the files you still have | **A missing file in the middle of the list is stitched over silently**: rc 0, empty stderr, and the missing file's transactions gone (measured: 100 of 300 rows vanished while everything reported success). Postgres at least stops at a hole; MySQL replays straight across it. Continuity is proven by name before anything boots. |
+| `mysqlbinlog` read the whole file without complaint | **It does not verify event checksums unless asked**: a corrupted binlog decodes with rc 0 without `--verify-binlog-checksum` and dies loudly with it (measured, same file both ways). The flag is hardwired here — and the mark's inventory names the rot **today**, without waiting for a replay to trip. |
+| The nightly `mysqldump`, plus "we keep the binlogs" | **The tutorial dump records no anchor** — nothing says WHERE the replay starts. Starting from the beginning re-runs history the dump already contains (measured: it died on the first DDL collision, leaving an ambiguous half-replay). `base` dumps with `--source-data` and refuses to write a manifest if the anchor is missing. |
+| Copy the binlogs somewhere safe | **The active binlog grows under the copy, and MySQL has no `archive_command`** — nothing ships closed files anywhere, ever. So `mark` IS the archiver: it flushes the active file closed, copies every file the instant stands on, and hash-verifies each copy against the server's own bytes *before* the manifest exists. The mark's inventory carries one sha256 per file — sizes vary by nature here, so the hash carries all the weight the WAL size gate used to. |
+| The database image can read its own history | **The official `mysql` image does not ship `mysqlbinlog`** (and `SHOW MASTER STATUS` is gone in 8.4 — both measured the hard way). The drill extracts the exact-version binary from the official client RPM and mounts it read-only into throwaways — the static-age lesson again — and `verify` refuses a version-skewed tool: a replay through the wrong decoder is a guess. |
+
+Measured with `gtid_mode=OFF`, the 8.4 default; GTID-mode PITR changes the
+replay rules and is not claimed here.
 
 ## How it works
 
@@ -405,11 +435,21 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   the remote can *prove*); in-place rot named by `check --remote` from the
   inventory alone, refused and cleaned up by `pull`, and *repaired* by the
   next `push`; and the crashed `.part` upload named for what it is.
-- **`test/backup.bats`**, **`test/offsite.bats`** and **`test/pitr.bats`** —
+- **`test/binlog.sh`** — the MySQL fire drill: seed, anchored dump, mark —
+  then a disaster after the mark (archived too, by a second mark), the source
+  destroyed, and the replay must reproduce the first instant exactly. Around
+  it, each measured binlog lie as a caught case: a mark doctored to stop
+  early replays **clean** and is failed by the arrival gate alone; the hole
+  and the rot are named before anything boots; the pre-anchor mark is
+  refused in milliseconds; and the drill to the second mark proves the
+  archived disaster is also a recoverable instant.
+- **`test/backup.bats`**, **`test/offsite.bats`**, **`test/pitr.bats`** and
+  **`test/binlog.bats`** —
   unit tests over argument
   parsing, manifest reading, the schema queries, the `eng_*` and `rem_*`
   interfaces, the WAL-name arithmetic (including the log-number carry a naive
-  hex increment gets wrong), and the regression guards described below.
+  hex increment gets wrong), the binlog name arithmetic, and the regression
+  guards described below.
 - CI runs the e2e against **Postgres 17, Postgres 16, MySQL 8.4 and a file
   tree, plain and encrypted** (eight combinations), the negative suite per
   engine, the off-site fire drill over **both remote kinds**, the PITR fire
@@ -417,7 +457,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
   **plain and encrypted**, because encryption must not change the promise —
-  and everything
+  the MySQL binlog fire drill, and everything
   again on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
@@ -556,14 +596,16 @@ explicitly, so both transports tell the same story.
 
 PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
 `--engine files`, off-site copies over ssh or onto a mounted disk, and
-point-in-time recovery over a WAL archive (PostgreSQL) — the archive pushed
-off-site, audited at the remote, pulled back onto a bare machine, and the
-whole chain optionally encrypted end to end (base backup and every segment):
+point-in-time recovery for both database engines — Postgres over a WAL
+archive (pushed off-site, audited at the remote, pulled back onto a bare
+machine, optionally encrypted end to end) and MySQL over archived binlogs:
 contents, schema objects (or file metadata), encryption at rest, whether the
 restored copy is actually usable, whether the remote provably holds what was
 sent, and whether a named instant provably comes back. Deliberately not here
-yet: point-in-time for MySQL — binlogs are a different mechanism, not a flag
-away; on the roadmap, not pretended to work today.
+yet: binlog PITR under GTID mode (measured with the 8.4 default, `gtid_mode=OFF`),
+and the binlog archive off-site or encrypted — the WAL archive earned both
+one measured campaign at a time, and the binlog archive will earn them the same way. On the
+roadmap, not pretended to work today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

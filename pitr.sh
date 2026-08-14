@@ -20,8 +20,9 @@
 #     reads the only witness there is.
 #
 # PostgreSQL only, on purpose. WAL archiving is a PostgreSQL mechanism;
-# MySQL's binlogs are a different animal, and pretending one interface covers
-# both would claim a generality this repo has not measured.
+# MySQL's binlogs are a different animal - measured, and different enough at
+# the spine (an unreached target is FATAL here, SILENT there) that they got
+# their own script: binlog.sh, same subcommands, opposite reflexes.
 #
 # Usage:
 #   ./pitr.sh base   --container NAME --db NAME --archive DIR [--out DIR]

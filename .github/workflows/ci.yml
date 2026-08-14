@@ -18,6 +18,11 @@ name: ci
 #                  alone brings the named instant back, and every measured way
 #                  an off-site WAL archive lies is caught, over both remotes,
 #                  plain and encrypted end to end
+#   binlog       - the MySQL point-in-time drill: anchored dump + archived
+#                  binlogs, disaster committed AFTER the mark, source
+#                  destroyed - and the named instant comes back exactly,
+#                  with arrival proven by CONTENT, because a replay that
+#                  never arrives exits 0 in silence (measured)
 on:
   push:
     branches: [main]
@@ -166,3 +171,14 @@ jobs:
           sudo install age/age age/age-keygen /usr/local/bin/
       - name: fire drill + every measured off-site WAL archive lie
         run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }} ${{ matrix.mode }}
+
+  binlog:
+    name: MySQL binlog fire drill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The drill extracts mysqlbinlog from the official client RPM itself -
+      # the mysql image does not ship it (measured), and only the
+      # exact-version official build is an honest replay tool.
+      - name: fire drill + every measured binlog lie
+        run: ./test/binlog.sh

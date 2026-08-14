@@ -76,7 +76,8 @@ main() {
     local kind
     kind="$(json_str "$MANIFEST" kind)"
     case "$kind" in
-        pitr-*) die "this is a PITR manifest (kind '$kind') - prove it with: ./pitr.sh verify";;
+        pitr-*)   die "this is a PITR manifest (kind '$kind') - prove it with: ./pitr.sh verify";;
+        binlog-*) die "this is a MySQL binlog PITR manifest (kind '$kind') - prove it with: ./binlog.sh verify";;
     esac
 
     local dir db artefact engine
