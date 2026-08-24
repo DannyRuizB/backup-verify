@@ -336,8 +336,9 @@ archiving but in places its exact opposite:
 | Copy the binlogs somewhere safe | **The active binlog grows under the copy, and MySQL has no `archive_command`** — nothing ships closed files anywhere, ever. So `mark` IS the archiver: it flushes the active file closed, copies every file the instant stands on, and hash-verifies each copy against the server's own bytes *before* the manifest exists. The mark's inventory carries one sha256 per file — sizes vary by nature here, so the hash carries all the weight the WAL size gate used to. |
 | The database image can read its own history | **The official `mysql` image does not ship `mysqlbinlog`** (and `SHOW MASTER STATUS` is gone in 8.4 — both measured the hard way). The drill extracts the exact-version binary from the official client RPM and mounts it read-only into throwaways — the static-age lesson again — and `verify` refuses a version-skewed tool: a replay through the wrong decoder is a guess. |
 
-Measured with `gtid_mode=OFF`, the 8.4 default; GTID-mode PITR changes the
-replay rules and is not claimed here.
+Measured with `gtid_mode=OFF`, the 8.4 default. GTID mode changes the replay
+rules — so it got its own measured campaign before it was claimed: see "GTID
+mode changes the replay's rules" below.
 
 ### The binlog archive has to leave the building too
 
@@ -379,6 +380,22 @@ WAL's in both directions:
 | Truncation needs the inventory to catch, like everything else here | The measured lie that anchors the plain binlog remote — **truncation at an event boundary decodes clean, rc 0, stderr empty** — is exactly what authenticated encryption kills: a `.age` cut *anywhere* (25%, 50%, 90%, and exactly at a chunk boundary — all measured) dies loudly at decrypt. **Encryption hands the binlog archive the noisy truncation it never had.** The WAL kept its exact-size gate through encryption; binlog sizes vary by nature, so here the loudness is pure gain. |
 | Encrypted means safe to trust | **A failed stream piped into age is still a valid ~200-byte `.age` that decrypts to nothing, rc 0** (measured) — encryption protects the bytes, not their meaning. `PIPESTATUS` names which side of the pipe broke, and the round trip against the server's bytes catches what no ciphertext self-check can. |
 | Ship the key with the backup, or verify can't run | `push` and `pull` **refuse** a key — they move opaque names and opaque hashes, and the remote audits the chain by ciphertext hash without ever holding a key. Only `verify` takes `--identity` (and refuses to run without it — no key, no drill, no comforting green tick); the wrong key is named at the first artefact it fails to open, and the chain decrypts only **inside** the throwaway, in a filesystem that dies with the drill. |
+
+### GTID mode changes the replay's rules
+
+Declared out of scope until the animal was measured — and the measurements
+say GTIDs make the silent failure modes *quieter*. Nothing is flagged:
+`base` and `mark` read the mode from the server, the manifests carry it, and
+`verify` boots a throwaway that matches (refusing, in milliseconds, a pair
+whose halves disagree — that is two different servers' rules, not a backup):
+
+| What looks fine | What is actually happening |
+|---|---|
+| The dump loaded cleanly on the throwaway, so the pair is compatible | **The load succeeds even on a `gtid_mode=OFF` throwaway** — `SET @@GLOBAL.GTID_PURGED` is legal there (measured) — and the failure waits for the expensive step: the replay dies at its first transaction, `ERROR 1781: @@SESSION.GTID_NEXT cannot be set to UUID:NUMBER when @@GLOBAL.GTID_MODE = OFF`. The throwaway must speak the pair's language, so `verify` boots it from the manifests, not from hope. |
+| The replay exited 0, so it applied | **The same replay run twice: rc 0 both times, stderr empty both times, and the second run applies NOTHING** (measured — `gtid_executed` byte-identical). GTID auto-skip silently eats every transaction the server believes it has seen, so with GTIDs an exit code means even *less* than before. New gate: the recovered history must **provably contain** the mark's transactions — `GTID_SUBSET(mark set, gtid_executed)` — in front of the fingerprints, which still decide. |
+| `gtid_purged` is replication noise — strip it from the dump | **The purged set IS the GTID world's anchor.** A dump stripped of it, replayed from the start, happily re-executes history it already contains until the collision: `ERROR 1050: Table 'customers' already exists` (measured). `base` on a GTID server refuses to write a manifest over a dump with no `GTID_PURGED` — and the set travels in **additive form** (`'+'`), which matters because a fresh throwaway is never GTID-empty: the official image's init writes ~6 GTIDs of its own before you touch it (measured). |
+| `--skip-gtids` fixes the 1781 error | It strips the GTID events — and with them the auto-skip protection, so the replay **re-executes everything** and dies on the same `already exists` collision (measured). The tool that looks like the fix is the re-execution. |
+| The anchor position must be exact, or GTID replays break | The one direction where GTIDs are a *gift*: with the purged set in place, a replay from the very beginning of history auto-skips everything pre-anchor and lands exactly (measured: the marked rows, nothing more). An over-generous start is forgiven; the replay still starts at the anchor because decoding 3 MB of the init's timezone rows for nothing is not a feature. |
 
 ## How it works
 
@@ -491,7 +508,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   the remote can *prove*); in-place rot named by `check --remote` from the
   inventory alone, refused and cleaned up by `pull`, and *repaired* by the
   next `push`; and the crashed `.part` upload named for what it is.
-- **`test/binlog.sh [--encrypted]`** — the MySQL fire drill: seed, anchored
+- **`test/binlog.sh [--encrypted] [--gtid]`** — the MySQL fire drill: seed,
+  anchored
   dump, mark —
   then a disaster after the mark (archived too, by a second mark), the source
   destroyed, and the replay must reproduce the first instant exactly. Around
@@ -503,6 +521,12 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   same drill through age ciphertext end to end — asserting the archive holds
   no plaintext and the seeded rows no longer grep out of it — plus the
   encrypted-only refusals: no key means no drill, and the wrong key is named.
+  `--gtid` runs it against a `gtid_mode=ON` source with nothing flagged on
+  `binlog.sh` itself — the mode must be detected, the throwaway must match,
+  the `GTID_SUBSET` gate must catch the doctored early stop alongside the
+  fingerprints, and a pair whose halves disagree about the mode must be
+  refused in milliseconds. The two flags compose, because neither may change
+  the promise.
 - **`test/binlog-offsite.sh [--remote-kind ssh|dir] [--encrypted]`** — the
   binlog archive's
   own fire drill: push, lose the machine, pull, and verify on nothing but
@@ -525,7 +549,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
   **plain and encrypted**, because encryption must not change the promise —
-  the MySQL binlog fire drill (**plain and encrypted**, for the same reason)
+  the MySQL binlog fire drill (**plain, encrypted, GTID, and GTID+encrypted**
+  — no mode may change the promise)
   and its off-site drill over **both remote kinds, plain and encrypted
   again**, and everything
   again on a
@@ -672,10 +697,10 @@ end to end, both pushed off-site, audited at the remote, and pulled back
 onto a bare machine: contents, schema objects (or file metadata), encryption
 at rest, whether the restored copy is actually usable, whether the remote
 provably holds what was sent, and whether a named instant provably comes back.
-Deliberately not here yet: binlog PITR under GTID mode (measured with the
-8.4 default, `gtid_mode=OFF`) — it changes the replay rules, so it will be
-measured first, like everything else here. On the roadmap, not pretended to
-work today.
+Binlog PITR is claimed under both `gtid_mode=OFF` (the 8.4 default) and
+`gtid_mode=ON` — each measured in its own campaign, with the mode read from
+the server and the manifests, never from a flag. Nothing else is promised:
+what the harness above does not drill, this repo does not claim.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

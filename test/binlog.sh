@@ -26,6 +26,12 @@
 # end (the mark encrypts as it archives; verify decrypts only inside the
 # throwaway), plus the encrypted-only refusals: no key means no drill, and
 # the wrong key is named at the first artefact it fails to open.
+#
+# --gtid runs the same drill against a source with gtid_mode=ON - detected by
+# base and mark, never flagged - plus the GTID-only checks: the throwaway
+# speaks GTID, the history gate (GTID_SUBSET) catches the silent early stop
+# alongside the fingerprints, and a pair whose halves disagree about the
+# mode is refused in milliseconds. Both flags compose.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -34,10 +40,12 @@ cd "$(dirname "$0")/.."
 load_engine mysql
 
 ENCRYPTED=0
+GTID=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --encrypted) ENCRYPTED=1; shift;;
-        *)           die "unknown option: $1 (usage: binlog.sh [--encrypted])";;
+        --gtid)      GTID=1; shift;;
+        *)           die "unknown option: $1 (usage: binlog.sh [--encrypted] [--gtid])";;
     esac
 done
 
@@ -62,6 +70,14 @@ trap cleanup EXIT
 # throwaway. The measured stake: a plain binlog reads your rows back with one
 # grep, and a plain binlog truncated at an event boundary decodes CLEAN -
 # ciphertext dies loudly at any cut.
+# --gtid runs the SAME drill against a source with gtid_mode=ON: nothing is
+# flagged on binlog.sh itself - base and mark must DETECT the mode, verify
+# must boot a matching throwaway and prove the history with GTID_SUBSET.
+GTID_ARGS=()
+if [ "$GTID" -eq 1 ]; then
+    GTID_ARGS=(--gtid-mode=ON --enforce-gtid-consistency=ON)
+fi
+
 SFX=""
 EFLAGS=()   # base/mark: --recipient + --identity
 VF=()       # verify / check --container: --identity
@@ -101,7 +117,8 @@ ok "mysqlbinlog $(docker run --rm -v "$TOOLS/mysqlbinlog:/usr/bin/mysqlbinlog:ro
 # --- the source, binlog on (the 8.4 default) -----------------------------------
 log "booting the source database ($IMAGE) with its binary log on"
 docker rm -f "$SRC" >/dev/null 2>&1 || true
-docker run -d --name "$SRC" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" >/dev/null
+docker run -d --name "$SRC" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" \
+    ${GTID_ARGS[@]+"${GTID_ARGS[@]}"} >/dev/null
 eng_wait_ready "$SRC"
 seed_mysql "$SRC" app
 ok "seeded: $(eng_query "$SRC" app 'SELECT COUNT(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC" app 'SELECT COUNT(*) FROM orders;' | tr -d '\n') orders"
@@ -177,6 +194,16 @@ else
     fail_case 'the fire drill failed: dump + binlogs did not reproduce the mark'
     sed -n '1,25p' "$OUT/verify.log" | sed 's/^/        /'
 fi
+if [ "$GTID" -eq 1 ]; then
+    # Nothing was flagged: the pair itself must have carried the mode, the
+    # throwaway must have spoken it, and the history gate must have run.
+    if grep -q 'gtid_mode=ON, to match the pair' "$OUT/verify.log" && grep -q 'GTID_SUBSET' "$OUT/verify.log"; then
+        pass_case "the throwaway spoke GTID (from the manifests, unflagged) and the recovered history provably contains the mark's transactions"
+    else
+        fail_case 'verify did not boot a GTID throwaway, or the history gate never ran'
+        sed -n '1,15p' "$OUT/verify.log" | sed 's/^/        /'
+    fi
+fi
 printf '\n'
 
 echo '== Case 2: a stop that is never reached is SILENT (measured) - arrival is proven by content =='
@@ -191,6 +218,16 @@ else
         pass_case 'the replay exited 0, said nothing, and the fingerprints failed it anyway - exit codes prove nothing here (measured)'
     else
         fail_case 'verify failed, but not through the arrival gate'
+        sed -n '1,15p' "$OUT/silent.log" | sed 's/^/        /'
+    fi
+fi
+if [ "$GTID" -eq 1 ]; then
+    # With GTIDs the same early stop is caught TWICE: the history gate names
+    # it before the fingerprints even run.
+    if grep -q "does not contain the mark's transactions" "$OUT/silent.log"; then
+        pass_case 'and the GTID history gate named the missing transactions too - two independent gates, one silent lie'
+    else
+        fail_case 'the GTID history gate did not name the early stop'
         sed -n '1,15p' "$OUT/silent.log" | sed 's/^/        /'
     fi
 fi
@@ -297,6 +334,24 @@ if [ "$ENCRYPTED" -eq 1 ]; then
         else
             fail_case 'verify failed, but without naming the wrong key'
             sed -n '1,15p' "$OUT/wrongkey.log" | sed 's/^/        /'
+        fi
+    fi
+    printf '\n'
+fi
+
+if [ "$GTID" -eq 1 ]; then
+    echo '== Case 9 (GTID only): a pair that disagrees about GTID mode is refused in milliseconds =='
+    # The mark doctored to claim a plain server: the halves now describe two
+    # different servers' rules, and no replay across that is a claim.
+    sed 's/"gtid_mode": "yes"/"gtid_mode": "no"/' "$M" > "$OUT/mode-mismatch.json"
+    if ./binlog.sh verify --base "$B" --mark "$OUT/mode-mismatch.json" --archive "$ARCHIVE" --tools "$TOOLS" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/mismatch.log" 2>&1; then
+        fail_case 'verify accepted a pair that disagrees about GTID mode'
+    else
+        if grep -q 'disagrees about GTID mode' "$OUT/mismatch.log" && ! grep -q 'booting a throwaway' "$OUT/mismatch.log"; then
+            pass_case "refused before anything boots - the halves describe two different servers' rules"
+        else
+            fail_case 'verify failed, but not with the mode-mismatch verdict'
+            sed -n '1,10p' "$OUT/mismatch.log" | sed 's/^/        /'
         fi
     fi
     printf '\n'

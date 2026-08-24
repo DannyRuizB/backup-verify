@@ -33,6 +33,16 @@
 #     (the shapeless lie above), truncated ciphertext dies loudly at every
 #     offset (measured) - encryption hands this archive the noisy truncation
 #     it never had.
+#   * GTID mode changes the replay's rules, so it was measured before it was
+#     claimed: a GTID replay on a gtid_mode=OFF throwaway dies (ERROR 1781);
+#     a REPEATED replay on a GTID throwaway exits 0, says nothing and
+#     applies NOTHING (auto-skip - rc 0 means even less than before); and a
+#     dump stripped of its GTID_PURGED re-executes history it already
+#     contains ("Table already exists" - the purged set IS the GTID world's
+#     anchor). GTID is read from the server and recorded in the manifests,
+#     never taken from a flag: verify boots the throwaway to match, refuses
+#     a pair whose halves disagree about the mode, and proves the replay's
+#     history with GTID_SUBSET on top of the fingerprints.
 #
 # Usage:
 #   ./binlog.sh base   --container NAME --db NAME [--out DIR]
@@ -236,6 +246,23 @@ binlog_status() {
     eng_query "$CONTAINER" mysql 'SHOW BINARY LOG STATUS;' | awk '{print $1, $2}'
 }
 
+# "yes" when the server runs with GTIDs, "no" otherwise. Recorded in every
+# manifest this script writes: verify must boot a throwaway that matches
+# (measured: a GTID replay dies on a gtid_mode=OFF server, ERROR 1781).
+server_gtid_mode() {
+    case "$(eng_query "$CONTAINER" mysql 'SELECT @@gtid_mode;' | tr -d '\n')" in
+        ON) printf 'yes';;
+        *)  printf 'no';;
+    esac
+}
+
+# The server's executed GTID set, on one line: the batch client escapes the
+# set's internal newlines as literal backslash-n (measured), stripped here so
+# the value survives a JSON string.
+server_gtid_executed() {
+    eng_query "$1" mysql 'SELECT @@gtid_executed;' | tr -d '\n' | sed 's/\\n//g'
+}
+
 container_sha256() {
     docker exec "$CONTAINER" sha256sum "/var/lib/mysql/$1" < /dev/null 2>/dev/null | awk '{print $1}'
 }
@@ -282,12 +309,13 @@ cmd_base() {
     assert_binlog_on
     mkdir -p "$OUT_DIR"
 
-    local stamp base artefact manifest version
+    local stamp base artefact manifest version gtid_mode
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     base="${DB}_${stamp}${LABEL:+_$LABEL}_binlogbase"
     artefact="$OUT_DIR/$base.sql"
     manifest="$OUT_DIR/$base.json"
     version=$(eng_query "$CONTAINER" mysql 'SELECT VERSION();' | tr -d '\n')
+    gtid_mode=$(server_gtid_mode)
 
     log "dumping '$DB' with its replay anchor (mysqldump --single-transaction --source-data)"
     trap 'rm -f -- "$artefact"' ERR
@@ -328,7 +356,7 @@ cmd_base() {
         rm -f -- "$artefact"
         die "base dump is only ${size} bytes (< $floor) - refusing to call that a base"
     fi
-    local anchor_line anchor_file anchor_pos
+    local anchor_line anchor_file anchor_pos purged_in_dump
     if [ -n "$RECIPIENT" ]; then
         # Two reads through the identity, and both are the key being proven
         # TODAY: does the dump parse to its end, and what is its anchor -
@@ -347,15 +375,30 @@ cmd_base() {
             die "the decrypted dump does not parse as a complete mysqldump (no trailing 'Dump completed') - removed"
         fi
         # awk reads the WHOLE stream: grep -m1 would close the pipe early and
-        # hand age a SIGPIPE that pipefail turns into a silent death.
-        anchor_line=$(age -d -i "$IDENTITY" "$artefact" 2>/dev/null \
-            | awk '/CHANGE REPLICATION SOURCE TO/ && !found { line = $0; found = 1 } END { print line }')
+        # hand age a SIGPIPE that pipefail turns into a silent death. The one
+        # pass also answers whether the dump carries its GTID_PURGED set.
+        local probe_out
+        probe_out=$(age -d -i "$IDENTITY" "$artefact" 2>/dev/null \
+            | awk '/CHANGE REPLICATION SOURCE TO/ && !found { line = $0; found = 1 }
+                   /GTID_PURGED/ { purged = 1 }
+                   END { print (purged ? "yes" : "no") "\t" line }')
+        purged_in_dump="${probe_out%%$'\t'*}"
+        anchor_line="${probe_out#*$'\t'}"
     else
         if ! eng_archive_parses "$CONTAINER" < "$artefact"; then
             rm -f -- "$artefact"
             die "the base dump does not parse as a complete mysqldump (no trailing 'Dump completed') - removed"
         fi
         anchor_line=$(grep -m1 'CHANGE REPLICATION SOURCE TO' "$artefact" || true)
+        purged_in_dump=$(grep -q 'GTID_PURGED' "$artefact" && echo yes || echo no)
+    fi
+    # On a GTID server the purged set IS the second anchor: a dump stripped
+    # of it re-executes history it already contains (measured: the replay
+    # died on "Table 'customers' already exists" after happily re-running
+    # every pre-dump transaction).
+    if [ "$gtid_mode" = yes ] && [ "$purged_in_dump" != yes ]; then
+        rm -f -- "$artefact"
+        die "the server runs with GTIDs but the dump carries no GTID_PURGED set - a replay over it would RE-EXECUTE history the dump already contains (measured); removed"
     fi
     anchor_file=$(printf '%s' "$anchor_line" | grep -o "SOURCE_LOG_FILE='[^']*'" | cut -d"'" -f2)
     anchor_pos=$(printf '%s' "$anchor_line" | grep -o 'SOURCE_LOG_POS=[0-9]*' | cut -d= -f2)
@@ -379,6 +422,9 @@ cmd_base() {
         printf '  "encryption": "%s",\n' "$([ -n "$RECIPIENT" ] && echo age || echo none)"
         printf '  "recipient": "%s",\n' "$([ -f "$RECIPIENT" ] && basename "$RECIPIENT" || printf '%s' "$RECIPIENT")"
         printf '  "server_version": "%s",\n' "$(printf '%s' "$version" | cut -d. -f1-2)"
+        # verify boots the throwaway to MATCH this, and refuses a pair whose
+        # halves disagree - a GTID replay on a plain server dies (measured).
+        printf '  "gtid_mode": "%s",\n' "$gtid_mode"
         printf '  "anchor_file": "%s",\n' "$anchor_file"
         printf '  "anchor_pos": %s\n' "$anchor_pos"
         printf '}\n'
@@ -452,7 +498,19 @@ EOF
         objects_block+=$(printf '    "%s": "%s"' "$class" "$(eng_schema_digest "$CONTAINER" "$DB" "$class")")
     done
 
-    local mark_file mark_pos quiesced
+    local mark_file mark_pos quiesced gtid_mode gtid_executed=""
+    gtid_mode=$(server_gtid_mode)
+    if [ "$gtid_mode" = yes ]; then
+        # This set is the GTID name of the instant, and verify holds the
+        # recovered history against it with GTID_SUBSET - because with GTIDs
+        # a replay that applies NOTHING also exits 0 (measured: auto-skip is
+        # silent). Read BEFORE the position on purpose: if a write straddles
+        # the two reads, a set read AFTER would contain a transaction the
+        # replay to the mark can never apply, and the history gate would
+        # fail a healthy pair - read first, the set can only trail the
+        # position, and the subset still holds.
+        gtid_executed=$(server_gtid_executed "$CONTAINER")
+    fi
     read -r mark_file mark_pos <<< "$(binlog_status)"
     if [ "$pos_before" = "$mark_file $mark_pos" ]; then
         quiesced="yes"
@@ -460,7 +518,7 @@ EOF
         quiesced="no"
         warn "the binlog advanced while fingerprinting ($pos_before -> $mark_file $mark_pos): writes are landing, and the fingerprints and the position may straddle them"
     fi
-    log "the instant is $mark_file:$mark_pos"
+    log "the instant is $mark_file:$mark_pos${gtid_executed:+ (executed GTIDs: $gtid_executed)}"
 
     # FLUSH closes the mark's file. An ACTIVE binlog keeps growing under any
     # copy (measured) - only a closed file has final bytes worth hashing.
@@ -565,6 +623,8 @@ EOF
         printf '  "mark_file": "%s",\n' "$mark_file"
         printf '  "mark_pos": %s,\n' "$mark_pos"
         printf '  "quiesced": "%s",\n' "$quiesced"
+        printf '  "gtid_mode": "%s",\n' "$gtid_mode"
+        printf '  "gtid_executed": "%s",\n' "$gtid_executed"
         # Recorded so verify, push, pull and check all learn the archive's
         # form from the manifest, never by sniffing directories.
         printf '  "binlogs_encrypted": "%s",\n' "$([ -n "$RECIPIENT" ] && echo yes || echo no)"
@@ -1094,6 +1154,19 @@ cmd_verify() {
         encryption_available || die "the pair is encrypted but 'age' is not installed"
     fi
 
+    # GTID mode also comes from the manifests, never from a flag - and the
+    # halves must agree: a history that changed mode between the base and
+    # the mark is not claimed here. Manifests from before this field are
+    # read as plain, which is what they were.
+    local base_gtid mark_gtid gtid_mode
+    base_gtid=$(json_str "$BASE_MANIFEST" gtid_mode)
+    mark_gtid=$(json_str "$MARK_MANIFEST" gtid_mode)
+    base_gtid=${base_gtid:-no}
+    mark_gtid=${mark_gtid:-no}
+    [ "$base_gtid" = "$mark_gtid" ] \
+        || die "the base says gtid_mode=$base_gtid but the mark says gtid_mode=$mark_gtid - a pair that disagrees about GTID mode describes two different servers' rules; take a fresh pair"
+    gtid_mode="$base_gtid"
+
     log "verifying that base + archived binlogs reproduce $mark_file:$mark_pos ($db)"
 
     # --- Gate 1: the base dump is byte-identical to what was taken -----------
@@ -1178,8 +1251,15 @@ cmd_verify() {
 
     PROBE="bv-binlog-$$"
     trap cleanup EXIT
-    log "booting a throwaway $IMAGE as '$PROBE'"
-    eng_boot "$PROBE" "$db" "$IMAGE"
+    if [ "$gtid_mode" = yes ]; then
+        # The throwaway must speak the pair's language: applying a GTID
+        # replay to a gtid_mode=OFF server dies with ERROR 1781 (measured).
+        log "booting a throwaway $IMAGE as '$PROBE' (gtid_mode=ON, to match the pair)"
+        eng_boot "$PROBE" "$db" "$IMAGE" --gtid-mode=ON --enforce-gtid-consistency=ON
+    else
+        log "booting a throwaway $IMAGE as '$PROBE'"
+        eng_boot "$PROBE" "$db" "$IMAGE"
+    fi
     eng_wait_ready "$PROBE"
     [ "$(eng_count_tables "$PROBE" "$db" | tr -d '\n')" = "0" ] \
         || die "the throwaway instance is not empty - refusing an ambiguous restore (measured on the dump side)"
@@ -1273,11 +1353,31 @@ cmd_verify() {
         rm -f "$replay_sql" "$replay_sql.apply-err"
     fi
 
-    # --- Gate 5: ARRIVAL, proven by content -----------------------------------
+    # --- Gate 5 (GTID only): the history, by name ------------------------------
+    # A GTID-shaped arrival check in front of the fingerprints: with GTIDs a
+    # replay can exit 0 having applied NOTHING AT ALL - auto-skip silently
+    # eats every transaction the server believes it has seen (measured: the
+    # same replay twice, rc 0 both times, zero effect the second). So the
+    # recovered instance must PROVABLY contain every transaction the mark
+    # stood on, and GTID_SUBSET asks exactly that.
+    local failures=0 gate_fail=0 checked mark_gtids
+    if [ "$gtid_mode" = yes ]; then
+        mark_gtids=$(json_str "$MARK_MANIFEST" gtid_executed)
+        if [ -z "$mark_gtids" ]; then
+            warn "this GTID mark records no gtid_executed set, so history containment cannot be checked - the fingerprints below still decide"
+        elif [ "$(eng_query "$PROBE" "$db" "SELECT GTID_SUBSET('$mark_gtids', @@global.gtid_executed);" | tr -d '\n')" = "1" ]; then
+            ok "the recovered history provably contains every transaction the mark stood on (GTID_SUBSET)"
+        else
+            printf '  %sFAIL%s the recovered history does not contain the mark'\''s transactions - a GTID replay skips what the server thinks it has seen, silently and with rc 0 (measured)\n' \
+                "$c_red" "$c_reset"
+            failures=$((failures + 1))
+        fi
+    fi
+
+    # --- Gate 6: ARRIVAL, proven by content -----------------------------------
     # The measured inversion this script exists for: a --stop-position past
     # the end of history exits 0 with an empty stderr. MySQL will not say
     # whether the replay ARRIVED - so the mark's own fingerprints do.
-    local failures=0 gate_fail=0 checked
     compare_tables "$PROBE" "$db" "$MARK_MANIFEST" || gate_fail=$?
     failures=$((failures + gate_fail))
     checked=$COMPARED_TABLES

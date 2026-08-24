@@ -381,3 +381,42 @@ fabricate_pair() {
     [[ "$output" == *"binlog.000005.age - the remote's bytes do not hash back"* ]]
     rm -rf "$tmp"
 }
+
+# --- GTID mode (12th round) ------------------------------------------------------
+
+@test "verify refuses a pair that disagrees about GTID mode, before anything boots" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/tools" "$tmp/archive"
+    printf '#!/bin/sh\n' > "$tmp/tools/mysqlbinlog"; chmod +x "$tmp/tools/mysqlbinlog"
+    fabricate_pair "$tmp" binlog.000003 100 binlog.000003 500
+    sed -i 's/"kind": "binlog-base",/"kind": "binlog-base",\n  "gtid_mode": "yes",/' "$tmp/b_binlogbase.json"
+    sed -i 's/"kind": "binlog-mark",/"kind": "binlog-mark",\n  "gtid_mode": "no",/' "$tmp/m_binlogmark.json"
+    run bash "$REPO/binlog.sh" verify --base "$tmp/b_binlogbase.json" --mark "$tmp/m_binlogmark.json" \
+        --archive "$tmp/archive" --tools "$tmp/tools"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"disagrees about GTID mode"* ]]
+    [[ "$output" != *"booting"* ]]
+    # a GTID base against a manifest from BEFORE the field is the same refusal:
+    # absent reads as plain, which is what it was
+    sed -i '/"gtid_mode"/d' "$tmp/m_binlogmark.json"
+    run bash "$REPO/binlog.sh" verify --base "$tmp/b_binlogbase.json" --mark "$tmp/m_binlogmark.json" \
+        --archive "$tmp/archive" --tools "$tmp/tools"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"disagrees about GTID mode"* ]]
+    rm -rf "$tmp"
+}
+
+@test "a plain pair - or one from before the gtid_mode field - is still read as plain" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/tools" "$tmp/archive"
+    printf '#!/bin/sh\n' > "$tmp/tools/mysqlbinlog"; chmod +x "$tmp/tools/mysqlbinlog"
+    # both halves absent (an old pair): must NOT die on the mode gate - it
+    # walks on and dies later, on the chain (the archive is empty)
+    fabricate_pair "$tmp" binlog.000003 100 binlog.000003 500
+    run bash "$REPO/binlog.sh" verify --base "$tmp/b_binlogbase.json" --mark "$tmp/m_binlogmark.json" \
+        --archive "$tmp/archive" --tools "$tmp/tools"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"disagrees about GTID mode"* ]]
+    [[ "$output" == *"missing binlog.000003"* ]]
+    rm -rf "$tmp"
+}
