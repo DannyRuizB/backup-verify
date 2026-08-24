@@ -74,6 +74,14 @@ age-keygen -o key.txt
                   --archive /srv/binlog-archive --remote bk@nas:/srv/binlogs
 ./binlog.sh check --remote bk@nas:/srv/binlogs
 ./binlog.sh pull  --db app --remote bk@nas:/srv/binlogs --archive ./recovered-binlogs
+
+# encrypted end to end: the mark encrypts as it archives (and proves the
+# round trip against the server's bytes), the chain travels as ciphertext,
+# and only verify ever holds the key:
+./binlog.sh base   --container my-mysql --db app --recipient age1... --identity key.txt
+./binlog.sh mark   --container my-mysql --db app --archive /srv/binlog-archive \
+                   --recipient age1... --identity key.txt
+./binlog.sh verify --base ... --mark ... --archive ... --tools ./tools --identity key.txt
 ```
 
 ```
@@ -352,6 +360,26 @@ The fire drill is the same as the WAL's: mark, push, lose the machine —
 source, local archive, every manifest — pull, and the instant comes back
 exactly, arrival proven by content on a bare machine.
 
+### And the binlog is your rows too
+
+The WAL measurement repeats here almost verbatim — a seeded email address
+greps straight out of a raw archived binlog (ROW format writes the row
+itself, and 8.4 neither compresses nor encrypts it by default) — with one
+trap the probe itself fell into: the grep first came back *empty*, because
+`binlog.000001` of a fresh official-image server belongs to the **init**, not
+to you — ~3 MB of timezone rows written by the entrypoint's temporary server.
+Your rows live from `binlog.000002` on, in clear either way. So the binlog
+archive earned its own encryption campaign, and the animal disagrees with the
+WAL's in both directions:
+
+| What looks fine | What is actually happening |
+|---|---|
+| Encrypt each file when it is uploaded | Same non-determinism as the WAL — **the same binlog encrypted twice gives different bytes** (measured, same size) — so the ciphertext **as archived** is the file's identity and the inventory hashes exactly that. But MySQL has no `archive_command` to hang the encryption on: the mark IS the archiver, so **the mark encrypts** — `docker exec` streams each closed file straight into `age`, and the plaintext never touches the host's disk. |
+| The `.age` landed, so the file is archived | The mark can do something the WAL's `archive_command` never could: **decrypt what it just archived and hold the plaintext against the server's own bytes, right now**. Every archived ciphertext is round-trip-proven before the manifest exists — the copy check and the key check are the same act, which is why `mark --recipient` requires `--identity`. |
+| Truncation needs the inventory to catch, like everything else here | The measured lie that anchors the plain binlog remote — **truncation at an event boundary decodes clean, rc 0, stderr empty** — is exactly what authenticated encryption kills: a `.age` cut *anywhere* (25%, 50%, 90%, and exactly at a chunk boundary — all measured) dies loudly at decrypt. **Encryption hands the binlog archive the noisy truncation it never had.** The WAL kept its exact-size gate through encryption; binlog sizes vary by nature, so here the loudness is pure gain. |
+| Encrypted means safe to trust | **A failed stream piped into age is still a valid ~200-byte `.age` that decrypts to nothing, rc 0** (measured) — encryption protects the bytes, not their meaning. `PIPESTATUS` names which side of the pipe broke, and the round trip against the server's bytes catches what no ciphertext self-check can. |
+| Ship the key with the backup, or verify can't run | `push` and `pull` **refuse** a key — they move opaque names and opaque hashes, and the remote audits the chain by ciphertext hash without ever holding a key. Only `verify` takes `--identity` (and refuses to run without it — no key, no drill, no comforting green tick); the wrong key is named at the first artefact it fails to open, and the chain decrypts only **inside** the throwaway, in a filesystem that dies with the drill. |
+
 ## How it works
 
 **`backup.sh --engine postgres|mysql|files`** dumps with the engine's own tool
@@ -463,20 +491,26 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   the remote can *prove*); in-place rot named by `check --remote` from the
   inventory alone, refused and cleaned up by `pull`, and *repaired* by the
   next `push`; and the crashed `.part` upload named for what it is.
-- **`test/binlog.sh`** — the MySQL fire drill: seed, anchored dump, mark —
+- **`test/binlog.sh [--encrypted]`** — the MySQL fire drill: seed, anchored
+  dump, mark —
   then a disaster after the mark (archived too, by a second mark), the source
   destroyed, and the replay must reproduce the first instant exactly. Around
   it, each measured binlog lie as a caught case: a mark doctored to stop
   early replays **clean** and is failed by the arrival gate alone; the hole
   and the rot are named before anything boots; the pre-anchor mark is
   refused in milliseconds; and the drill to the second mark proves the
-  archived disaster is also a recoverable instant.
-- **`test/binlog-offsite.sh [--remote-kind ssh|dir]`** — the binlog archive's
+  archived disaster is also a recoverable instant. `--encrypted` runs the
+  same drill through age ciphertext end to end — asserting the archive holds
+  no plaintext and the seeded rows no longer grep out of it — plus the
+  encrypted-only refusals: no key means no drill, and the wrong key is named.
+- **`test/binlog-offsite.sh [--remote-kind ssh|dir] [--encrypted]`** — the
+  binlog archive's
   own fire drill: push, lose the machine, pull, and verify on nothing but
   the remote's contents — plus the incremental push, the unpushed mark being
   unclaimable, rot at the remote (shapeless here even as truncation —
   measured) named by `check --remote`, refused by `pull` and repaired by the
-  next `push`, and the `.part` debris named.
+  next `push`, and the `.part` debris named. `--encrypted` sends the same
+  instant as ciphertext the remote never gets a key for.
 - **`test/backup.bats`**, **`test/offsite.bats`**, **`test/pitr.bats`** and
   **`test/binlog.bats`** —
   unit tests over argument
@@ -491,8 +525,9 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
   **plain and encrypted**, because encryption must not change the promise —
-  the MySQL binlog fire drill and its off-site drill over **both remote
-  kinds**, and everything
+  the MySQL binlog fire drill (**plain and encrypted**, for the same reason)
+  and its off-site drill over **both remote kinds, plain and encrypted
+  again**, and everything
   again on a
   weekly schedule: a backup tool that only works the day you wrote it is not a
   backup tool. `age` is installed in the negative jobs deliberately **without**
@@ -632,16 +667,15 @@ explicitly, so both transports tell the same story.
 PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
 `--engine files`, off-site copies over ssh or onto a mounted disk, and
 point-in-time recovery for both database engines — Postgres over a WAL
-archive (optionally encrypted end to end) and MySQL over archived binlogs,
-both pushed off-site, audited at the remote, and pulled back onto a bare
-machine: contents, schema objects (or file metadata), encryption at rest,
-whether the restored copy is actually usable, whether the remote provably
-holds what was sent, and whether a named instant provably comes back.
+archive and MySQL over archived binlogs, both archives optionally encrypted
+end to end, both pushed off-site, audited at the remote, and pulled back
+onto a bare machine: contents, schema objects (or file metadata), encryption
+at rest, whether the restored copy is actually usable, whether the remote
+provably holds what was sent, and whether a named instant provably comes back.
 Deliberately not here yet: binlog PITR under GTID mode (measured with the
-8.4 default, `gtid_mode=OFF`), and the binlog archive encrypted — the WAL
-archive earned encryption through its own measured campaign, and the binlog
-archive will earn it the same way. On the roadmap, not pretended to work
-today.
+8.4 default, `gtid_mode=OFF`) — it changes the replay rules, so it will be
+measured first, like everything else here. On the roadmap, not pretended to
+work today.
 
 Sibling in spirit of [debian-hardening](https://github.com/DannyRuizB/debian-hardening),
 [debian-hardening-ansible](https://github.com/DannyRuizB/debian-hardening-ansible)

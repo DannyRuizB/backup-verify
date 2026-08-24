@@ -15,6 +15,10 @@
 #     check --remote today, refused and cleaned up by pull, REPAIRED by push;
 #   * a crashed upload (.part) named for what it is;
 #   * the second push ships only what the remote cannot already prove.
+#
+# --encrypted ships the same instant as age ciphertext end to end: opaque
+# names, opaque hashes, no key at the remote ever - and the bare-machine
+# verify still proves arrival by content, through the identity.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -23,10 +27,12 @@ cd "$(dirname "$0")/.."
 load_engine mysql
 
 KIND="ssh"
+ENCRYPTED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --remote-kind) KIND="${2:-}"; shift 2;;
-        *)             die "unknown option: $1 (usage: binlog-offsite.sh [--remote-kind ssh|dir])";;
+        --encrypted)   ENCRYPTED=1; shift;;
+        *)             die "unknown option: $1 (usage: binlog-offsite.sh [--remote-kind ssh|dir] [--encrypted])";;
     esac
 done
 case "$KIND" in ssh|dir) ;; *) die "--remote-kind must be ssh or dir, got '$KIND'";; esac
@@ -50,6 +56,24 @@ cleanup() {
     rm -rf "$OUT" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# --encrypted: the chain leaves the server as age ciphertext and travels that
+# way - push, pull and check handle opaque names and hashes, and no key ever
+# reaches the remote. Only the fire drill's verify (case 6) needs the identity.
+SFX=""
+EFLAGS=()
+VF=()
+if [ "$ENCRYPTED" -eq 1 ]; then
+    encryption_available || die '--encrypted requires age'
+    docker run --rm -v "$(command -v age):/usr/local/bin/age:ro" \
+            --entrypoint /usr/local/bin/age "$IMAGE" --version >/dev/null 2>&1 \
+        || die "the age at $(command -v age) does not run inside $IMAGE (dynamically linked?) - the encrypted drill needs a static age"
+    age-keygen -o "$OUT/key.txt" 2>/dev/null
+    RECIPIENT=$(grep -o 'age1.*' "$OUT/key.txt")
+    SFX=".age"
+    EFLAGS=(--recipient "$RECIPIENT" --identity "$OUT/key.txt")
+    VF=(--identity "$OUT/key.txt")
+fi
 
 # --- the remote, and kind-specific mutation helpers --------------------------
 if [ "$KIND" = ssh ]; then
@@ -116,13 +140,13 @@ eng_wait_ready "$SRC"
 seed_mysql "$SRC" app
 ok "seeded: $(eng_query "$SRC" app 'SELECT COUNT(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC" app 'SELECT COUNT(*) FROM orders;' | tr -d '\n') orders"
 
-./binlog.sh base --container "$SRC" --db app --out "$BK" >"$OUT/base.log" 2>&1 \
+./binlog.sh base --container "$SRC" --db app --out "$BK" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/base.log" 2>&1 \
     || { fail_case 'the anchored dump failed'; sed -n '1,10p' "$OUT/base.log" | sed 's/^/        /'; exit 1; }
 B=$(find "$BK" -name '*_binlogbase.json' | head -1)
 traffic case1
 eng_query "$SRC" mysql 'FLUSH BINARY LOGS;' >/dev/null
 traffic case1b
-./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" >"$OUT/mark1.log" 2>&1 \
+./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark1.log" 2>&1 \
     || { fail_case 'the first mark failed'; sed -n '1,10p' "$OUT/mark1.log" | sed 's/^/        /'; exit 1; }
 M1=$(find "$BK" -name '*_binlogmark.json' | LC_ALL=C sort | tail -1)
 
@@ -145,7 +169,7 @@ printf '\n'
 echo '== Case 2: the second push ships only what the remote cannot already prove =='
 traffic case2
 sleep 1.1
-./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" >"$OUT/mark2.log" 2>&1 \
+./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark2.log" 2>&1 \
     || fail_case 'the second mark failed'
 M2=$(find "$BK" -name '*_binlogmark.json' | LC_ALL=C sort | tail -1)
 if ./binlog.sh push --base "$B" --mark "$M2" --archive "$ARCHIVE" --remote "$REMOTE" "${OS[@]}" >"$OUT/push2.log" 2>&1; then
@@ -166,7 +190,7 @@ printf '\n'
 echo '== Case 3: an instant never pushed is an instant the remote cannot prove =='
 traffic case3
 sleep 1.1
-./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" >"$OUT/mark3.log" 2>&1 \
+./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark3.log" 2>&1 \
     || fail_case 'the third mark failed'
 M3=$(find "$BK" -name '*_binlogmark.json' | LC_ALL=C sort | tail -1)
 if ./binlog.sh pull --db app --remote "$REMOTE" --archive "$OUT/pulled3-archive" --out "$OUT/pulled3" "${OS[@]}" >"$OUT/pull3.log" 2>&1; then
@@ -183,7 +207,7 @@ fi
 
 printf '\n'
 echo '== Case 4: rot at the remote - shapeless here even as truncation (measured) - named, refused, repaired =='
-VICTIM=$(json_str "$B" anchor_file)
+VICTIM="$(json_str "$B" anchor_file)$SFX"
 remote_rot "$VICTIM"
 if ./binlog.sh check --remote "$REMOTE" "${OS[@]}" >"$OUT/check4.log" 2>&1; then
     fail_case 'check --remote blessed a remote with rotten bytes'
@@ -241,7 +265,7 @@ ok "the machine is bare - the remote is the only copy of anything"
 if ./binlog.sh pull --db app --remote "$REMOTE" --archive "$OUT/fire-archive" --out "$OUT/fire" "${OS[@]}" >"$OUT/pull6.log" 2>&1; then
     FB=$(find "$OUT/fire" -name '*_binlogbase.json')
     FM=$(find "$OUT/fire" -name '*_binlogmark.json')
-    if ./binlog.sh verify --base "$FB" --mark "$FM" --archive "$OUT/fire-archive" --tools "$TOOLS" --image "$IMAGE" >"$OUT/verify6.log" 2>&1; then
+    if ./binlog.sh verify --base "$FB" --mark "$FM" --archive "$OUT/fire-archive" --tools "$TOOLS" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify6.log" 2>&1; then
         pass_case 'the pulled dump + chain reproduced the pushed instant EXACTLY - arrival proven by content, on a bare machine'
     else
         fail_case 'the pulled pair did not verify'

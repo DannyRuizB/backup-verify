@@ -1,6 +1,6 @@
 name: ci
 
-# Six stages, in order of how much they prove:
+# Eight stages, in order of how much they prove:
 #   lint         - the scripts parse, shellcheck is happy, the units pass
 #   e2e          - a real source (Postgres 17/16, MySQL 8.4, a file tree; plain
 #                  and encrypted) is seeded, backed up, DESTROYED, and restored
@@ -22,12 +22,15 @@ name: ci
 #                  binlogs, disaster committed AFTER the mark, source
 #                  destroyed - and the named instant comes back exactly,
 #                  with arrival proven by CONTENT, because a replay that
-#                  never arrives exits 0 in silence (measured)
+#                  never arrives exits 0 in silence (measured); plain and
+#                  with the whole archive encrypted through age (a raw
+#                  binlog greps your rows back in clear - measured)
 #   binlog-offsite - the same instant pushed to a remote, the MACHINE lost,
 #                  and the remote alone bringing it back - where even
 #                  truncation is shapeless (a binlog cut at an event
 #                  boundary decodes clean - measured), so the inventory
-#                  hash carries everything, over both transports
+#                  hash carries everything, over both transports, plain
+#                  and as ciphertext the remote never gets a key for
 on:
   push:
     branches: [main]
@@ -53,7 +56,7 @@ jobs:
       - name: ShellCheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck >/dev/null
-          shellcheck -x backup.sh verify.sh offsite.sh pitr.sh lib/*.sh test/*.sh
+          shellcheck -x backup.sh verify.sh offsite.sh pitr.sh binlog.sh lib/*.sh test/*.sh
 
       - name: Unit tests (bats)
         run: |
@@ -178,24 +181,45 @@ jobs:
         run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }} ${{ matrix.mode }}
 
   binlog:
-    name: MySQL binlog fire drill
+    name: MySQL binlog fire drill (${{ matrix.mode }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Encrypted re-runs the whole drill through age, plus the two
+      # encrypted-only refusals (no key, wrong key).
+      matrix:
+        mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
+      # Static release build, same reason as the pitr job: age rides into the
+      # replay container, and a dynamically linked age does not run there.
+      - name: Install age (static release build)
+        if: matrix.mode == '--encrypted'
+        run: |
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar -xz
+          sudo install age/age age/age-keygen /usr/local/bin/
       # The drill extracts mysqlbinlog from the official client RPM itself -
       # the mysql image does not ship it (measured), and only the
       # exact-version official build is an honest replay tool.
       - name: fire drill + every measured binlog lie
-        run: ./test/binlog.sh
+        run: ./test/binlog.sh ${{ matrix.mode }}
 
   binlog-offsite:
-    name: MySQL binlog off-site fire drill (${{ matrix.remote }})
+    name: MySQL binlog off-site fire drill (${{ matrix.remote }} ${{ matrix.mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Both transports, plain and with the chain as ciphertext the remote
+      # never gets a key for.
       matrix:
         remote: [ssh, dir]
+        mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
+      - name: Install age (static release build)
+        if: matrix.mode == '--encrypted'
+        run: |
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar -xz
+          sudo install age/age age/age-keygen /usr/local/bin/
       - name: fire drill + every measured off-site binlog lie
-        run: ./test/binlog-offsite.sh --remote-kind ${{ matrix.remote }}
+        run: ./test/binlog-offsite.sh --remote-kind ${{ matrix.remote }} ${{ matrix.mode }}

@@ -274,3 +274,110 @@ fabricate_pair() {
     [[ "$output" == *"can prove every instant it claims"* ]]
     rm -rf "$tmp"
 }
+
+# --- the encrypted archive (11th round) ----------------------------------------
+
+@test "base and mark refuse --recipient without --identity: the key gets proven today" {
+    run bash -c "source '$REPO/binlog.sh'; parse_args base --container c --db app --recipient age1xyz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"base --recipient requires --identity"* ]]
+    [[ "$output" == *"anchor lives INSIDE the dump"* ]]
+    tmp=$(mktemp -d)
+    run bash -c "source '$REPO/binlog.sh'; parse_args mark --container c --db app --archive '$tmp' --recipient age1xyz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"mark --recipient requires --identity"* ]]
+    rm -rf "$tmp"
+}
+
+@test "a key is refused wherever it means nothing: base --identity alone, verify --recipient, push/pull with any key" {
+    tmp=$(mktemp -d)
+    touch "$tmp/key.txt"
+    printf '#!/bin/sh\n' > "$tmp/mysqlbinlog"; chmod +x "$tmp/mysqlbinlog"
+    run bash -c "source '$REPO/binlog.sh'; parse_args base --container c --db app --identity '$tmp/key.txt'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--identity only makes sense with --recipient"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args verify --archive '$tmp' --base b --mark m --tools '$tmp' --recipient age1xyz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"backup-time option"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args push --base b --mark m --archive '$tmp' --remote r --identity '$tmp/key.txt'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"moves opaque ciphertext"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args pull --db app --remote r --archive '$tmp' --recipient age1xyz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"moves opaque ciphertext"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args base --container c --db app --recipient age1xyz --identity '$tmp/missing'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"identity file not found"* ]]
+    rm -rf "$tmp"
+}
+
+@test "the archive names its own form: plain, .age, or a mixed coin toss refused" {
+    tmp=$(mktemp -d)
+    source "$REPO/lib/common.sh"
+    source "$REPO/binlog.sh" 2>/dev/null || true
+    ARCHIVE_DIR="$tmp"
+    [ -z "$(archive_binlog_suffix)" ]                       # empty archive: no form yet
+    touch "$tmp/binlog.000001" "$tmp/binlog.000002"
+    [ -z "$(archive_binlog_suffix)" ]                       # plain
+    rm -f "$tmp"/binlog.00000*
+    touch "$tmp/binlog.000001.age"
+    [ "$(archive_binlog_suffix)" = ".age" ]                 # encrypted
+    touch "$tmp/binlog.000002"
+    run archive_binlog_suffix                               # mixed: refuse
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"BOTH plain and .age"* ]]
+    rm -rf "$tmp"
+}
+
+@test "verify refuses an encrypted pair without the key, before anything boots" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/tools" "$tmp/archive"
+    printf '#!/bin/sh\n' > "$tmp/tools/mysqlbinlog"; chmod +x "$tmp/tools/mysqlbinlog"
+    printf 'age ciphertext, allegedly' > "$tmp/b_binlogbase.sql.age"
+    sha=$(sha256sum "$tmp/b_binlogbase.sql.age" | cut -d' ' -f1)
+    bytes=$(stat -c%s "$tmp/b_binlogbase.sql.age")
+    printf '{\n  "schema": 3,\n  "kind": "binlog-base",\n  "database": "app",\n  "artefact": "b_binlogbase.sql.age",\n  "bytes": %s,\n  "sha256": "%s",\n  "engine": "mysql",\n  "server_version": "8.4",\n  "anchor_file": "binlog.000003",\n  "anchor_pos": 100\n}\n' \
+        "$bytes" "$sha" > "$tmp/b_binlogbase.json"
+    printf '{\n  "schema": 3,\n  "kind": "binlog-mark",\n  "database": "app",\n  "mark_file": "binlog.000003",\n  "mark_pos": 500,\n  "binlogs_encrypted": "yes",\n  "binlogs": {\n    "binlog.000003.age": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:158"\n  },\n  "tables": {\n    "t": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1"\n  },\n  "objects": {\n  }\n}\n' \
+        > "$tmp/m_binlogmark.json"
+    run bash "$REPO/binlog.sh" verify --base "$tmp/b_binlogbase.json" --mark "$tmp/m_binlogmark.json" \
+        --archive "$tmp/archive" --tools "$tmp/tools"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"would be a guess"* ]]
+    [[ "$output" != *"booting"* ]]
+    rm -rf "$tmp"
+}
+
+@test "check --container over an encrypted archive refuses to guess without the key" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/archive"
+    printf 'ciphertext' > "$tmp/archive/binlog.000001.age"
+    run bash "$REPO/binlog.sh" check --archive "$tmp/archive" --container whatever
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"needs --identity"* ]]
+    rm -rf "$tmp"
+}
+
+@test "check --remote audits an encrypted chain by ciphertext hash - no key exists there" {
+    tmp=$(mktemp -d)
+    mkdir "$tmp/remote"
+    printf 'not really an encrypted mysqldump' > "$tmp/remote/b.sql.age"
+    bsha=$(sha256sum "$tmp/remote/b.sql.age" | cut -d' ' -f1)
+    bbytes=$(stat -c%s "$tmp/remote/b.sql.age")
+    printf '{\n  "schema": 3,\n  "kind": "binlog-base",\n  "database": "app",\n  "artefact": "b.sql.age",\n  "bytes": %s,\n  "sha256": "%s",\n  "engine": "mysql",\n  "server_version": "8.4",\n  "anchor_file": "binlog.000005",\n  "anchor_pos": 100\n}\n' \
+        "$bbytes" "$bsha" > "$tmp/remote/app_20260101T000000Z_binlogbase.json"
+    printf 'opaque log ciphertext' > "$tmp/remote/binlog.000005.age"
+    ssha=$(sha256sum "$tmp/remote/binlog.000005.age" | cut -d' ' -f1)
+    sbytes=$(stat -c%s "$tmp/remote/binlog.000005.age")
+    printf '{\n  "schema": 3,\n  "kind": "binlog-mark",\n  "database": "app",\n  "mark_file": "binlog.000005",\n  "mark_pos": 200,\n  "binlogs_encrypted": "yes",\n  "binlogs": {\n    "binlog.000005.age": "%s:%s"\n  },\n  "tables": {\n  },\n  "objects": {\n  }\n}\n' \
+        "$ssha" "$sbytes" > "$tmp/remote/app_20260101T000000Z_binlogmark.json"
+    run bash "$REPO/binlog.sh" check --remote "$tmp/remote"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"can prove every instant it claims"* ]]
+    # and rot in the ciphertext is still named, keyless
+    printf 'different ciphertext bytes!!' > "$tmp/remote/binlog.000005.age"
+    run bash "$REPO/binlog.sh" check --remote "$tmp/remote"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"binlog.000005.age - the remote's bytes do not hash back"* ]]
+    rm -rf "$tmp"
+}
