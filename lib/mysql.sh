@@ -38,11 +38,17 @@ eng_preflight() {
     docker inspect "$1" >/dev/null 2>&1 || die "container '$1' not found"
 }
 
+# Arguments past the image go to the SERVER: a GTID pair must be verified on
+# a throwaway that speaks GTID (measured: applying a GTID replay to a
+# gtid_mode=OFF server dies with ERROR 1781), so binlog.sh boots the
+# throwaway to match the manifests. Existing three-argument callers are
+# untouched.
 eng_boot() {
     need docker
     local name="$1" db="$2" image="$3"
+    shift 3
     docker run -d --name "$name" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE="$db" \
-        "$image" >/dev/null
+        "$image" "$@" >/dev/null
 }
 
 # Remove the throwaway instance.
