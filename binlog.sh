@@ -25,14 +25,24 @@
 #   * the official mysql image cannot read its own binlogs - mysqlbinlog is
 #     not in it. The exact-version binary from the official client RPM rides
 #     into throwaway containers read-only (the static-age lesson, again).
+#   * the binlog is your rows: a seeded email reads IN CLEAR from the raw
+#     file with one grep (measured - ROW format writes the row itself, and
+#     8.4 neither compresses nor encrypts it by default). So the archive can
+#     be encrypted end to end: mark encrypts each file as it archives it,
+#     and where a PLAIN binlog truncated at an event boundary decodes clean
+#     (the shapeless lie above), truncated ciphertext dies loudly at every
+#     offset (measured) - encryption hands this archive the noisy truncation
+#     it never had.
 #
 # Usage:
 #   ./binlog.sh base   --container NAME --db NAME [--out DIR]
+#                      [--recipient KEY --identity FILE]
 #   ./binlog.sh mark   --container NAME --db NAME --archive DIR [--out DIR]
-#   ./binlog.sh check  --archive DIR [--container NAME]
+#                      [--recipient KEY --identity FILE]
+#   ./binlog.sh check  --archive DIR [--container NAME [--identity FILE]]
 #   ./binlog.sh check  --remote REMOTE [--db NAME]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
-#                      [--image IMAGE]
+#                      [--image IMAGE] [--identity FILE]
 #   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
 #
@@ -71,6 +81,16 @@
 #                     from the official mysql-community-client RPM)
 #   --image IMAGE     image for the throwaway instance (default: mysql:<major>
 #                     from the base manifest)
+#   --recipient KEY   (base, mark) encrypt with age; KEY is an age public key
+#                     or a file of them. Requires --identity: base cannot even
+#                     read its own anchor without it (the anchor lives INSIDE
+#                     the dump), and mark decrypts every ciphertext it archives
+#                     back and holds it against the server's own bytes - the
+#                     key gets proven today, not on the day of the fire.
+#   --identity FILE   age identity. Required by base/mark --recipient, by
+#                     verify when the pair is encrypted, and by
+#                     check --container over an encrypted archive. push and
+#                     pull never take a key: they move opaque ciphertext.
 #   --label TEXT      extra label in the base artefact name
 #   --timeout SECONDS how long mark/verify wait (default 90)
 #   --keep-container  leave the throwaway instance running (for debugging)
@@ -102,6 +122,9 @@ TOOLS_DIR=""
 PROBE=""
 REMOTE=""
 SSH_OPTS_STR=""
+RECIPIENT=""
+IDENTITY=""
+KEYDIR=""
 
 usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -126,6 +149,8 @@ parse_args() {
             --tools)          TOOLS_DIR="${2:-}"; shift 2;;
             --remote)         REMOTE="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
+            --recipient)      RECIPIENT="${2:-}"; shift 2;;
+            --identity)       IDENTITY="${2:-}"; shift 2;;
             --keep-container) KEEP_CONTAINER=1; shift;;
             -h|--help)        usage 0;;
             *)                printf 'unknown option: %s\n' "$1" >&2; usage 1;;
@@ -149,15 +174,39 @@ parse_args() {
         fi
         ARCHIVE_DIR="$(cd "$ARCHIVE_DIR" && pwd)"
     fi
+    if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
+        die "identity file not found: $IDENTITY"
+    fi
     case "$SUBCMD" in
         base|mark)
             [ -n "$CONTAINER" ] || die "$SUBCMD needs --container (where the database lives)"
-            [ -n "$DB" ] || die "$SUBCMD needs --db";;
+            [ -n "$DB" ] || die "$SUBCMD needs --db"
+            if [ -n "$RECIPIENT" ] && [ -z "$IDENTITY" ]; then
+                if [ "$SUBCMD" = base ]; then
+                    die "base --recipient requires --identity: the replay anchor lives INSIDE the dump, so a base that cannot read its own ciphertext cannot even write its manifest - and the key gets proven today, not on the day of the fire"
+                fi
+                die "mark --recipient requires --identity: every ciphertext this mark archives is decrypted back and held against the server's own bytes - an archived ciphertext nothing has ever decrypted is a hope, and the key gets proven today"
+            fi
+            if [ -n "$IDENTITY" ] && [ -z "$RECIPIENT" ]; then
+                die "--identity only makes sense with --recipient here (there is nothing to decrypt)"
+            fi;;
         verify)
             [ -n "$BASE_MANIFEST" ] || die "verify needs --base (the base-dump manifest)"
             [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove)"
             [ -n "$TOOLS_DIR" ] || die "verify needs --tools (a directory holding mysqlbinlog - the official image ships none; see the header)"
-            [ -x "$TOOLS_DIR/mysqlbinlog" ] || die "no executable mysqlbinlog in $TOOLS_DIR";;
+            [ -x "$TOOLS_DIR/mysqlbinlog" ] || die "no executable mysqlbinlog in $TOOLS_DIR"
+            [ -z "$RECIPIENT" ] || die "--recipient is a backup-time option - verify only ever needs --identity";;
+        check)
+            [ -z "$RECIPIENT" ] || die "--recipient is a backup-time option - check only ever needs --identity";;
+        push|pull)
+            # Names and hashes are opaque at the remote on purpose: ciphertext
+            # travels, the key never does. A key offered here is a key waved
+            # around for nothing.
+            if [ -n "$RECIPIENT" ] || [ -n "$IDENTITY" ]; then
+                die "$SUBCMD moves opaque ciphertext - no key is needed, so none is accepted"
+            fi;;
+    esac
+    case "$SUBCMD" in
         push)
             [ -n "$BASE_MANIFEST" ] || die "push needs --base (the base-dump manifest)"
             [ -n "$MARK_MANIFEST" ] || die "push needs --mark (the instant the remote must be able to prove)"
@@ -191,6 +240,40 @@ container_sha256() {
     docker exec "$CONTAINER" sha256sum "/var/lib/mysql/$1" < /dev/null 2>/dev/null | awk '{print $1}'
 }
 
+# The archive decides its own form: every file is NAME (plain) or NAME.age
+# (encrypted by the mark that archived it). Mixed contents mean two
+# differently configured marks have written here, and a replay through a
+# mixed chain is a coin toss - the WAL archive's rule, applied here.
+archive_binlog_suffix() {
+    local plain enc
+    plain=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' \
+        | { grep -cE '^[A-Za-z0-9_-]+\.[0-9]{6,}$' || true; })
+    enc=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' \
+        | { grep -cE '^[A-Za-z0-9_-]+\.[0-9]{6,}\.age$' || true; })
+    if [ "$plain" -gt 0 ] && [ "$enc" -gt 0 ]; then
+        die "the archive holds BOTH plain and .age binlogs - two differently configured marks have written here, and a replay through a mixed chain is a coin toss; refusing"
+    fi
+    if [ "$enc" -gt 0 ]; then printf '%s' "$ENC_SUFFIX"; fi
+}
+
+# The recipient flags as an ARRAY, filled in place: a shell function cannot
+# hand back a list through a string (measured elsewhere in this repo - a
+# missing trailing newline made `read` drop a line and age got a bare -r).
+set_recip_args() {
+    if [ -f "$RECIPIENT" ]; then
+        RECIP_ARGS=(-R "$RECIPIENT")   # a file of recipients
+    else
+        RECIP_ARGS=(-r "$RECIPIENT")   # an inline age1... public key
+    fi
+}
+
+# sha256 of what an archived ciphertext decrypts back to. A failed decrypt
+# hashes as the empty stream - never equal to any real file's hash, so the
+# comparison that follows fails honestly rather than exploding here.
+decrypted_sha256() {
+    { age -d -i "$IDENTITY" "$1" 2>/dev/null || true; } | sha256sum | awk '{print $1}'
+}
+
 # --- base --------------------------------------------------------------------
 
 cmd_base() {
@@ -212,10 +295,31 @@ cmd_base() {
     # position this dump is consistent AT. Without it the dump is the
     # tutorial's dump, and a replay has nowhere honest to start (measured:
     # starting from the beginning re-runs history the dump already contains).
-    docker exec -e MYSQL_PWD=verify "$CONTAINER" mysqldump -uroot \
-        --single-transaction --source-data=2 --routines --events --triggers \
-        --databases "$DB" < /dev/null 2> /dev/null > "$artefact" \
-        || { rm -f -- "$artefact"; die "mysqldump failed - no artefact was left behind"; }
+    if [ -n "$RECIPIENT" ]; then
+        encryption_available || die "--recipient given but 'age' is not installed"
+        artefact="$artefact$ENC_SUFFIX"
+        RECIP_ARGS=()
+        set_recip_args
+        # The family pipe: the plaintext dump NEVER touches the disk -
+        # mysqldump streams straight into age - and PIPESTATUS names which
+        # side broke, because age exits 0 over a failed dump's empty stream
+        # (measured: a valid ~200-byte .age that decrypts to nothing).
+        set +e
+        docker exec -e MYSQL_PWD=verify "$CONTAINER" mysqldump -uroot \
+            --single-transaction --source-data=2 --routines --events --triggers \
+            --databases "$DB" < /dev/null 2> /dev/null | age "${RECIP_ARGS[@]}" > "$artefact"
+        local -a dst=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${dst[0]}" -ne 0 ] || [ "${dst[1]}" -ne 0 ]; then
+            rm -f -- "$artefact"
+            die "encrypted dump failed (mysqldump rc=${dst[0]}, age rc=${dst[1]}) - no artefact was left behind"
+        fi
+    else
+        docker exec -e MYSQL_PWD=verify "$CONTAINER" mysqldump -uroot \
+            --single-transaction --source-data=2 --routines --events --triggers \
+            --databases "$DB" < /dev/null 2> /dev/null > "$artefact" \
+            || { rm -f -- "$artefact"; die "mysqldump failed - no artefact was left behind"; }
+    fi
     trap - ERR
 
     local size floor="${ENG_MIN_ARTEFACT_BYTES:-$MIN_ARTEFACT_BYTES}"
@@ -224,13 +328,35 @@ cmd_base() {
         rm -f -- "$artefact"
         die "base dump is only ${size} bytes (< $floor) - refusing to call that a base"
     fi
-    if ! eng_archive_parses "$CONTAINER" < "$artefact"; then
-        rm -f -- "$artefact"
-        die "the base dump does not parse as a complete mysqldump (no trailing 'Dump completed') - removed"
-    fi
-
     local anchor_line anchor_file anchor_pos
-    anchor_line=$(grep -m1 'CHANGE REPLICATION SOURCE TO' "$artefact" || true)
+    if [ -n "$RECIPIENT" ]; then
+        # Two reads through the identity, and both are the key being proven
+        # TODAY: does the dump parse to its end, and what is its anchor -
+        # which lives INSIDE the ciphertext, so a base --recipient without
+        # the key could not even write its own manifest.
+        set +e
+        age -d -i "$IDENTITY" "$artefact" 2>/dev/null | eng_archive_parses "$CONTAINER"
+        local -a pst=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${pst[0]}" -ne 0 ]; then
+            rm -f -- "$artefact"
+            die "the artefact does not decrypt with the given identity (age rc=${pst[0]}) - removed"
+        fi
+        if [ "${pst[1]}" -ne 0 ]; then
+            rm -f -- "$artefact"
+            die "the decrypted dump does not parse as a complete mysqldump (no trailing 'Dump completed') - removed"
+        fi
+        # awk reads the WHOLE stream: grep -m1 would close the pipe early and
+        # hand age a SIGPIPE that pipefail turns into a silent death.
+        anchor_line=$(age -d -i "$IDENTITY" "$artefact" 2>/dev/null \
+            | awk '/CHANGE REPLICATION SOURCE TO/ && !found { line = $0; found = 1 } END { print line }')
+    else
+        if ! eng_archive_parses "$CONTAINER" < "$artefact"; then
+            rm -f -- "$artefact"
+            die "the base dump does not parse as a complete mysqldump (no trailing 'Dump completed') - removed"
+        fi
+        anchor_line=$(grep -m1 'CHANGE REPLICATION SOURCE TO' "$artefact" || true)
+    fi
     anchor_file=$(printf '%s' "$anchor_line" | grep -o "SOURCE_LOG_FILE='[^']*'" | cut -d"'" -f2)
     anchor_pos=$(printf '%s' "$anchor_line" | grep -o 'SOURCE_LOG_POS=[0-9]*' | cut -d= -f2)
     if [ -z "$anchor_file" ] || [ -z "$anchor_pos" ]; then
@@ -248,13 +374,21 @@ cmd_base() {
         printf '  "bytes": %s,\n' "$size"
         printf '  "sha256": "%s",\n' "$(sha256_of "$artefact")"
         printf '  "engine": "%s",\n' "$ENG_NAME"
+        # Recorded so verify knows it needs an identity, and so a human can
+        # tell WHICH key opens this file. A recipient is a public key: safe here.
+        printf '  "encryption": "%s",\n' "$([ -n "$RECIPIENT" ] && echo age || echo none)"
+        printf '  "recipient": "%s",\n' "$([ -f "$RECIPIENT" ] && basename "$RECIPIENT" || printf '%s' "$RECIPIENT")"
         printf '  "server_version": "%s",\n' "$(printf '%s' "$version" | cut -d. -f1-2)"
         printf '  "anchor_file": "%s",\n' "$anchor_file"
         printf '  "anchor_pos": %s\n' "$anchor_pos"
         printf '}\n'
     } > "$manifest"
 
-    ok "base dump: $artefact ($size bytes, parses, replay starts at $anchor_file:$anchor_pos)"
+    if [ -n "$RECIPIENT" ]; then
+        ok "base dump: $artefact ($size ciphertext bytes; decrypts with the given identity and parses; replay starts at $anchor_file:$anchor_pos)"
+    else
+        ok "base dump: $artefact ($size bytes, parses, replay starts at $anchor_file:$anchor_pos)"
+    fi
     ok "a base alone is one instant - name the instants it must roll forward to:"
     printf '      ./binlog.sh mark --container %s --db %s --archive ARCHIVE_DIR\n' "$CONTAINER" "$DB"
 }
@@ -266,6 +400,24 @@ cmd_mark() {
     eng_preflight "$CONTAINER"
     assert_binlog_on
     mkdir -p "$OUT_DIR"
+
+    # The archive's existing form binds this mark: encrypting into a plain
+    # archive, or archiving plain into an encrypted one, would leave behind
+    # the mixed chain no replay can be trusted through.
+    local sfx
+    sfx=$(archive_binlog_suffix)   # dies loudly on a MIXED archive
+    if [ -n "$RECIPIENT" ]; then
+        encryption_available || die "--recipient given but 'age' is not installed"
+        if [ -z "$sfx" ] && find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' \
+                | grep -qE '^[A-Za-z0-9_-]+\.[0-9]{6,}$'; then
+            die "this archive already holds PLAIN binlogs and the mark was told to encrypt - a mixed archive is a coin toss; refusing"
+        fi
+        sfx="$ENC_SUFFIX"
+        RECIP_ARGS=()
+        set_recip_args
+    elif [ -n "$sfx" ]; then
+        die "this archive is encrypted ($ENC_SUFFIX) and the mark was given no --recipient - a mixed archive is a coin toss; refusing"
+    fi
 
     local stamp manifest
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -328,37 +480,80 @@ EOF
     # off-site lesson replayed locally. Files already archived must STILL
     # hash true: binlogs are immutable once closed, so a mismatch is rot,
     # here or there, and naming it beats propagating it.
-    local name src_sha dst_sha archived=0 already=0
+    #
+    # With --recipient the copy leaves the server ALREADY encrypted: docker
+    # exec streams the closed file straight into age, so the plaintext never
+    # touches the host's disk - and the round trip is the copy check AND the
+    # key being proven today: what was just encrypted must decrypt back to
+    # exactly the bytes the server holds. The inventory then hashes the
+    # CIPHERTEXT as archived: age is non-deterministic (measured: the same
+    # binlog encrypted twice gives different bytes, same size), so
+    # re-encrypting can never reproduce an archived file - the archived file
+    # IS the identity, and only the inventory can vouch for it.
+    local name aname src_sha dst_sha inv_sha archived=0 already=0
     local inv_block="" first_inv=1
     while IFS=$'\t' read -r name _; do
         [ -n "$name" ] || continue
         [ "$(binlog_index_of "$name")" -le "$(binlog_index_of "$mark_file")" ] || continue
         src_sha=$(container_sha256 "$name")
         [ -n "$src_sha" ] || die "could not hash $name inside the container"
-        if [ -e "$ARCHIVE_DIR/$name" ]; then
-            dst_sha=$(sha256_of "$ARCHIVE_DIR/$name")
-            [ "$dst_sha" = "$src_sha" ] \
-                || die "$name is already archived with DIFFERENT bytes (archive $dst_sha, server $src_sha) - a closed binlog is immutable, so one of the two has rotted; refusing to write a mark over it"
+        aname="$name$sfx"
+        if [ -e "$ARCHIVE_DIR/$aname" ]; then
+            if [ -n "$RECIPIENT" ]; then
+                dst_sha=$(decrypted_sha256 "$ARCHIVE_DIR/$aname")
+                [ "$dst_sha" = "$src_sha" ] \
+                    || die "$aname is already archived but does not decrypt back to the server's bytes (decrypted $dst_sha, server $src_sha) - a closed binlog is immutable, so one of the two has rotted (or this is another key's ciphertext); refusing to write a mark over it"
+            else
+                dst_sha=$(sha256_of "$ARCHIVE_DIR/$aname")
+                [ "$dst_sha" = "$src_sha" ] \
+                    || die "$name is already archived with DIFFERENT bytes (archive $dst_sha, server $src_sha) - a closed binlog is immutable, so one of the two has rotted; refusing to write a mark over it"
+            fi
             already=$((already + 1))
         else
-            docker cp "$CONTAINER:/var/lib/mysql/$name" "$ARCHIVE_DIR/.$name.copying" > /dev/null 2>&1 \
-                || die "could not copy $name out of the container"
-            dst_sha=$(sha256_of "$ARCHIVE_DIR/.$name.copying")
-            if [ "$dst_sha" != "$src_sha" ]; then
-                rm -f "$ARCHIVE_DIR/.$name.copying"
-                die "$name did not survive the copy (server $src_sha, copy $dst_sha) - the partial was removed"
+            if [ -n "$RECIPIENT" ]; then
+                set +e
+                docker exec "$CONTAINER" cat "/var/lib/mysql/$name" < /dev/null 2>/dev/null \
+                    | age "${RECIP_ARGS[@]}" > "$ARCHIVE_DIR/.$aname.copying"
+                local -a cst=("${PIPESTATUS[@]}")
+                set -e
+                if [ "${cst[0]}" -ne 0 ] || [ "${cst[1]}" -ne 0 ]; then
+                    rm -f "$ARCHIVE_DIR/.$aname.copying"
+                    die "could not stream $name out of the container encrypted (cat rc=${cst[0]}, age rc=${cst[1]}) - the partial was removed"
+                fi
+                dst_sha=$(decrypted_sha256 "$ARCHIVE_DIR/.$aname.copying")
+                if [ "$dst_sha" != "$src_sha" ]; then
+                    rm -f "$ARCHIVE_DIR/.$aname.copying"
+                    die "$name did not survive the encrypt-archive round trip (server $src_sha, decrypted copy $dst_sha) - the partial was removed"
+                fi
+            else
+                docker cp "$CONTAINER:/var/lib/mysql/$name" "$ARCHIVE_DIR/.$aname.copying" > /dev/null 2>&1 \
+                    || die "could not copy $name out of the container"
+                dst_sha=$(sha256_of "$ARCHIVE_DIR/.$aname.copying")
+                if [ "$dst_sha" != "$src_sha" ]; then
+                    rm -f "$ARCHIVE_DIR/.$aname.copying"
+                    die "$name did not survive the copy (server $src_sha, copy $dst_sha) - the partial was removed"
+                fi
             fi
-            mv "$ARCHIVE_DIR/.$name.copying" "$ARCHIVE_DIR/$name"
-            chmod 644 "$ARCHIVE_DIR/$name"
+            mv "$ARCHIVE_DIR/.$aname.copying" "$ARCHIVE_DIR/$aname"
+            chmod 644 "$ARCHIVE_DIR/$aname"
             archived=$((archived + 1))
+        fi
+        if [ -n "$RECIPIENT" ]; then
+            inv_sha=$(sha256_of "$ARCHIVE_DIR/$aname")
+        else
+            inv_sha="$src_sha"
         fi
         [ "$first_inv" -eq 1 ] || inv_block+=$',\n'
         first_inv=0
-        inv_block+=$(printf '    "%s": "%s:%s"' "$name" "$src_sha" "$(stat -c%s "$ARCHIVE_DIR/$name")")
+        inv_block+=$(printf '    "%s": "%s:%s"' "$aname" "$inv_sha" "$(stat -c%s "$ARCHIVE_DIR/$aname")")
     done < <(eng_query "$CONTAINER" mysql 'SHOW BINARY LOGS;' | awk -F'\t' '{print $1 "\t" $2}')
-    printf '%s' "$inv_block" | grep -qF "\"$mark_file\":" \
+    printf '%s' "$inv_block" | grep -qF "\"$mark_file$sfx\":" \
         || die "the mark's own file $mark_file was never archived - refusing to write a mark that cannot be replayed to"
-    ok "archived $archived file(s), $already already archived and hashing true"
+    if [ -n "$RECIPIENT" ]; then
+        ok "archived $archived file(s) as age ciphertext (round trip proven against the server's bytes), $already already archived and decrypting true"
+    else
+        ok "archived $archived file(s), $already already archived and hashing true"
+    fi
 
     {
         printf '{\n'
@@ -370,6 +565,10 @@ EOF
         printf '  "mark_file": "%s",\n' "$mark_file"
         printf '  "mark_pos": %s,\n' "$mark_pos"
         printf '  "quiesced": "%s",\n' "$quiesced"
+        # Recorded so verify, push, pull and check all learn the archive's
+        # form from the manifest, never by sniffing directories.
+        printf '  "binlogs_encrypted": "%s",\n' "$([ -n "$RECIPIENT" ] && echo yes || echo no)"
+        printf '  "recipient": "%s",\n' "$([ -f "$RECIPIENT" ] && basename "$RECIPIENT" || printf '%s' "$RECIPIENT")"
         printf '  "binlogs": {\n%s\n  },\n' "$inv_block"
         printf '  "tables": {\n%s\n  },\n' "$tables_block"
         printf '  "objects": {\n%s\n  }\n' "$objects_block"
@@ -388,19 +587,27 @@ cmd_check() {
         cmd_check_remote
         return
     fi
+    # The archive names its own form; a mixed one is refused before anything
+    # else is judged. When encrypted, all arithmetic runs on the STRIPPED
+    # name - the counter does not care what wrapping the bytes wear.
+    local sfx
+    sfx=$(archive_binlog_suffix)   # dies loudly on a MIXED archive
+
     local problems=0 name prefix=""
     local -a files=() strays=()
     while IFS= read -r name; do
         [ -n "$name" ] || continue
-        if [[ "$name" =~ ^[A-Za-z0-9_-]+\.[0-9]{6,}$ ]]; then
-            files+=("$name")
-            if [ -z "$prefix" ]; then
-                prefix=$(binlog_prefix_of "$name")
-            elif [ "$prefix" != "$(binlog_prefix_of "$name")" ]; then
-                die "the archive holds binlogs with TWO prefixes ('$prefix' and '$(binlog_prefix_of "$name")') - two servers have written here, and a replay across them is fiction; refusing"
-            fi
-        else
+        if [ -n "$sfx" ] && [[ "$name" =~ ^[A-Za-z0-9_-]+\.[0-9]{6,}\.age$ ]]; then
+            name="${name%"$sfx"}"
+        elif [ -n "$sfx" ] || ! [[ "$name" =~ ^[A-Za-z0-9_-]+\.[0-9]{6,}$ ]]; then
             strays+=("$name")
+            continue
+        fi
+        files+=("$name")
+        if [ -z "$prefix" ]; then
+            prefix=$(binlog_prefix_of "$name")
+        elif [ "$prefix" != "$(binlog_prefix_of "$name")" ]; then
+            die "the archive holds binlogs with TWO prefixes ('$prefix' and '$(binlog_prefix_of "$name")') - two servers have written here, and a replay across them is fiction; refusing"
         fi
     done < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
 
@@ -421,9 +628,9 @@ cmd_check() {
     i1=$(binlog_index_of "${files[${#files[@]}-1]}")
     for ((i = i0; i <= i1; i++)); do
         name=$(binlog_name "$prefix" "$i")
-        if [ ! -e "$ARCHIVE_DIR/$name" ]; then
+        if [ ! -e "$ARCHIVE_DIR/$name$sfx" ]; then
             printf '  %sFAIL%s missing %s - the chain is broken here, and a replay would STITCH OVER the hole silently (measured)\n' \
-                "$c_red" "$c_reset" "$name"
+                "$c_red" "$c_reset" "$name$sfx"
             problems=$((problems + 1))
         fi
     done
@@ -433,6 +640,13 @@ cmd_check() {
     # archive does NOT have yet are named, because MySQL will not archive
     # them for you (there is no archive_command; the next mark does it).
     if [ -n "$CONTAINER" ]; then
+        if [ -n "$sfx" ]; then
+            # Ciphertext cannot be held against the server's bytes by eye:
+            # the comparison runs through the key, or it does not run.
+            [ -n "$IDENTITY" ] \
+                || die "this archive is encrypted - comparing it against the server needs --identity; without the key this check would be a guess, and this tool does not guess"
+            encryption_available || die "the archive is encrypted but 'age' is not installed"
+        fi
         eng_preflight "$CONTAINER"
         assert_binlog_on
         local current_file src_sha dst_sha unarchived=0
@@ -440,12 +654,16 @@ cmd_check() {
         while IFS=$'\t' read -r name _; do
             [ -n "$name" ] || continue
             [ "$name" != "$current_file" ] || continue   # the active file is still growing
-            if [ -e "$ARCHIVE_DIR/$name" ]; then
+            if [ -e "$ARCHIVE_DIR/$name$sfx" ]; then
                 src_sha=$(container_sha256 "$name")
-                dst_sha=$(sha256_of "$ARCHIVE_DIR/$name")
+                if [ -n "$sfx" ]; then
+                    dst_sha=$(decrypted_sha256 "$ARCHIVE_DIR/$name$sfx")
+                else
+                    dst_sha=$(sha256_of "$ARCHIVE_DIR/$name")
+                fi
                 if [ "$src_sha" != "$dst_sha" ]; then
-                    printf '  %sFAIL%s %s - the archived copy does not match the server'\''s bytes (one of the two has rotted)\n' \
-                        "$c_red" "$c_reset" "$name"
+                    printf '  %sFAIL%s %s - the archived copy does not %s the server'\''s bytes (one of the two has rotted)\n' \
+                        "$c_red" "$c_reset" "$name$sfx" "$([ -n "$sfx" ] && echo 'decrypt back to' || echo 'match')"
                     problems=$((problems + 1))
                 fi
             else
@@ -460,7 +678,7 @@ cmd_check() {
     if [ "$problems" -gt 0 ]; then
         die "ARCHIVE CHECK FAILED: $problems problem(s). A replay through this archive would stitch over holes or apply rot - this is the cheap day to find out."
     fi
-    ok "archive is continuous: ${#files[@]} binlog(s), $prefix.$(printf '%06d' "$i0") .. $prefix.$(printf '%06d' "$i1")"
+    ok "archive is continuous: ${#files[@]} binlog(s)${sfx:+ (age ciphertext)}, $prefix.$(printf '%06d' "$i0") .. $prefix.$(printf '%06d' "$i1")"
     log 'continuous is not recoverable - prove an instant with: ./binlog.sh verify'
 }
 
@@ -521,11 +739,15 @@ cmd_push() {
 
     # The chain the pair replays, proven LOCALLY first: present, vouched for
     # by the inventory, and hashing true - rot replicates as happily as data.
+    # An encrypted chain ships as-is: the inventory hashes are OF the
+    # ciphertext, so nothing here needs a key - and none is accepted.
+    local sfx=""
+    [ "$(json_str "$MARK_MANIFEST" binlogs_encrypted)" != "yes" ] || sfx="$ENC_SUFFIX"
     local idx name prefix
     prefix=$(binlog_prefix_of "$anchor_file")
     local -a to_ship=()
     for ((idx = a_idx; idx <= m_idx; idx++)); do
-        name=$(binlog_name "$prefix" "$idx")
+        name="$(binlog_name "$prefix" "$idx")$sfx"
         to_ship+=("$name")
         [ -e "$ARCHIVE_DIR/$name" ] \
             || die "the chain needs $name and the local archive does not hold it - pushing would replicate the hole off-site (a replay stitches over holes with rc 0 - measured)"
@@ -562,7 +784,7 @@ cmd_push() {
     # Manifests last, mark VERY last: the receipt.
     upload_checked "$BASE_MANIFEST" "$(basename "$BASE_MANIFEST")" "$(sha256_of "$BASE_MANIFEST")"
     upload_checked "$MARK_MANIFEST" "$(basename "$MARK_MANIFEST")" "$(sha256_of "$MARK_MANIFEST")"
-    ok "PUSHED: $pushed file(s) shipped, $skipped already proven at the remote - it can now prove $mark_file:$mark_pos"
+    ok "PUSHED: $pushed file(s) shipped, $skipped already proven at the remote - it can now prove $mark_file:$mark_pos${sfx:+ (ciphertext end to end; the key never travelled)}"
 }
 
 # --- pull ----------------------------------------------------------------------
@@ -649,13 +871,15 @@ cmd_pull() {
     for line in "${inv_lines[@]}"; do
         inv["${line%%$'\t'*}"]="${line##*$'\t'}"
     done
+    local sfx=""
+    [ "$(json_str "$mark_local" binlogs_encrypted)" != "yes" ] || sfx="$ENC_SUFFIX"
     local idx name isha fetched=0 already=0 tmpf prefix
     prefix=$(binlog_prefix_of "$mark_file")
     local a_idx m_idx
     a_idx=$(binlog_index_of "$(json_str "$base_local" anchor_file)")
     m_idx=$(binlog_index_of "$mark_file")
     for ((idx = a_idx; idx <= m_idx; idx++)); do
-        name=$(binlog_name "$prefix" "$idx")
+        name="$(binlog_name "$prefix" "$idx")$sfx"
         isha="${inv[$name]:-}"
         [ -n "$isha" ] \
             || die "the pair needs $name and the mark's inventory never stood on it - pull refuses to guess"
@@ -681,7 +905,10 @@ cmd_pull() {
     done
     ok "PULLED: chain of $((m_idx - a_idx + 1)) file(s) ($fetched fetched, $already already here and hashing true)"
     ok "Prove the instant:"
-    printf '      ./binlog.sh verify --base %s --mark %s --archive %s --tools TOOLS_DIR\n' "$base_local" "$mark_local" "$ARCHIVE_DIR"
+    local id_hint=""
+    case "$(json_str "$base_local" artefact)" in *"$ENC_SUFFIX") id_hint=" --identity KEYFILE";; esac
+    [ -z "$sfx" ] || id_hint=" --identity KEYFILE"
+    printf '      ./binlog.sh verify --base %s --mark %s --archive %s --tools TOOLS_DIR%s\n' "$base_local" "$mark_local" "$ARCHIVE_DIR" "$id_hint"
 }
 
 # --- check --remote --------------------------------------------------------------
@@ -768,11 +995,16 @@ cmd_check_remote() {
             fi
         done < <(printf '%s\n' "$listing" | { grep -E "^${mark_db}_[0-9]{8}T[0-9]{6}Z(_.*)?_binlogbase\.json$" || true; } | LC_ALL=C sort -r)
 
+        # The mark says what form its chain wears; the audit asks for those
+        # exact names. The hashes are of the ciphertext when encrypted, so
+        # the remote proves an encrypted chain without any key existing here.
+        local rsfx=""
+        [ "$(json_str "$tmp/$mark" binlogs_encrypted)" != "yes" ] || rsfx="$ENC_SUFFIX"
         local -a audit=()
         local idx
         if [ "$base_ok" -eq 1 ]; then
             for ((idx = $(binlog_index_of "$bfile"); idx <= $(binlog_index_of "$mark_file"); idx++)); do
-                audit+=("$(binlog_name "$(binlog_prefix_of "$mark_file")" "$idx")")
+                audit+=("$(binlog_name "$(binlog_prefix_of "$mark_file")" "$idx")$rsfx")
             done
         else
             printf '  %sFAIL%s %s - no intact base dump at the remote can reach this mark, so its chain has nothing to replay from\n' "$c_red" "$c_reset" "$mark"
@@ -814,6 +1046,10 @@ cleanup() {
     elif [ -n "$PROBE" ]; then
         warn "throwaway instance left in place: $PROBE"
     fi
+    # The identity copy the throwaway read - world-readable, so first to go.
+    if [ -n "$KEYDIR" ] && [ -d "$KEYDIR" ]; then
+        rm -rf -- "$KEYDIR" 2>/dev/null || warn "could not remove the identity copy in $KEYDIR"
+    fi
 }
 
 cmd_verify() {
@@ -847,6 +1083,17 @@ cmd_verify() {
         IMAGE="mysql:$(json_str "$BASE_MANIFEST" server_version)"
     fi
 
+    # The manifests, not the directory, say what is encrypted - and without
+    # the key there is no verification, and no green tick of consolation.
+    local base_enc=0 chain_sfx=""
+    case "$(json_str "$BASE_MANIFEST" artefact)" in *"$ENC_SUFFIX") base_enc=1;; esac
+    [ "$(json_str "$MARK_MANIFEST" binlogs_encrypted)" != "yes" ] || chain_sfx="$ENC_SUFFIX"
+    if [ "$base_enc" -eq 1 ] || [ -n "$chain_sfx" ]; then
+        [ -n "$IDENTITY" ] \
+            || die "this backup is encrypted (base: $([ "$base_enc" -eq 1 ] && echo yes || echo no), binlog archive: $([ -n "$chain_sfx" ] && echo yes || echo no)) - verification without --identity would be a guess, and this tool does not guess"
+        encryption_available || die "the pair is encrypted but 'age' is not installed"
+    fi
+
     log "verifying that base + archived binlogs reproduce $mark_file:$mark_pos ($db)"
 
     # --- Gate 1: the base dump is byte-identical to what was taken -----------
@@ -877,25 +1124,26 @@ cmd_verify() {
     for line in "${inv_lines[@]}"; do
         inv["${line%%$'\t'*}"]="${line##*$'\t'}"
     done
-    local idx name fsha problems=0 prefix
+    local idx name aname fsha problems=0 prefix
     prefix=$(binlog_prefix_of "$anchor_file")
     local -a replay_files=()
     for ((idx = a_idx; idx <= m_idx; idx++)); do
         name=$(binlog_name "$prefix" "$idx")
+        aname="$name$chain_sfx"
         replay_files+=("$name")
-        if [ ! -e "$ARCHIVE_DIR/$name" ]; then
-            printf '  %sFAIL%s missing %s - a replay would stitch over this hole with rc 0 (measured)\n' "$c_red" "$c_reset" "$name"
+        if [ ! -e "$ARCHIVE_DIR/$aname" ]; then
+            printf '  %sFAIL%s missing %s - a replay would stitch over this hole with rc 0 (measured)\n' "$c_red" "$c_reset" "$aname"
             problems=$((problems + 1))
             continue
         fi
-        if [ -z "${inv[$name]:-}" ]; then
-            printf '  %sFAIL%s %s - in the archive, but the mark'\''s inventory never stood on it\n' "$c_red" "$c_reset" "$name"
+        if [ -z "${inv[$aname]:-}" ]; then
+            printf '  %sFAIL%s %s - in the archive, but the mark'\''s inventory never stood on it\n' "$c_red" "$c_reset" "$aname"
             problems=$((problems + 1))
             continue
         fi
-        fsha=$(sha256_of "$ARCHIVE_DIR/$name")
-        if [ "$fsha" != "${inv[$name]%%:*}" ]; then
-            printf '  %sFAIL%s %s - these are not the bytes the mark stood on (rot or a partial copy; mysqlbinlog would replay them anyway - measured)\n' "$c_red" "$c_reset" "$name"
+        fsha=$(sha256_of "$ARCHIVE_DIR/$aname")
+        if [ "$fsha" != "${inv[$aname]%%:*}" ]; then
+            printf '  %sFAIL%s %s - these are not the bytes the mark stood on (rot or a partial copy; mysqlbinlog would replay them anyway - measured)\n' "$c_red" "$c_reset" "$aname"
             problems=$((problems + 1))
         fi
     done
@@ -917,6 +1165,17 @@ cmd_verify() {
     [ "$tool_ver" = "$want_ver" ] \
         || die "mysqlbinlog is $tool_ver but the base was taken from a $want_ver server - a version-skewed replay is a guess, and this tool does not guess"
 
+    if [ -n "$chain_sfx" ]; then
+        # The chain decrypts INSIDE the replay container, so its plaintext
+        # only ever exists in a filesystem that dies with the drill - which
+        # means the host's age binary rides in, and the static-age lesson
+        # applies: prove it runs there BEFORE anything boots (a dynamically
+        # linked age was measured failing inside a container in seconds).
+        docker run --rm -v "$(command -v age):/usr/local/bin/age:ro" \
+                --entrypoint /usr/local/bin/age "$IMAGE" --version >/dev/null 2>&1 \
+            || die "the age at $(command -v age) does not run inside $IMAGE (dynamically linked?) - decrypting the chain in the throwaway needs a static age build"
+    fi
+
     PROBE="bv-binlog-$$"
     trap cleanup EXIT
     log "booting a throwaway $IMAGE as '$PROBE'"
@@ -926,32 +1185,93 @@ cmd_verify() {
         || die "the throwaway instance is not empty - refusing an ambiguous restore (measured on the dump side)"
 
     log "loading the base dump"
-    docker exec -e MYSQL_PWD=verify -i "$PROBE" mysql -uroot < "$artefact" > /dev/null 2>&1 \
-        || die "the base dump did not load cleanly - the replay has nothing sane to stand on"
+    if [ "$base_enc" -eq 1 ]; then
+        # Decrypt-and-load in one pipe: the plaintext dump exists only inside
+        # it, and PIPESTATUS tells a wrong key apart from a dump that will
+        # not load.
+        set +e
+        age -d -i "$IDENTITY" "$artefact" 2>/dev/null \
+            | docker exec -e MYSQL_PWD=verify -i "$PROBE" mysql -uroot > /dev/null 2>&1
+        local -a lst=("${PIPESTATUS[@]}")
+        set -e
+        [ "${lst[0]}" -eq 0 ] \
+            || die "the base artefact does not decrypt with the given identity (age rc=${lst[0]}) - wrong key, or ciphertext damage the sha256 gate somehow missed"
+        [ "${lst[1]}" -eq 0 ] \
+            || die "the base dump did not load cleanly - the replay has nothing sane to stand on"
+    else
+        docker exec -e MYSQL_PWD=verify -i "$PROBE" mysql -uroot < "$artefact" > /dev/null 2>&1 \
+            || die "the base dump did not load cleanly - the replay has nothing sane to stand on"
+    fi
 
     # --verify-binlog-checksum is NOT optional: without it a corrupted event
     # sails into the replay with rc 0 (measured). The inventory above already
     # proved these bytes, so a failure here is mysqlbinlog disagreeing with
     # the mark - worth dying on either way.
     log "replaying ${#replay_files[@]} file(s) to $mark_file:$mark_pos (checksums verified)"
-    local replay_sql
-    replay_sql=$(mktemp)
-    if ! docker run --rm -v "$ARCHIVE_DIR:/archive:ro" \
+    if [ -n "$chain_sfx" ]; then
+        # The replay container decrypts for itself: chain plaintext lands
+        # only in ITS filesystem and dies with the docker run, and the
+        # decoded history - which is your rows - streams straight into the
+        # probe without ever touching the host disk. PIPESTATUS separates
+        # the decode side from the apply side, and rc 42 inside the decode
+        # side means a file did not decrypt (gate 3 already proved these are
+        # the mark's exact bytes, so that is the key disagreeing, not rot).
+        KEYDIR=$(mktemp -d)
+        cp "$IDENTITY" "$KEYDIR/identity"
+        chmod 755 "$KEYDIR"; chmod 644 "$KEYDIR/identity"
+        local dec_err apply_err
+        dec_err=$(mktemp)
+        apply_err=$(mktemp)
+        set +e
+        docker run --rm -v "$ARCHIVE_DIR:/archive:ro" \
             -v "$TOOLS_DIR/mysqlbinlog:/usr/bin/mysqlbinlog:ro" \
+            -v "$(command -v age):/usr/local/bin/age:ro" \
+            -v "$KEYDIR:/run/bvkey:ro" \
             --entrypoint sh "$IMAGE" \
-            -c "cd /archive && mysqlbinlog --verify-binlog-checksum --start-position=$anchor_pos --stop-position=$mark_pos $(printf '%s ' "${replay_files[@]}")" \
-            > "$replay_sql" 2> "$replay_sql.err"; then
-        sed 's/^/      /' "$replay_sql.err" | head -5
-        rm -f "$replay_sql" "$replay_sql.err"
-        die "mysqlbinlog refused the chain - the history cannot even be decoded"
-    fi
-    rm -f "$replay_sql.err"
-    if ! docker exec -e MYSQL_PWD=verify -i "$PROBE" mysql -uroot "$db" < "$replay_sql" > /dev/null 2> "$replay_sql.apply-err"; then
-        sed 's/^/      /' "$replay_sql.apply-err" | head -5
+            -c "mkdir /dec || exit 1
+                for f in $(printf '%s ' "${replay_files[@]}"); do
+                    /usr/local/bin/age -d -i /run/bvkey/identity -o /dec/\$f /archive/\$f$chain_sfx || exit 42
+                done
+                cd /dec && mysqlbinlog --verify-binlog-checksum --start-position=$anchor_pos --stop-position=$mark_pos $(printf '%s ' "${replay_files[@]}")" \
+            2> "$dec_err" \
+            | docker exec -e MYSQL_PWD=verify -i "$PROBE" mysql -uroot "$db" > /dev/null 2> "$apply_err"
+        local -a rst=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${rst[0]}" -eq 42 ]; then
+            sed 's/^/      /' "$dec_err" | head -5
+            rm -f "$dec_err" "$apply_err"
+            die "a chain file did not decrypt inside the throwaway - the bytes are the mark's own (gate 3), so this is the wrong identity"
+        elif [ "${rst[0]}" -ne 0 ]; then
+            sed 's/^/      /' "$dec_err" | head -5
+            rm -f "$dec_err" "$apply_err"
+            die "mysqlbinlog refused the chain - the history cannot even be decoded"
+        fi
+        if [ "${rst[1]}" -ne 0 ]; then
+            sed 's/^/      /' "$apply_err" | head -5
+            rm -f "$dec_err" "$apply_err"
+            die "the replay did not apply cleanly - an ambiguous half-replayed instance is not a recovery"
+        fi
+        rm -f "$dec_err" "$apply_err"
+    else
+        local replay_sql
+        replay_sql=$(mktemp)
+        if ! docker run --rm -v "$ARCHIVE_DIR:/archive:ro" \
+                -v "$TOOLS_DIR/mysqlbinlog:/usr/bin/mysqlbinlog:ro" \
+                --entrypoint sh "$IMAGE" \
+                -c "cd /archive && mysqlbinlog --verify-binlog-checksum --start-position=$anchor_pos --stop-position=$mark_pos $(printf '%s ' "${replay_files[@]}")" \
+                > "$replay_sql" 2> "$replay_sql.err"; then
+            sed 's/^/      /' "$replay_sql.err" | head -5
+            rm -f "$replay_sql" "$replay_sql.err"
+            die "mysqlbinlog refused the chain - the history cannot even be decoded"
+        fi
+        rm -f "$replay_sql.err"
+        if ! docker exec -e MYSQL_PWD=verify -i "$PROBE" mysql -uroot "$db" < "$replay_sql" > /dev/null 2> "$replay_sql.apply-err"; then
+            sed 's/^/      /' "$replay_sql.apply-err" | head -5
+            rm -f "$replay_sql" "$replay_sql.apply-err"
+            die "the replay did not apply cleanly - an ambiguous half-replayed instance is not a recovery"
+        fi
         rm -f "$replay_sql" "$replay_sql.apply-err"
-        die "the replay did not apply cleanly - an ambiguous half-replayed instance is not a recovery"
     fi
-    rm -f "$replay_sql" "$replay_sql.apply-err"
 
     # --- Gate 5: ARRIVAL, proven by content -----------------------------------
     # The measured inversion this script exists for: a --stop-position past
@@ -982,7 +1302,7 @@ cmd_verify() {
         die "BINLOG VERIFICATION FAILED: $write_problems write problem(s) - the instant came back and the next INSERT collides."
     fi
 
-    ok "BINLOG PITR VERIFIED: base dump + archived binlogs reproduce $mark_file:$mark_pos exactly ($checked table(s), byte-for-byte)."
+    ok "BINLOG PITR VERIFIED: base dump + archived binlogs reproduce $mark_file:$mark_pos exactly ($checked table(s), byte-for-byte)${chain_sfx:+ - the chain decrypted only inside the throwaway}."
 }
 
 main() {
