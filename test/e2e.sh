@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --engine)    ENGINE="${2:-}"; shift 2;;
         --encrypted) ENCRYPTED=1; shift;;
-        *)           die "unknown option: $1 (usage: e2e.sh [--engine postgres|mysql|files] [--encrypted])";;
+        *)           die "unknown option: $1 (usage: e2e.sh [--engine postgres|mysql|files|sqlite] [--encrypted])";;
     esac
 done
 load_engine "$ENGINE"
@@ -33,9 +33,12 @@ SRC_DIR=""
 OUT=$(mktemp -d)
 IMAGE="${BV_IMAGE:-$ENG_DEFAULT_IMAGE}"
 
+SRC_DB=""
 cleanup() {
     if [ "$ENG_NAME" = files ]; then
         if [ -n "$SRC_DIR" ]; then rm -rf "$SRC_DIR"; fi
+    elif [ "$ENG_NAME" = sqlite ]; then
+        [ -n "$SRC_DB" ] && rm -f "$SRC_DB" "$SRC_DB-wal" "$SRC_DB-shm"
     else
         docker rm -f "$SRC" >/dev/null 2>&1 || true
     fi
@@ -50,6 +53,11 @@ if [ "$ENG_NAME" = files ]; then
     log "seeding a deterministic file tree ($SRC_DIR)"
     seed_files "$SRC_DIR"
     ok "seeded: $(find "$SRC_DIR" -type f | wc -l) files, $(find "$SRC_DIR" -type l | wc -l) symlink, $(find "$SRC_DIR" -mindepth 1 -type d | wc -l) dirs (one empty, one setgid)"
+elif [ "$ENG_NAME" = sqlite ]; then
+    SRC_DB="$OUT/source.db"
+    log "seeding a deterministic SQLite database ($SRC_DB)"
+    seed_sqlite "$SRC_DB"
+    ok "seeded: $(eng_query "$SRC_DB" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC_DB" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
 else
     log "booting the source database ($ENG_NAME, $IMAGE)"
     docker rm -f "$SRC" >/dev/null 2>&1 || true
@@ -65,6 +73,8 @@ fi
 # promise does not.
 if [ "$ENG_NAME" = files ]; then
     SRC_ARGS=(--path "$SRC_DIR")
+elif [ "$ENG_NAME" = sqlite ]; then
+    SRC_ARGS=(--path "$SRC_DB" --db app)
 else
     SRC_ARGS=(--container "$SRC" --db app)
 fi
@@ -91,6 +101,10 @@ if [ "$ENG_NAME" = files ]; then
     log "DESTROYING the source tree (this is the whole point)"
     rm -rf "$SRC_DIR"
     SRC_DIR=""
+elif [ "$ENG_NAME" = sqlite ]; then
+    log "DESTROYING the source database file (this is the whole point)"
+    rm -f "$SRC_DB" "$SRC_DB-wal" "$SRC_DB-shm"
+    SRC_DB=""
 else
     log "DESTROYING the source database (this is the whole point)"
     docker rm -f "$SRC" >/dev/null

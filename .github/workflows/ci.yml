@@ -82,9 +82,15 @@ jobs:
           # No image at all: the files engine restores into a scratch
           # directory. Same destruction test, no Docker involved.
           - { engine: files, image: 'scratch-dir' }
+          # A single-file database: same destruction test, no Docker, the
+          # instance is a scratch .db file.
+          - { engine: sqlite, image: 'scratch-db' }
         mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5
+      - name: Install sqlite3
+        if: matrix.target.engine == 'sqlite'
+        run: sudo apt-get update -qq && sudo apt-get install -y sqlite3 >/dev/null
       - name: Install age
         if: matrix.mode == '--encrypted'
         run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
@@ -100,12 +106,16 @@ jobs:
       fail-fast: false
       # Every engine, because each contributes its own measured disaster to
       # case 6: pg_dump -t on Postgres, mysqldump's routine-dropping DEFAULT
-      # invocation on MySQL, and the dotfile-dropping `tar czf backup.tgz *`
-      # on files.
+      # invocation on MySQL, the dotfile-dropping `tar czf backup.tgz *` on
+      # files, and a table-scoped `.dump customers orders` on sqlite (which
+      # drops the index, both views and the trigger while keeping every row).
       matrix:
-        engine: [postgres, mysql, files]
+        engine: [postgres, mysql, files, sqlite]
     steps:
       - uses: actions/checkout@v5
+      - name: Install sqlite3
+        if: matrix.engine == 'sqlite'
+        run: sudo apt-get update -qq && sudo apt-get install -y sqlite3 >/dev/null
       # Not optional: the encryption cases FAIL the suite if age is missing,
       # rather than skipping quietly and reporting green.
       - name: Install age

@@ -34,7 +34,7 @@ ENGINE="postgres"
 while [ $# -gt 0 ]; do
     case "$1" in
         --engine) ENGINE="${2:-}"; shift 2;;
-        *)        die "unknown option: $1 (usage: negative.sh [--engine postgres|mysql|files])";;
+        *)        die "unknown option: $1 (usage: negative.sh [--engine postgres|mysql|files|sqlite])";;
     esac
 done
 load_engine "$ENGINE"
@@ -49,10 +49,14 @@ FAILURES=0
 pass_case() { printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$1"; }
 fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAILURES + 1)); }
 
+SRC_DB=""
 cleanup() {
     if [ "$ENG_NAME" = files ]; then
         if [ -n "$SRC_DIR" ]; then rm -rf "$SRC_DIR"; fi
         rm -rf "${TMPDIR:-/tmp}"/bv-files-bv-verify-* 2>/dev/null || true
+    elif [ "$ENG_NAME" = sqlite ]; then
+        [ -n "$SRC_DB" ] && rm -f "$SRC_DB" "$SRC_DB-wal" "$SRC_DB-shm"
+        rm -f "${TMPDIR:-/tmp}"/bv-sqlite-bv-verify-*.db 2>/dev/null || true
     else
         docker rm -f "$SRC" >/dev/null 2>&1 || true
         docker ps -aq --filter "name=bv-verify-" | xargs -r docker rm -f >/dev/null 2>&1 || true
@@ -68,6 +72,10 @@ if [ "$ENG_NAME" = files ]; then
     SRC_DIR=$(mktemp -d)
     log "seeding a source file tree ($SRC_DIR)"
     seed_files "$SRC_DIR"
+elif [ "$ENG_NAME" = sqlite ]; then
+    SRC_DB="$OUT/source.db"
+    log "seeding a source SQLite database ($SRC_DB)"
+    seed_sqlite "$SRC_DB"
 else
     log "booting a source database with data ($ENG_NAME, $IMAGE)"
     docker rm -f "$SRC" >/dev/null 2>&1 || true
@@ -92,6 +100,8 @@ fresh_backup() {
     dir=$(mktemp -d "$OUT/caseXXXXXX")
     if [ "$ENG_NAME" = files ]; then
         ./backup.sh --engine "$ENGINE" --path "$SRC_DIR" --db app --out "$dir" >/dev/null
+    elif [ "$ENG_NAME" = sqlite ]; then
+        ./backup.sh --engine "$ENGINE" --path "$SRC_DB" --db app --out "$dir" >/dev/null
     else
         ./backup.sh --engine "$ENGINE" --container "$SRC" --db app --out "$dir" >/dev/null
     fi
@@ -158,6 +168,28 @@ if [ "$ENG_NAME" = files ]; then
         fail_case 'backup.sh called a valid archive of an EMPTY directory a backup'
     else
         pass_case 'backup.sh refuses to back up an empty tree (a backup of nothing is nothing)'
+        if find "$OUT" -maxdepth 1 -name 'emptyset_*' | grep -q .; then
+            fail_case 'and it left an artefact behind'
+        else
+            pass_case '...and leaves no plausible-looking artefact behind'
+        fi
+    fi
+elif [ "$ENG_NAME" = sqlite ]; then
+    # The missing source: a .db file that is not there must fail at preflight.
+    if ./backup.sh --engine "$ENGINE" --path "$OUT/does-not-exist.db" --out "$OUT" >"$OUT/c2.log" 2>&1; then
+        fail_case 'backup.sh reported success for a source database that does not exist'
+    else
+        pass_case 'backup.sh fails on a source database that is not there'
+    fi
+    # The EMPTY database: a valid SQLite file with zero tables. It dumps
+    # cleanly (BEGIN; COMMIT;), so the parse gate passes - only the "manifest
+    # lists no tables" guard stands between it and a backup of nothing.
+    EMPTY_DB="$OUT/emptyset.db"
+    sqlite3 "$EMPTY_DB" 'PRAGMA user_version;' >/dev/null
+    if ./backup.sh --engine "$ENGINE" --path "$EMPTY_DB" --db emptyset --out "$OUT" >"$OUT/c2b.log" 2>&1; then
+        fail_case 'backup.sh called a dump of an EMPTY database a backup'
+    else
+        pass_case 'backup.sh refuses to back up a database with no tables (a backup of nothing is nothing)'
         if find "$OUT" -maxdepth 1 -name 'emptyset_*' | grep -q .; then
             fail_case 'and it left an artefact behind'
         else
@@ -255,6 +287,12 @@ case "$ENG_NAME" in
         # The glob expands to everything EXCEPT the dotfiles - measured: .env
         # was simply not in the archive, and tar exited 0.
         (cd "$SRC_DIR" && tar -czf - -- *) > "$ARTEFACT";;
+    sqlite)
+        # A TABLE-SCOPED dump: `.dump customers orders` returns every row of
+        # both tables (exit 0, no warning) and drops the index, both views and
+        # the trigger - the SQLite `pg_dump -t` (measured: 2500 rows kept, all
+        # other objects gone).
+        sqlite3 "$SRC_DB" '.dump customers orders' > "$ARTEFACT";;
 esac
 realign_manifest "$MANIFEST"
 # What the rejection must SAY, per engine. MySQL is pinned to the exact numbers
@@ -267,6 +305,8 @@ case "$ENG_NAME" in
               C6_OK='OK   customers';;
     files)    C6_PAT='\.env - file absent'
               C6_OK='OK   config/nginx.conf';;
+    sqlite)   C6_PAT='indexes - expected|views - expected|triggers - expected'
+              C6_OK='OK   customers';;
 esac
 if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c6.log" 2>&1; then
     fail_case 'a stripped artefact passed verification (the loss went unnoticed)'
@@ -296,6 +336,7 @@ else
         postgres) PLAIN_SIG='PGDMP';;
         mysql)    PLAIN_SIG='MySQL dump';;
         files)    PLAIN_SIG='';;
+        sqlite)   PLAIN_SIG='PRAGMA foreign_keys';;
     esac
     KEYDIR=$(mktemp -d "$OUT/keysXXXXXX")
     age-keygen -o "$KEYDIR/good.txt" 2>/dev/null
@@ -305,6 +346,8 @@ else
     # encrypted invocations cannot drift from the plain ones.
     if [ "$ENG_NAME" = files ]; then
         SRC_ARGS=(--path "$SRC_DIR" --db app)
+    elif [ "$ENG_NAME" = sqlite ]; then
+        SRC_ARGS=(--path "$SRC_DB" --db app)
     else
         SRC_ARGS=(--container "$SRC" --db app)
     fi

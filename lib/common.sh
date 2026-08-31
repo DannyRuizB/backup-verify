@@ -44,7 +44,7 @@ die()  { printf '%s[x]%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
 # shellcheck disable=SC2034  # consumed by backup.sh/verify.sh, which source this
 SCHEMA_CLASSES="indexes constraints sequences views routines triggers"
 
-SUPPORTED_ENGINES="postgres mysql files"
+SUPPORTED_ENGINES="postgres mysql files sqlite"
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"

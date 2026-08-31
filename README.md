@@ -3,8 +3,8 @@
 [![ci](https://github.com/DannyRuizB/backup-verify/actions/workflows/ci.yml/badge.svg)](https://github.com/DannyRuizB/backup-verify/actions/workflows/ci.yml)
 
 **A backup nobody has restored is not a backup, it is a hope.** This repo takes
-PostgreSQL, MySQL/MariaDB and plain file-tree backups and then *proves they
-restore* — by restoring them into a throwaway instance and comparing the
+PostgreSQL, MySQL/MariaDB, SQLite and plain file-tree backups and then *proves
+they restore* — by restoring them into a throwaway instance and comparing the
 result against the source, table by table (or file by file). And because a
 copy that never left the building is a hope of a different kind, `offsite.sh`
 gets the proven pair off the machine — and makes the far end prove, hash in
@@ -29,6 +29,9 @@ engine.
 
 # a directory tree: same promise, same gates, no Docker involved
 ./backup.sh --engine files --path /srv/app --out ./backups
+
+# a SQLite database: same promise, same gates, no Docker involved
+./backup.sh --engine sqlite --path /srv/app/app.db --db app --out ./backups
 
 # encrypted at rest, and proven to decrypt at backup time:
 age-keygen -o key.txt
@@ -190,6 +193,25 @@ The "schema objects" of a tree are its metadata, digested in three classes the
 way the database engines digest theirs: **modes** (every entry's permission
 bits — the umask lie), **symlinks** (a link turned into a copy is a different
 tree), and **dirs** (an empty directory a naive tool drops is still a loss).
+
+## SQLite has its own ways of lying
+
+The fourth engine is a single file, and that is exactly what makes the obvious
+backup the wrong one — every row below was observed on this machine (sqlite3
+3.46.1) before the module was written:
+
+| What looks fine | What is actually happening |
+|---|---|
+| `cp app.db backup.db` and the copy opens | **A file copy of a live database can be torn** — a page written, its index page not yet — and the WAL is worse: copying only the `.db` and not the `-wal` **loses every commit still in the write-ahead log**. The copy still opens, and "does it open?" signs it off; only `PRAGMA integrity_check` sees the damage. The engine dumps with `.dump` — a consistent logical snapshot inside a read transaction — so it never takes a torn copy in the first place. |
+| `sqlite3 db .dump customers orders` exited 0, every row is there | **A table-scoped dump silently drops every other object.** Measured: 2500 rows of both named tables kept, and the index, *both* views and the trigger simply gone — no error, no warning. The SQLite `pg_dump -t`, and negative case 6 proves a table-scoped artefact is rejected for exactly this. |
+| The `.sql` dump looks complete | **An interrupted `.dump` has no closing `COMMIT;`.** A `.dump` wraps everything in `BEGIN TRANSACTION; … COMMIT;`, so a dump cut short before the trailer rolls back *cleanly* on restore — the table never exists, rather than half its rows landing. The parse gate demands that trailer, the exact twin of MySQL's `Dump completed`. |
+| `NULL` and the string `'NULL'` both came back | **A naive fingerprint cannot tell them apart**, and a value with an embedded newline splits a line-oriented hash into two rows. The fingerprint quotes every column (`quote(NULL)` is a bareword, `quote('NULL')` a quoted string) and joins the ordered rows *inside* SQLite into one value hashed once, so neither confusion nor a newline can fool it. |
+| Every row restored, and the app breaks on its first INSERT | **`INTEGER PRIMARY KEY AUTOINCREMENT` keeps its high-water mark in `sqlite_sequence`.** A counter restored *behind* its data makes the next INSERT reuse an id and collide with the primary key — the SQLite twin of a Postgres sequence behind its data. The writable gate proves each counter still sits at or above its table's largest id. |
+
+No Docker anywhere: the "throwaway instance" is a scratch `.db` file, the way
+the files engine's is a scratch directory. The schema objects are digested in
+three classes — **indexes**, **views** and **triggers** — the objects a
+table-scoped dump throws away.
 
 ## Off-site copies have their own ways of lying
 
@@ -399,9 +421,10 @@ whose halves disagree — that is two different servers' rules, not a backup):
 
 ## How it works
 
-**`backup.sh --engine postgres|mysql|files`** dumps with the engine's own tool
-(`pg_dump -Fc`; `mysqldump --single-transaction --routines --events
---triggers`; `tar -cz .` — the dot, never the dotfile-dropping glob) and writes
+**`backup.sh --engine postgres|mysql|files|sqlite`** dumps with the engine's own
+tool (`pg_dump -Fc`; `mysqldump --single-transaction --routines --events
+--triggers`; `tar -cz .` — the dot, never the dotfile-dropping glob; `sqlite3
+.dump`) and writes
 a **manifest** beside the artefact: size, sha256, the
 engine, and one content fingerprint per table (or file) — the yardstick for later.
 `verify.sh` reads the engine back from the manifest, so a Postgres backup can
@@ -447,19 +470,21 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
 
 ## How it's tested
 
-- **`test/e2e.sh [--engine postgres|mysql|files] [--encrypted]`** — seed →
+- **`test/e2e.sh [--engine postgres|mysql|files|sqlite] [--encrypted]`** — seed →
   back up → **destroy the source** (`docker rm -f`, or `rm -rf` of the tree) →
   restore into a fresh instance → compare. The
   destruction is the point: it removes the possibility of accidentally
   verifying against the original.
-- **`test/negative.sh [--engine postgres|mysql|files]`** — eleven cases *per
-  engine*:
+- **`test/negative.sh [--engine postgres|mysql|files|sqlite]`** — eleven cases
+  *per engine*:
   truncated archive, un-runnable dump, post-backup corruption, matching row
   count with different content, **everything restored with the silent loss
   intact** (Postgres: a `pg_dump -t` tables-only artefact; MySQL: a dump made
   with mysqldump's own **default** invocation, rejected for exactly
   `routines - expected 2, restored copy has 0`; files: a `tar czf backup.tgz *`
-  artefact, rejected for exactly `.env - file absent`), five encryption cases (real
+  artefact, rejected for exactly `.env - file absent`; SQLite: a table-scoped
+  `.dump customers orders`, rejected because the index, both views and the
+  trigger are gone), five encryption cases (real
   ciphertext on disk with no plaintext header in the clear, verification
   refusing without a key, the **wrong** key failing at decryption and told
   apart from a bad archive, a truncated ciphertext that cannot decrypt at all,
@@ -689,8 +714,9 @@ explicitly, so both transports tell the same story.
 
 ## Scope
 
-PostgreSQL and MySQL/MariaDB via Docker containers, plain directory trees via
-`--engine files`, off-site copies over ssh or onto a mounted disk, and
+PostgreSQL and MySQL/MariaDB via Docker containers, SQLite databases and plain
+directory trees with no Docker at all (`--engine sqlite` / `--engine files`),
+off-site copies over ssh or onto a mounted disk, and
 point-in-time recovery for both database engines — Postgres over a WAL
 archive and MySQL over archived binlogs, both archives optionally encrypted
 end to end, both pushed off-site, audited at the remote, and pulled back
