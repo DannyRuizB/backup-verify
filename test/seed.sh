@@ -85,6 +85,42 @@ INSERT INTO orders (customer_id, total, note)
 SQL
 }
 
+# SQLite gets the same shape to lose, in one file: two tables (PK, UNIQUE,
+# CHECK, FK), an extra index, a view and a trigger. SQLite has no stored
+# routines, so the "routines" slot is filled by a second view - the point of
+# case 6 is a table-scoped dump dropping every VIEW, and two of them prove it
+# drops all, not just the first. AUTOINCREMENT on the PKs so the writable gate
+# has a counter to check. The argument is the TARGET .db file (created here),
+# not a container - the containerless shape the files engine established.
+seed_sqlite() {
+    local dbfile="$1"
+    sqlite3 "$dbfile" <<'SQL'
+PRAGMA foreign_keys=ON;
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE,
+  created_at TEXT DEFAULT '2026-01-01T00:00:00Z'
+);
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER REFERENCES customers(id),
+  total NUMERIC CHECK (total >= 0),
+  note TEXT
+);
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 1000;
+CREATE VIEW order_totals AS SELECT customer_id, sum(total) AS spent FROM orders GROUP BY customer_id;
+CREATE TRIGGER orders_note AFTER INSERT ON orders
+  WHEN NEW.note IS NULL
+  BEGIN UPDATE orders SET note = 'pedido sin nota' WHERE id = NEW.id; END;
+WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 500)
+  INSERT INTO customers (name, email) SELECT 'cliente '||n, 'c'||n||'@example.com' FROM g;
+WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 2000)
+  INSERT INTO orders (customer_id, total, note) SELECT (n % 500) + 1, round(n * 1.37, 2), 'pedido '||n FROM g;
+SQL
+}
+
 # The files tree gets the same treatment: everything a naive file backup is
 # MEASURED to lose. A dotfile (the glob invocation drops it), a 100KB blob
 # (a truncated archive leaves a partial copy with a plausible size), a

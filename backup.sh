@@ -66,13 +66,20 @@ parse_args() {
             *)           printf 'unknown option: %s\n' "$1" >&2; usage 1;;
         esac
     done
-    # --path is the files engine's source: it takes the --container slot (it
-    # is where the data lives), made absolute so the engine never guesses, and
-    # the dataset name defaults to its basename.
+    # --path is a path source (the files engine's directory tree, or the
+    # sqlite engine's .db file): it takes the --container slot - it is where
+    # the data lives - made absolute so the engine never guesses, with the
+    # dataset name defaulting to its basename. A directory OR a regular file is
+    # accepted here; the engine's own preflight rejects the wrong kind, so this
+    # stays free of any engine name.
     if [ -n "$SRC_PATH" ]; then
         [ -z "$CONTAINER" ] || die "--path and --container are two different sources - give one"
-        [ -d "$SRC_PATH" ] || die "source directory '$SRC_PATH' not found"
-        CONTAINER="$(cd "$SRC_PATH" && pwd)"
+        [ -e "$SRC_PATH" ] || die "source path '$SRC_PATH' not found"
+        if [ -d "$SRC_PATH" ]; then
+            CONTAINER="$(cd "$SRC_PATH" && pwd)"
+        else
+            CONTAINER="$(cd "$(dirname "$SRC_PATH")" && pwd)/$(basename "$SRC_PATH")"
+        fi
         [ -n "$DB" ] || DB="$(basename "$CONTAINER")"
     fi
     [ -n "$CONTAINER" ] || die "--container (or --path) is required"

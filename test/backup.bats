@@ -5,6 +5,12 @@
 
 setup() {
     REPO="${BATS_TEST_DIRNAME}/.."
+    # The sqlite engine's unit tests need the CLI; skip them cleanly if it is
+    # not installed rather than failing the whole suite (CI has it).
+    SQLITE="$(command -v sqlite3 || true)"
+    if [[ "$BATS_TEST_DESCRIPTION" == sqlite\ engine:* && -z "$SQLITE" ]]; then
+        skip "sqlite3 CLI not installed"
+    fi
 }
 
 @test "backup.sh --help lists every option" {
@@ -132,7 +138,7 @@ JSON
     # Regression guard for a real bug: with `docker exec -i`, calling the query
     # helper from inside a `while read` loop made the client swallow the loop's
     # remaining input, and the manifest listed 1 of 2 tables.
-    for engine in postgres mysql; do
+    for engine in postgres mysql sqlite; do
         run bash -c "grep -A3 '^eng_query' '$REPO/lib/$engine.sh'"
         [[ "$output" == *"/dev/null"* ]]
         [[ "$output" != *"docker exec -i \"\$container\""* ]]
@@ -182,7 +188,7 @@ JSON
 }
 
 @test "an unknown schema class is a loud error in every engine" {
-    for engine in postgres mysql; do
+    for engine in postgres mysql sqlite files; do
         run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/$engine.sh'"
         [[ "$output" == *"unknown object class"* ]]
     done
@@ -197,7 +203,7 @@ JSON
 @test "each engine module defines the whole eng_* interface" {
     # Adding an engine must not mean discovering a missing function at runtime,
     # halfway through someone's restore.
-    for engine in postgres mysql files; do
+    for engine in postgres mysql files sqlite; do
         for fn in eng_preflight eng_boot eng_wait_ready eng_query eng_dump \
                   eng_restore eng_archive_parses eng_list_tables \
                   eng_table_fingerprint eng_schema_digest eng_count_tables \
@@ -260,6 +266,74 @@ JSON
     [ "$status" -eq 0 ]
     [ "${lines[0]}" = "backups/app_1.json" ]
     [ "${lines[1]}" = "backups/app_1.json" ]
+}
+
+@test "sqlite engine: a probe name maps under /tmp, an absolute path stays itself" {
+    # eng_teardown does rm -f on what sqlite_file returns - the same guard the
+    # files engine has between cleanup and deleting a user's database.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; sqlite_file bv-verify-123; echo; sqlite_file /srv/app.db"
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "${TMPDIR:-/tmp}/bv-sqlite-bv-verify-123.db" ]
+    [ "${lines[1]}" = "/srv/app.db" ]
+}
+
+@test "sqlite engine: teardown never removes an absolute (user-supplied) database" {
+    dir=$(mktemp -d)
+    "$SQLITE" "$dir/precious.db" 'CREATE TABLE t(x);' >/dev/null
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; eng_teardown '$dir/precious.db'"
+    [ "$status" -eq 0 ]
+    [ -f "$dir/precious.db" ]
+    rm -rf "$dir"
+    # ...while a derived scratch database IS removed
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh';
+        eng_boot probe-bats-$$; [ -f \"\$(sqlite_file probe-bats-$$)\" ] || exit 1;
+        eng_teardown probe-bats-$$; [ ! -f \"\$(sqlite_file probe-bats-$$)\" ]"
+    [ "$status" -eq 0 ]
+}
+
+@test "sqlite engine: fingerprints are HASH:COUNT, deterministic and NULL-safe" {
+    dir=$(mktemp -d)
+    "$SQLITE" "$dir/f.db" "CREATE TABLE t(id INTEGER, v TEXT); INSERT INTO t VALUES (1,'a'),(2,NULL),(3,'NULL');" >/dev/null
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; eng_table_fingerprint '$dir/f.db' ignored t"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^[0-9a-f]{64}:3$ ]]
+    fp1="$output"
+    # Deterministic: same data, same fingerprint.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; eng_table_fingerprint '$dir/f.db' ignored t"
+    [ "$output" = "$fp1" ]
+    # NULL and the string 'NULL' must NOT hash the same: flip row 2 to 'NULL'.
+    "$SQLITE" "$dir/f.db" "UPDATE t SET v='NULL' WHERE id=2;" >/dev/null
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; eng_table_fingerprint '$dir/f.db' ignored t"
+    [ "$output" != "$fp1" ]
+    # An empty table is EMPTY:0, never a hash of nothing.
+    "$SQLITE" "$dir/f.db" "CREATE TABLE e(x);" >/dev/null
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; eng_table_fingerprint '$dir/f.db' ignored e"
+    [ "$output" = "EMPTY:0" ]
+    rm -rf "$dir"
+}
+
+@test "sqlite engine: the parse gate demands the COMMIT trailer a truncated dump lacks" {
+    # A .dump ends with COMMIT; an interrupted one does not - the SQLite twin
+    # of MySQL's 'Dump completed' truncation detector.
+    good="BEGIN TRANSACTION;
+CREATE TABLE t(x);
+COMMIT;"
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; printf '%s\n' '$good' | eng_archive_parses"
+    [ "$status" -eq 0 ]
+    trunc="BEGIN TRANSACTION;
+CREATE TABLE t(x);
+INSERT INTO t VALUES(1"
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/sqlite.sh'; printf '%s\n' '$trunc' | eng_archive_parses"
+    [ "$status" -ne 0 ]
+}
+
+@test "sqlite engine: schema classes are indexes/views/triggers, each with ORDER BY" {
+    for class in indexes views triggers; do
+        run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/sqlite.sh' | grep -c '^ *$class)'"
+        [ "$output" = "1" ]
+    done
+    run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/sqlite.sh' | grep -c 'ORDER BY'"
+    [ "$output" -ge 3 ]
 }
 
 @test "Postgres compares sequences with their last_value" {
