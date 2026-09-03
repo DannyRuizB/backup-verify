@@ -136,8 +136,8 @@ jobs:
         remote: [ssh, dir]
     steps:
       - uses: actions/checkout@v5
-      - name: Install age
-        run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
+      - name: Install age and sqlite3
+        run: sudo apt-get update -qq && sudo apt-get install -y age sqlite3 >/dev/null
       - name: fire drill + every measured off-site lie
         run: ./test/offsite.sh --remote-kind ${{ matrix.remote }}
 

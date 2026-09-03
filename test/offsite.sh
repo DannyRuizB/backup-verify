@@ -300,6 +300,52 @@ else
         sed -n '1,10p' "$OUT/c6-pull.log" | sed 's/^/        /'
     fi
 fi
+echo '== Case 7: the fire, SQLite edition - the fourth engine through the same off-site cycle =='
+# The off-site protocol is engine-agnostic by construction (a manifest and
+# its artefact, hashed at both ends), so the drill so far ran the files
+# engine only. The fourth engine gets the same fire, for two reasons the
+# manifest cannot promise on its own: its artefact is a text .dump whose
+# closing COMMIT is the restore's parse gate (a truncated upload must never
+# verify), and it carries no container - the pull lands on a box with nothing
+# but sqlite3, the containerless shape the files engine established.
+if command -v sqlite3 >/dev/null 2>&1; then
+    BK7=$(mktemp -d "$OUT/bk7XXXXXX")
+    SRC7="$OUT/src7.db"
+    seed_sqlite "$SRC7"
+    ./backup.sh --engine sqlite --path "$SRC7" --db app --out "$BK7" >/dev/null
+    M7=$(find "$BK7" -name '*.json' | sort | tail -1)
+    R7="$BASE/case7"
+    ./offsite.sh push --manifest "$M7" --remote "$R7" "${OS[@]}" >"$OUT/c7-push.log" 2>&1 \
+        || { fail_case 'push of the sqlite pair failed'; sed -n '1,10p' "$OUT/c7-push.log" | sed 's/^/        /'; }
+    rm -f "$SRC7" "$SRC7-wal" "$SRC7-shm"; rm -rf "$BK7"   # the building burns: source db and local backups gone
+    if ./offsite.sh pull --db app --remote "$R7" --out "$OUT/restored7" "${OS[@]}" >"$OUT/c7-pull.log" 2>&1; then
+        PM7=$(find "$OUT/restored7" -name '*.json' | head -1)
+        if ./verify.sh --manifest "$PM7" >"$OUT/c7-verify.log" 2>&1; then
+            pass_case 'the pulled SQLite dump RESTORED into a scratch database - the fourth engine survives the fire too'
+        else
+            fail_case 'the pulled sqlite pair did not verify'
+            sed -n '1,15p' "$OUT/c7-verify.log" | sed 's/^/        /'
+        fi
+        # The engine-specific lie: a dump amputated by a dying upload has no
+        # closing COMMIT. Truncate the pulled artefact like a crash would and
+        # verify must REFUSE it - not restore half a database and call it done.
+        A7=$(find "$OUT/restored7" -type f ! -name '*.json' | head -1)
+        if [ -n "$A7" ]; then
+            size7=$(stat -c %s "$A7")
+            truncate -s $((size7 * 2 / 3)) "$A7"
+            if ./verify.sh --manifest "$PM7" >"$OUT/c7-trunc.log" 2>&1; then
+                fail_case 'a truncated sqlite dump verified - half a database passed as a backup'
+            else
+                pass_case 'a truncated sqlite dump is REFUSED by verify (the closing COMMIT is the gate, and the hash disagrees first)'
+            fi
+        fi
+    else
+        fail_case 'pull of the sqlite pair failed with nothing local left'
+        sed -n '1,10p' "$OUT/c7-pull.log" | sed 's/^/        /'
+    fi
+else
+    fail_case 'sqlite3 is not installed - case 7 cannot run (the CI installs it; do the same locally)'
+fi
 printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then
