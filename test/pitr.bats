@@ -444,3 +444,21 @@ fabricate_pair() {
     [ "$status" -ne 0 ]
     [[ "$output" == *"--keep belongs to push"* ]]
 }
+
+@test "pitr.sh prune needs --db and --keep >= 1" {
+    run bash "$REPO/pitr.sh" prune --out /tmp --archive /tmp --keep 2
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"prune needs --db"* ]]
+    run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"prune needs --keep N with N >= 1"* ]]
+    run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp --keep 0
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"keeping nothing is not retention"* ]]
+}
+
+@test "pitr.sh --help lists prune" {
+    run bash "$REPO/pitr.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"./pitr.sh prune"* ]]
+}
