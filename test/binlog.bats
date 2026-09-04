@@ -433,3 +433,21 @@ fabricate_pair() {
     [ "$status" -ne 0 ]
     [[ "$output" == *"--keep belongs to push"* ]]
 }
+
+@test "binlog.sh prune needs --db, --out, --archive and --keep >= 1" {
+    run bash "$REPO/binlog.sh" prune --out /tmp --archive /tmp --keep 2
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"prune needs --db"* ]]
+    run bash "$REPO/binlog.sh" prune --db app --out /tmp --archive /tmp
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"prune needs --keep N with N >= 1"* ]]
+    run bash "$REPO/binlog.sh" prune --db app --out /tmp --archive /tmp --keep 0
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"keeping nothing is not retention"* ]]
+}
+
+@test "binlog.sh --help lists prune" {
+    run bash "$REPO/binlog.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"./binlog.sh prune"* ]]
+}

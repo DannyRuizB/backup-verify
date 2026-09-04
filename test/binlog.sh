@@ -60,7 +60,7 @@ pass_case() { printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$1"; }
 fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAILURES + 1)); }
 
 cleanup() {
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
+    docker rm -f "$SRC" "${SRC}8" >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -356,6 +356,77 @@ if [ "$GTID" -eq 1 ]; then
     fi
     printf '\n'
 fi
+
+echo '== Case 8: local retention - prune draws its line at the oldest KEPT dump and the newest mark still replays =='
+# Self-contained (its own source, archive, backups): case 1 destroys the main
+# source on purpose, and retention needs a SECOND anchored dump to draw a line.
+SRC8="${SRC}8"; ARCHIVE8="$OUT/archive8"; BK8="$OUT/backups8"
+mkdir -p "$ARCHIVE8" "$BK8"
+docker rm -f "$SRC8" >/dev/null 2>&1 || true
+docker run -d --name "$SRC8" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" \
+    ${GTID_ARGS[@]+"${GTID_ARGS[@]}"} >/dev/null
+eng_wait_ready "$SRC8"
+seed_mysql "$SRC8" app
+traffic8() { eng_query "$SRC8" app "INSERT INTO orders (customer_id, total, note) SELECT (i % 500) + 1, i, '$1' FROM (WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<300) SELECT i FROM s) q;" >/dev/null; }
+./binlog.sh base --container "$SRC8" --db app --out "$BK8" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/base8a.log" 2>&1 \
+    || { fail_case 'the first retention dump failed'; sed -n '1,10p' "$OUT/base8a.log" | sed 's/^/        /'; }
+B8A=$(find "$BK8" -name '*_binlogbase.json' | LC_ALL=C sort | head -1)
+traffic8 case8a; eng_query "$SRC8" mysql 'FLUSH BINARY LOGS;' >/dev/null
+./binlog.sh mark --container "$SRC8" --db app --archive "$ARCHIVE8" --out "$BK8" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark8a.log" 2>&1 \
+    || { fail_case 'the first retention mark failed'; sed -n '1,10p' "$OUT/mark8a.log" | sed 's/^/        /'; }
+M8A=$(find "$BK8" -name '*_binlogmark.json' | LC_ALL=C sort | head -1)
+traffic8 case8b; eng_query "$SRC8" mysql 'FLUSH BINARY LOGS;' >/dev/null
+./binlog.sh base --container "$SRC8" --db app --out "$BK8" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/base8b.log" 2>&1 \
+    || { fail_case 'the second retention dump failed'; sed -n '1,10p' "$OUT/base8b.log" | sed 's/^/        /'; }
+B8B=$(find "$BK8" -name '*_binlogbase.json' | LC_ALL=C sort | tail -1)
+traffic8 case8c; eng_query "$SRC8" mysql 'FLUSH BINARY LOGS;' >/dev/null
+./binlog.sh mark --container "$SRC8" --db app --archive "$ARCHIVE8" --out "$BK8" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark8b.log" 2>&1 \
+    || { fail_case 'the second retention mark failed'; sed -n '1,10p' "$OUT/mark8b.log" | sed 's/^/        /'; }
+M8B=$(find "$BK8" -name '*_binlogmark.json' | LC_ALL=C sort | tail -1)
+CUT8=$(json_str "$B8B" anchor_file)
+OLD_ART8=$(json_str "$B8A" artefact)
+below8() { awk -v cut="$CUT8" -v pfx="${CUT8%.*}." 'index($0, pfx) == 1 { s = $0; sub(/\.age$/, "", s); if (s < cut) n++ } END { print n + 0 }'; }
+BELOW8=$(find "$ARCHIVE8" -maxdepth 1 -type f -printf '%f\n' | below8)
+if [ "$B8B" = "$B8A" ] || [ "$BELOW8" -eq 0 ]; then
+    fail_case "could not set the scene: dumps $(basename "$B8A") / $(basename "$B8B"), $BELOW8 binlog(s) below the second anchor $CUT8"
+fi
+if ./binlog.sh prune --db app --out "$BK8" --archive "$ARCHIVE8" --keep 1 >"$OUT/prune8.log" 2>&1; then
+    STILL8=$(find "$ARCHIVE8" -maxdepth 1 -type f -printf '%f\n' | below8)
+    if [ ! -e "$B8A" ] && [ ! -e "$BK8/$OLD_ART8" ] && [ "$STILL8" -eq 0 ] && [ -e "$B8B" ] && [ -e "$M8B" ] \
+       && [ -e "$ARCHIVE8/$CUT8$SFX" ]; then
+        pass_case "--keep 1 retired the older dump, its artefact and $BELOW8 archived binlog(s) below $CUT8 - and kept the new dump, its anchor binlog and the mark"
+    else
+        fail_case "prune removed the wrong things (binlogs still below the cut: $STILL8; old dump present: $([ -e "$B8A" ] && echo yes || echo no))"
+        sed -n '1,20p' "$OUT/prune8.log" | sed 's/^/        /'
+    fi
+    if [ ! -e "$M8A" ]; then
+        pass_case "the first mark $(basename "$M8A") went with the dump that alone could prove it"
+    else
+        M8A_FILE=$(json_str "$M8A" mark_file)
+        if [ "$(binlog_prefix_of "$M8A_FILE")" = "$(binlog_prefix_of "$CUT8")" ] && [ "$(binlog_index_of "$M8A_FILE")" -lt "$(binlog_index_of "$CUT8")" ]; then
+            fail_case "mark $(basename "$M8A") points at $M8A_FILE, below the cut, and survived the prune"
+        else
+            pass_case "mark $(basename "$M8A") sits at $M8A_FILE, not below the cut $CUT8 - kept"
+        fi
+    fi
+    if ./binlog.sh check --archive "$ARCHIVE8" >"$OUT/check8.log" 2>&1; then
+        pass_case 'check --archive stays green after the prune: the chain a kept dump needs is whole'
+    else
+        fail_case 'check --archive failed after retention - the prune cut into a chain a kept dump needs'
+        sed -n '1,20p' "$OUT/check8.log" | sed 's/^/        /'
+    fi
+    if ./binlog.sh verify --base "$B8B" --mark "$M8B" --archive "$ARCHIVE8" --tools "$TOOLS" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify8.log" 2>&1; then
+        pass_case 'the newest mark still replays exactly on the pruned archive'
+    else
+        fail_case 'the newest mark no longer verifies after the prune'
+        sed -n '1,25p' "$OUT/verify8.log" | sed 's/^/        /'
+    fi
+else
+    fail_case 'prune --keep 1 failed'
+    sed -n '1,20p' "$OUT/prune8.log" | sed 's/^/        /'
+fi
+docker rm -f "$SRC8" >/dev/null 2>&1 || true
+printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then
     die "$FAILURES binlog PITR case(s) behaved wrongly"

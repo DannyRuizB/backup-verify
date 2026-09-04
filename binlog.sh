@@ -55,6 +55,7 @@
 #                      [--image IMAGE] [--identity FILE]
 #   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N]
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
+#   ./binlog.sh prune  --db NAME --out DIR --archive DIR --keep N
 #
 # Subcommands:
 #   base    mysqldump with --source-data: the dump plus its ANCHOR (the
@@ -107,7 +108,11 @@
 #   --remote REMOTE   user@host:/path (ssh) or /path (a mounted disk) -
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
-#   --keep N          (push) after the push, keep the newest N anchored dumps
+#   --keep N          (push) keep the newest N anchored dumps at the remote;
+#                     (prune) the same line drawn LOCALLY - newest N dumps in
+#                     --out, everything below the oldest kept dump's anchor
+#                     file retired from --archive and --out. N >= 1 for prune.
+#                     Original push wording: keep the newest N anchored dumps
 #                     at the remote and drop only what no kept dump can
 #                     replay: older dumps, the binlog files below the oldest
 #                     kept dump's anchor, the marks only they could prove.
@@ -147,7 +152,7 @@ usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-
 
 parse_args() {
     case "${1:-}" in
-        base|mark|check|verify|push|pull) SUBCMD="$1"; shift;;
+        base|mark|check|verify|push|pull|prune) SUBCMD="$1"; shift;;
         -h|--help) usage 0;;
         '')        printf 'a subcommand is required: base, mark, check, verify, push or pull\n' >&2; usage 1;;
         *)         printf 'unknown subcommand: %s\n' "$1" >&2; usage 1;;
@@ -181,7 +186,7 @@ parse_args() {
         ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
     esac
     [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
-        || die "--keep belongs to push: retention happens where the copy lives, right after it arrived"
+        || [ "$SUBCMD" = prune ] || die "--keep belongs to push (remote retention) and prune (local retention)"
     # base needs no archive: the dump carries its anchor, the binlogs come
     # with the first mark. A remote check audits the off-site copy; pull
     # CREATES its archive directory - disaster recovery starts with nothing.
@@ -237,6 +242,11 @@ parse_args() {
         pull)
             [ -n "$DB" ] || die "pull needs --db (which database to bring back)"
             [ -n "$REMOTE" ] || die "pull needs --remote (where the copy lives)";;
+        prune)
+            [ -n "$DB" ] || die "prune needs --db (whose dumps and marks to count)"
+            [ -n "$OUT_DIR" ] || die "prune needs --out (where the dumps live)"
+            [ -n "$ARCHIVE_DIR" ] || die "prune needs --archive (where the binlogs live)"
+            [ "$KEEP" -ge 1 ] || die "prune needs --keep N with N >= 1 (keeping nothing is not retention, it is deletion)";;
     esac
 }
 
@@ -935,6 +945,72 @@ prune_remote_binlog() {
     ok "retention: kept the newest $KEEP anchored dump(s), line drawn at $cut_file - dropped $removed_bases dump(s), $removed_files binlog file(s), $removed_marks mark(s) no kept dump could replay"
 }
 
+# --- prune (local retention) ------------------------------------------------------
+
+# The archive grows until the disk says otherwise; the answer is push --keep's
+# line drawn at home. Keep the newest N anchored dumps in --out, and retire
+# everything BELOW the oldest kept dump's anchor file: the older dumps and their
+# artefacts, the marks only they could prove, and the archived binlogs (same
+# prefix, lower index) no kept dump can replay. Binlogs in the archive are
+# host-readable (mark copies them there), so no sidecar is needed - the files
+# are found and removed directly. Refuses to guess without anchor_file, and
+# refuses --keep 0. History across two server prefixes is out of scope: only
+# the anchor's prefix is pruned.
+cmd_prune() {
+    [ -d "$OUT_DIR" ] || die "backup directory not found: $OUT_DIR"
+    [ -d "$ARCHIVE_DIR" ] || die "archive directory not found: $ARCHIVE_DIR"
+    local -a all=() dumps=()
+    mapfile -t all < <(find "$OUT_DIR" -maxdepth 1 -name "${DB}_*_binlogbase.json" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+    local name
+    for name in ${all[@]+"${all[@]}"}; do
+        [ "$(json_str "$OUT_DIR/$name" kind)" = "binlog-base" ] && dumps+=("$name")
+    done
+    local total=${#dumps[@]}
+    if [ "$total" -le "$KEEP" ]; then
+        ok "retention: $total anchored dump(s) of '$DB' in $OUT_DIR, keeping up to $KEEP - nothing to drop"
+        return 0
+    fi
+    local oldest_kept="${dumps[$((total - KEEP))]}"
+    local cut_file cut_prefix cut_idx
+    cut_file="$(json_str "$OUT_DIR/$oldest_kept" anchor_file)"
+    [ -n "$cut_file" ] || die "retention: $oldest_kept carries no anchor_file - refusing to guess where the line is; nothing was dropped"
+    cut_prefix=$(binlog_prefix_of "$cut_file")
+    cut_idx=$(binlog_index_of "$cut_file")
+    log "retention: keeping the newest $KEEP dump(s) of '$DB'; the line is $cut_file (anchor of $oldest_kept)"
+
+    local aname removed_dumps=0 removed_marks=0 removed_binlogs=0 mfile bare
+    for name in "${dumps[@]:0:$((total - KEEP))}"; do
+        aname="$(json_str "$OUT_DIR/$name" artefact)"
+        [ -z "$aname" ] || rm -f -- "$OUT_DIR/$aname"
+        rm -f -- "$OUT_DIR/$name"
+        removed_dumps=$((removed_dumps + 1))
+        warn "retention: removed dump $name (and its artefact) - every kept dump is newer"
+    done
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        [ "$(json_str "$OUT_DIR/$name" kind)" = "binlog-mark" ] || continue
+        mfile="$(json_str "$OUT_DIR/$name" mark_file)"
+        [ -n "$mfile" ] || continue
+        [ "$(binlog_prefix_of "$mfile")" = "$cut_prefix" ] || continue
+        if [ "$(binlog_index_of "$mfile")" -lt "$cut_idx" ]; then
+            rm -f -- "$OUT_DIR/$name"
+            removed_marks=$((removed_marks + 1))
+            warn "retention: removed mark $name - it points below $cut_file, where no kept dump can reach"
+        fi
+    done < <(find "$OUT_DIR" -maxdepth 1 -name "${DB}_*_binlogmark.json" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        bare="${name%.age}"
+        [ "$(binlog_prefix_of "$bare")" = "$cut_prefix" ] || continue
+        [[ "${bare##*.}" =~ ^[0-9]+$ ]] || continue
+        if [ "$(binlog_index_of "$bare")" -lt "$cut_idx" ]; then
+            rm -f -- "$ARCHIVE_DIR/$name"
+            removed_binlogs=$((removed_binlogs + 1))
+        fi
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+    ok "retention: kept the newest $KEEP dump(s), line drawn at $cut_file - dropped $removed_dumps dump(s), $removed_marks mark(s), $removed_binlogs archived binlog(s) no kept dump could replay"
+}
+
 # --- pull ----------------------------------------------------------------------
 
 # Disaster recovery: bring back the newest instant the remote can PROVE - the
@@ -1505,6 +1581,7 @@ main() {
         check)  cmd_check;;
         verify) cmd_verify;;
         push)   cmd_push;;
+        prune)  cmd_prune;;
         pull)   cmd_pull;;
     esac
 }
