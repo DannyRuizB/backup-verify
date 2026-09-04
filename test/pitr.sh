@@ -51,6 +51,7 @@ fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAI
 root_sh() { docker run --rm -u root --entrypoint sh -v "$OUT:/work" "$IMAGE" -c "$1"; }
 
 cleanup() {
+    docker rm -f "${SRC}9" >/dev/null 2>&1 || true
     docker rm -f "$SRC" >/dev/null 2>&1 || true
     root_sh 'rm -rf /work/archive /work/pristine' >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
@@ -357,6 +358,89 @@ else
     fail_case 'the harness broke the archive it was testing'
     sed -n '1,20p' "$OUT/verify2.log" | sed 's/^/        /'
 fi
+printf '\n'
+
+echo '== Case 9: local retention - prune draws its line at the oldest KEPT base and the newest mark still verifies =='
+# Its own source, archive and backup directory: the drill above destroyed the
+# source on purpose (case 1), and retention needs a SECOND base backup to draw
+# a line between. Same image, same archive_command, same key when encrypted.
+SRC9="${SRC}9"; ARCHIVE9="$OUT/archive9"; BK9="$OUT/backups9"
+mkdir -p "$ARCHIVE9" "$BK9"; chmod 777 "$ARCHIVE9"
+docker rm -f "$SRC9" >/dev/null 2>&1 || true
+if [ "$ENCRYPTED" -eq 1 ]; then
+    docker run -d --name "$SRC9" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+        -v "$ARCHIVE9:/archive" -v "$(command -v age):/usr/local/bin/age:ro" "$IMAGE" \
+        -c archive_mode=on \
+        -c "archive_command=test ! -f /archive/%f.age && age -r $RECIPIENT -o /archive/%f.age %p" >/dev/null
+else
+    docker run -d --name "$SRC9" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+        -v "$ARCHIVE9:/archive" "$IMAGE" \
+        -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
+fi
+eng_wait_ready "$SRC9"
+seed_postgres "$SRC9" app >/dev/null
+traffic9() {
+    eng_query "$SRC9" app "INSERT INTO orders (customer_id, total, note)
+        SELECT (i % 500) + 1, i, '$1' FROM generate_series(1, 2000) i;" >/dev/null
+}
+./pitr.sh base --container "$SRC9" --db app --archive "$ARCHIVE9" --out "$BK9" ${BASE_ENC[@]+"${BASE_ENC[@]}"} >"$OUT/base9a.log" 2>&1 \
+    || { fail_case 'the first retention base failed'; sed -n '1,10p' "$OUT/base9a.log" | sed 's/^/        /'; }
+B9A=$(find "$BK9" -name '*_base.json' | LC_ALL=C sort | head -1)
+traffic9 case9a
+./pitr.sh mark --container "$SRC9" --db app --archive "$ARCHIVE9" --out "$BK9" >"$OUT/mark9a.log" 2>&1 \
+    || { fail_case 'the first retention mark failed'; sed -n '1,10p' "$OUT/mark9a.log" | sed 's/^/        /'; }
+M9A=$(find "$BK9" -name '*_mark.json' | LC_ALL=C sort | head -1)
+traffic9 case9b
+./pitr.sh base --container "$SRC9" --db app --archive "$ARCHIVE9" --out "$BK9" ${BASE_ENC[@]+"${BASE_ENC[@]}"} >"$OUT/base9b.log" 2>&1 \
+    || { fail_case 'the second retention base failed'; sed -n '1,10p' "$OUT/base9b.log" | sed 's/^/        /'; }
+B9B=$(find "$BK9" -name '*_base.json' | LC_ALL=C sort | tail -1)
+traffic9 case9c
+./pitr.sh mark --container "$SRC9" --db app --archive "$ARCHIVE9" --out "$BK9" >"$OUT/mark9b.log" 2>&1 \
+    || { fail_case 'the second retention mark failed'; sed -n '1,10p' "$OUT/mark9b.log" | sed 's/^/        /'; }
+M9B=$(find "$BK9" -name '*_mark.json' | LC_ALL=C sort | tail -1)
+CUT9=$(json_str "$B9B" wal_start_file)
+OLD_ART9=$(json_str "$B9A" artefact)
+below_cut9() { awk -v cut="$CUT9" 'length($0) >= 24 && substr($0, 1, 24) ~ /^[0-9A-F]+$/ { s = $0; sub(/\.age$/, "", s); if (s < cut) n++ } END { print n + 0 }'; }
+BELOW9=$(root_sh 'ls -1 /work/archive9' | below_cut9)
+if [ "$B9B" = "$B9A" ] || [ "$BELOW9" -eq 0 ]; then
+    fail_case "could not set the scene: bases $(basename "$B9A") / $(basename "$B9B"), $BELOW9 segment(s) below the second start $CUT9"
+fi
+if ./pitr.sh prune --db app --out "$BK9" --archive "$ARCHIVE9" --keep 1 >"$OUT/prune9.log" 2>&1; then
+    STILL9=$(root_sh 'ls -1 /work/archive9' | below_cut9)
+    if [ ! -e "$B9A" ] && [ ! -e "$BK9/$OLD_ART9" ] && [ "$STILL9" -eq 0 ] && [ -e "$B9B" ] && [ -e "$M9B" ] \
+       && root_sh "test -e /work/archive9/$CUT9$SEGSFX" >/dev/null 2>&1; then
+        pass_case "--keep 1 retired the older base, its artefact and $BELOW9 archived segment(s) below $CUT9 - and kept the new base, its start segment and the mark"
+    else
+        fail_case "prune removed the wrong things (segments still below the cut: $STILL9; old base present: $([ -e "$B9A" ] && echo yes || echo no))"
+        sed -n '1,20p' "$OUT/prune9.log" | sed 's/^/        /'
+    fi
+    if [ ! -e "$M9A" ]; then
+        pass_case "the first mark $(basename "$M9A") went with the base that alone could prove it"
+    else
+        M9A_FILE=$(json_str "$M9A" wal_file)
+        if [[ "$M9A_FILE" < "$CUT9" ]]; then
+            fail_case "mark $(basename "$M9A") points at $M9A_FILE, below the cut, and survived the prune"
+        else
+            pass_case "mark $(basename "$M9A") sits at $M9A_FILE, not below the cut $CUT9 - kept (reachable from the kept base)"
+        fi
+    fi
+    if ./pitr.sh check --archive "$ARCHIVE9" >"$OUT/check9.log" 2>&1; then
+        pass_case 'check --archive stays green after the prune: the chain a kept base needs is whole'
+    else
+        fail_case 'check --archive failed after retention - the prune cut into a chain a kept base needs'
+        sed -n '1,20p' "$OUT/check9.log" | sed 's/^/        /'
+    fi
+    if ./pitr.sh verify --base "$B9B" --mark "$M9B" --archive "$ARCHIVE9" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify9.log" 2>&1; then
+        pass_case 'the newest mark still reproduces exactly on the pruned archive'
+    else
+        fail_case 'the newest mark no longer verifies after the prune'
+        sed -n '1,25p' "$OUT/verify9.log" | sed 's/^/        /'
+    fi
+else
+    fail_case 'prune --keep 1 failed'
+    sed -n '1,20p' "$OUT/prune9.log" | sed 's/^/        /'
+fi
+docker rm -f "$SRC9" >/dev/null 2>&1 || true
 printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then

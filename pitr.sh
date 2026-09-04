@@ -32,6 +32,7 @@
 #   ./pitr.sh verify --base FILE --mark FILE --archive DIR [--image IMAGE]
 #   ./pitr.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N]
 #   ./pitr.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
+#   ./pitr.sh prune  --db NAME --out DIR --archive DIR --keep N
 #
 # Subcommands:
 #   base    take a pg_basebackup (tar, no WAL of its own - the archive is the
@@ -75,6 +76,10 @@
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
 #   --keep N          (push) after the push, keep the newest N base backups
+#                     at the remote; (prune) the same line drawn LOCALLY -
+#                     the newest N bases in --out, everything below the oldest
+#                     kept base's start segment retired from --archive and
+#                     from --out (bases, marks). N >= 1 for prune.
 #                     at the remote and drop only what no kept base can
 #                     replay: older bases, the segments below the oldest
 #                     kept base's start, the marks only they could prove.
@@ -124,9 +129,9 @@ usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-
 
 parse_args() {
     case "${1:-}" in
-        base|mark|check|verify|push|pull) SUBCMD="$1"; shift;;
+        base|mark|check|verify|push|pull|prune) SUBCMD="$1"; shift;;
         -h|--help) usage 0;;
-        '')        printf 'a subcommand is required: base, mark, check, verify, push or pull\n' >&2; usage 1;;
+        '')        printf 'a subcommand is required: base, mark, check, verify, push, pull or prune\n' >&2; usage 1;;
         *)         printf 'unknown subcommand: %s\n' "$1" >&2; usage 1;;
     esac
     while [ $# -gt 0 ]; do
@@ -169,8 +174,8 @@ parse_args() {
     case "$KEEP" in
         ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
     esac
-    [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
-        || die "--keep belongs to push: retention happens where the copy lives, right after it arrived"
+    [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] || [ "$SUBCMD" = prune ] \
+        || die "--keep belongs to push (remote retention) and prune (local retention)"
     if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
         die "identity file not found: $IDENTITY"
     fi
@@ -191,6 +196,9 @@ parse_args() {
         pull)
             [ -n "$DB" ] || die "pull needs --db (which database to bring back)"
             [ -n "$REMOTE" ] || die "pull needs --remote (where the copy lives)";;
+        prune)
+            [ -n "$DB" ] || die "prune needs --db (whose bases and marks to count)"
+            [ "$KEEP" -ge 1 ] || die "prune needs --keep N with N >= 1 (keeping nothing is not retention, it is deletion)";;
     esac
 }
 
@@ -1005,6 +1013,93 @@ prune_remote_wal() {
     ok "retention: kept the newest $KEEP base(s), line drawn at $cut_file - dropped $removed_bases base(s), $removed_segs segment(s), $removed_marks mark(s) no kept base could replay"
 }
 
+# --- prune (local retention) ------------------------------------------------------
+
+# The archive grows until the disk says otherwise, and the answer is the same
+# line push --keep draws at the remote, drawn at home: keep the newest N base
+# backups in --out, and retire everything BELOW the oldest kept base's start
+# segment - the older bases and their artefacts, the marks only they could
+# prove, the archived segments in --archive that no kept base can replay
+# (and the .backup history files of the retired bases).
+# pg_archivecleanup draws that line for segments alone (given a backup_label);
+# prune draws it from the manifest, for segments, bases and marks together, and
+# refuses to guess when the kept base carries no wal_start_file. Segments are
+# listed and removed through the same sidecar push stages through: they land
+# 0600 as the server's uid, in a directory the host may not even read.
+cmd_prune() {
+    need docker
+    [ -d "$OUT_DIR" ] || die "backup directory not found: $OUT_DIR"
+    local -a all=() bases=()
+    mapfile -t all < <(find "$OUT_DIR" -maxdepth 1 -name "${DB}_*_base.json" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+    local name
+    for name in ${all[@]+"${all[@]}"}; do
+        [ "$(json_str "$OUT_DIR/$name" kind)" = "pitr-base" ] && bases+=("$name")
+    done
+    local total=${#bases[@]}
+    if [ "$total" -le "$KEEP" ]; then
+        ok "retention: $total base backup(s) of '$DB' in $OUT_DIR, keeping up to $KEEP - nothing to drop"
+        return 0
+    fi
+    local oldest_kept="${bases[$((total - KEEP))]}"
+    local cut_file seg_bytes cut_tl cut_idx
+    cut_file="$(json_str "$OUT_DIR/$oldest_kept" wal_start_file)"
+    seg_bytes="$(json_num "$OUT_DIR/$oldest_kept" wal_segment_bytes)"
+    if [ -z "$cut_file" ] || [ -z "$seg_bytes" ]; then
+        die "retention: $oldest_kept carries no wal_start_file/wal_segment_bytes - refusing to guess where the line is; nothing was dropped"
+    fi
+    cut_tl=$(wal_name_timeline "$cut_file")
+    cut_idx=$(wal_name_index "$cut_file" "$seg_bytes")
+    log "retention: keeping the newest $KEEP base(s) of '$DB'; the line is $cut_file (start of $oldest_kept)"
+
+    local aname removed_bases=0 removed_marks=0 removed_segs=0
+    for name in "${bases[@]:0:$((total - KEEP))}"; do
+        aname="$(json_str "$OUT_DIR/$name" artefact)"
+        [ -z "$aname" ] || rm -f -- "$OUT_DIR/$aname"
+        rm -f -- "$OUT_DIR/$name"
+        removed_bases=$((removed_bases + 1))
+        warn "retention: removed base $name (and its artefact) - every kept base is newer"
+    done
+    local mfile
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        [ "$(json_str "$OUT_DIR/$name" kind)" = "pitr-mark" ] || continue
+        mfile="$(json_str "$OUT_DIR/$name" wal_file)"
+        [ -n "$mfile" ] || continue
+        [ "$(wal_name_timeline "$mfile")" = "$cut_tl" ] || continue
+        if [ "$(wal_name_index "$mfile" "$seg_bytes")" -lt "$cut_idx" ]; then
+            rm -f -- "$OUT_DIR/$name"
+            removed_marks=$((removed_marks + 1))
+            warn "retention: removed mark $name - it points below $cut_file, where no kept base can reach"
+        fi
+    done < <(find "$OUT_DIR" -maxdepth 1 -name "${DB}_*_mark.json" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+
+    # Segments: list through the sidecar (the host may not read the archive),
+    # decide by name and timeline, remove through the sidecar. History files
+    # and other timelines stay.
+    local sidecar bare
+    local -a doomed=()
+    sidecar="postgres:$(json_str "$OUT_DIR/$oldest_kept" server_version)-alpine"
+    # A segment is 24 hex characters; a base backup also leaves its backup
+    # history file (<segment>.<offset>.backup) in the archive, and that file
+    # belongs to the base it describes - retired with it, like pg_archivecleanup
+    # does. Timeline .history files are never touched.
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        bare="${name%.age}"
+        [[ "$bare" =~ ^([0-9A-F]{24})(\.[0-9A-F]{8}\.backup)?$ ]] || continue
+        bare="${BASH_REMATCH[1]}"
+        [ "$(wal_name_timeline "$bare")" = "$cut_tl" ] || continue
+        [ "$(wal_name_index "$bare" "$seg_bytes")" -lt "$cut_idx" ] && doomed+=("$name")
+    done < <(docker run --rm --entrypoint sh -v "$ARCHIVE_DIR:/archive:ro" "$sidecar" -c 'ls -1 /archive' 2>/dev/null)
+    if [ "${#doomed[@]}" -gt 0 ]; then
+        docker run --rm -u root --entrypoint sh -v "$ARCHIVE_DIR:/archive" "$sidecar" \
+            -c "rm -f $(printf '/archive/%q ' "${doomed[@]}")" \
+            || die "retention: could not remove segments from the archive (the bases and marks above were already retired)"
+        removed_segs=${#doomed[@]}
+    fi
+    ok "retention: kept the newest $KEEP base(s), line drawn at $cut_file - dropped $removed_bases base(s), $removed_marks mark(s), $removed_segs archived segment(s) no kept base could replay"
+}
+
 # --- pull ----------------------------------------------------------------------
 
 # Disaster recovery: bring back the newest instant the remote can PROVE - the
@@ -1410,6 +1505,7 @@ main() {
         check)  cmd_check;;
         verify) cmd_verify;;
         push)   cmd_push;;
+        prune)  cmd_prune;;
         pull)   cmd_pull;;
     esac
 }

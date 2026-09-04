@@ -53,6 +53,7 @@ age-keygen -o key.txt
 # ...and get the instant off the machine, chain and all:
 ./pitr.sh push  --base ./backups/app_..._base.json --mark ./backups/app_..._mark.json \
                 --archive /srv/wal-archive --remote bk@nas:/srv/pitr --keep 14
+./pitr.sh prune --db app --out ./backups --archive /srv/wal-archive --keep 7
 ./pitr.sh check --remote bk@nas:/srv/pitr
 ./pitr.sh pull  --db app --remote bk@nas:/srv/pitr --archive ./recovered-wal --out ./recovered
 
@@ -384,6 +385,8 @@ makes the binlog remote *more* treacherous than the WAL one:
 The fire drill is the same as the WAL's: mark, push, lose the machine —
 source, local archive, every manifest — pull, and the instant comes back
 exactly, arrival proven by content on a bare machine.
+
+Retention at **home** is the same line, drawn locally: `./pitr.sh prune --db app --out ./backups --archive /srv/wal-archive --keep 7` keeps the newest 7 base backups and retires everything below the oldest kept base's start segment — the older bases and their artefacts, the marks only they could prove, and the archived segments no kept base can replay (listed and removed through the same sidecar `push` stages through, because the archive lands 0600 as the server's uid). `pg_archivecleanup` draws that line for segments alone, given a `backup_label`; `prune` draws it from the manifest for segments, bases and marks together, refuses to guess when the kept base carries no `wal_start_file`, and refuses `--keep 0` (keeping nothing is not retention). Measured in the drill: after a second base and `--keep 1`, the first base and every segment below the new start were gone, `check --archive` stayed green, the newest mark still reproduced exactly — and the first mark, which only the retired base could prove, went with it.
 
 Retention at the binlog remote is `pitr.sh`'s rule with binlog names: `push --keep N` keeps the newest N anchored dumps **by name** and drops only what sits below the oldest kept dump's **anchor file** — the older dumps and their manifests, the binlog files only they needed, the marks only they could prove. A mark *in* the anchor file is kept (its position may still precede the anchor, and the file is the unit here); the prune runs after the mark landed, never before the receipt. Measured in the drill: after a rotation, a second dump and `--keep 1`, the remote lost the first dump and every binlog file below the new anchor, `check --remote` stayed green and the fire recovered the newest mark exactly.
 
