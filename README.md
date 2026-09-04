@@ -52,7 +52,7 @@ age-keygen -o key.txt
 
 # ...and get the instant off the machine, chain and all:
 ./pitr.sh push  --base ./backups/app_..._base.json --mark ./backups/app_..._mark.json \
-                --archive /srv/wal-archive --remote bk@nas:/srv/pitr
+                --archive /srv/wal-archive --remote bk@nas:/srv/pitr --keep 14
 ./pitr.sh check --remote bk@nas:/srv/pitr
 ./pitr.sh pull  --db app --remote bk@nas:/srv/pitr --archive ./recovered-wal --out ./recovered
 
@@ -317,6 +317,7 @@ artefact copies above don't — each one measured before `push`, `pull` and
 | The fire drill passed | **Rot past the mark leaves that mark's drill green.** Measured: with a segment rotted *after* mark 1's stop point, verify to mark 1 exits 0 with every fingerprint true — and verify to mark 2, straight through the rot, dies FATAL (`invalid magic number`). A passing recovery proves the chain it replayed, not the archive. Hence the mark's **inventory**: one sha256 per file, so `check --remote` can hash the remote's bytes against a recorded claim *today*, and `verify` refuses rot in its range in milliseconds instead of discovering it mid-replay. |
 | The archive was synced an hour ago | **An archive pushed at 12:00 cannot prove a 12:05 mark** — the mark's segment never travelled. Measured: recovery against the stale copy, newer mark named = refused, `missing segment ... the chain is broken here`. So the mark manifest travels **last**, behind everything it stands on: a mark at the remote is a receipt, and `pull` returns the newest instant the remote can *prove*, never the newest that merely exists. |
 | The segment is there, the "skip existing" sync is fast | **A killed upload leaves a partial under the segment's final name, and an exists-check never repairs it** — measured: 262 144 of 16 777 216 bytes squatting as the segment, invisible to `test -f`-style syncs forever. `push` uploads under a temporary name, has the **remote** hash it, renames only on a match — and re-ships anything whose remote hash disagrees with the inventory, because "the file is already there" is a claim about a name, not about bytes. |
+| Prune the WAL remote like the dump remote: keep the newest N files | **A WAL remote is chains, not files.** Every segment there is either below the oldest *kept* base's start (dead weight) or part of a chain a kept base needs — and neither a file count nor an mtime can tell the two apart. `push --keep N` keeps the newest N bases **by name** and drops only what sits below the oldest kept base's start segment on its timeline: the older bases and their manifests, the segments only they needed, the marks only they could prove; history files and other timelines stay, and the prune runs after the mark landed, never before the receipt. Measured in the drill: after `--keep 1` the remote lost the older base and every segment below the new base's start, `check --remote` stayed green and the fire recovered the newest mark exactly. |
 
 The protocol is offsite.sh's, applied per file: the same `rem_*` transports
 (ssh, or a mounted directory), upload to `.part`, hash at the remote, rename;

@@ -30,7 +30,7 @@
 #   ./pitr.sh check  --archive DIR [--container NAME]
 #   ./pitr.sh check  --remote REMOTE [--db NAME]
 #   ./pitr.sh verify --base FILE --mark FILE --archive DIR [--image IMAGE]
-#   ./pitr.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE
+#   ./pitr.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N]
 #   ./pitr.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
 #
 # Subcommands:
@@ -74,6 +74,13 @@
 #   --remote REMOTE   user@host:/path (ssh) or /path (a mounted disk) -
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
+#   --keep N          (push) after the push, keep the newest N base backups
+#                     at the remote and drop only what no kept base can
+#                     replay: older bases, the segments below the oldest
+#                     kept base's start, the marks only they could prove.
+#                     Decided by NAME and WAL arithmetic - never by mtime
+#                     or by counting files (a WAL remote is chains, not
+#                     files). History files and other timelines stay.
 #   --recipient KEY   (base) encrypt the base backup with age; KEY is an age
 #                     public key or a file of them. Requires --identity: a
 #                     base whose backup_label cannot be read is not a base,
@@ -107,6 +114,7 @@ KEEP_CONTAINER=0
 PROBE=""
 SCRATCH=""
 REMOTE=""
+KEEP=0
 SSH_OPTS_STR=""
 RECIPIENT=""
 IDENTITY=""
@@ -134,6 +142,7 @@ parse_args() {
             --timeout)        TIMEOUT="${2:-}"; shift 2;;
             --keep-container) KEEP_CONTAINER=1; shift;;
             --remote)         REMOTE="${2:-}"; shift 2;;
+            --keep)           KEEP="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
             --recipient)      RECIPIENT="${2:-}"; shift 2;;
             --identity)       IDENTITY="${2:-}"; shift 2;;
@@ -157,6 +166,11 @@ parse_args() {
     case "$TIMEOUT" in
         ''|*[!0-9]*) die "--timeout must be a non-negative integer, got '$TIMEOUT'";;
     esac
+    case "$KEEP" in
+        ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
+    esac
+    [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
+        || die "--keep belongs to push: retention happens where the copy lives, right after it arrived"
     if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
         die "identity file not found: $IDENTITY"
     fi
@@ -908,6 +922,87 @@ cmd_push() {
     upload_checked "$BASE_MANIFEST" "$(basename "$BASE_MANIFEST")" "$(sha256_of "$BASE_MANIFEST")"
     upload_checked "$MARK_MANIFEST" "$(basename "$MARK_MANIFEST")" "$(sha256_of "$MARK_MANIFEST")"
     ok "PUSHED: $pushed file(s) shipped, $skipped already proven at the remote - it can now prove '$(json_str "$MARK_MANIFEST" mark_name)'"
+    [ "$KEEP" -eq 0 ] || prune_remote_wal "$db"
+}
+
+# --- retention at the remote --------------------------------------------------
+
+# Retention for a WAL remote is NOT "keep the newest N files": every file there
+# is either part of a chain some kept base can replay, or dead weight, and the
+# line between the two is one number - the START segment of the OLDEST KEPT
+# base. Bases are counted by NAME (the stamp sorts; mtime is upload time -
+# offsite.sh's measured lesson), and everything below that start on its
+# timeline is unreachable from every kept base: the older bases and their
+# manifests, the segments only they needed, the marks only they could prove.
+# History files stay (tiny, and every timeline switch needs them) and segments
+# on OTHER timelines are left alone - nothing here can prove they are dead.
+# Runs only after the mark landed, so a prune never precedes the receipt.
+# Measured in the drill: after --keep 1 the remote lost the older base and
+# every segment below the new base's start, check --remote stayed green and
+# the fire recovered the newest mark exactly.
+prune_remote_wal() {
+    local db="$1" listing tmp total
+    local -a bases=() drop=()
+    listing=$(rem_list)
+    mapfile -t bases < <(printf '%s\n' "$listing" | grep -E "^${db}_.*_base\.json$" | LC_ALL=C sort || true)
+    total=${#bases[@]}
+    if [ "$total" -le "$KEEP" ]; then
+        ok "retention: $total base backup(s) at the remote, keeping up to $KEEP - nothing to drop"
+        return 0
+    fi
+    drop=("${bases[@]:0:$((total - KEEP))}")
+    local oldest_kept="${bases[$((total - KEEP))]}"
+    tmp=$(mktemp -d)
+    rem_get "$oldest_kept" "$tmp/oldest_kept.json" \
+        || { rm -rf "$tmp"; die "retention: could not read $oldest_kept back from the remote - nothing was dropped"; }
+    local cut_file cut_tl cut_idx seg_bytes
+    cut_file="$(json_str "$tmp/oldest_kept.json" wal_start_file)"
+    seg_bytes="$(json_num "$tmp/oldest_kept.json" wal_segment_bytes)"
+    if [ -z "$cut_file" ] || [ -z "$seg_bytes" ]; then
+        rm -rf "$tmp"
+        die "retention: $oldest_kept carries no wal_start_file/wal_segment_bytes - refusing to guess where the line is; nothing was dropped"
+    fi
+    cut_tl=$(wal_name_timeline "$cut_file")
+    cut_idx=$(wal_name_index "$cut_file" "$seg_bytes")
+
+    local name aname bare mfile removed_bases=0 removed_segs=0 removed_marks=0
+    for name in "${drop[@]}"; do
+        if rem_get "$name" "$tmp/drop.json" 2>/dev/null; then
+            aname="$(json_str "$tmp/drop.json" artefact)"
+            [ -z "$aname" ] || rem_delete "$aname"
+        else
+            warn "retention: could not read $name back - dropping the manifest only, its artefact may linger"
+        fi
+        rem_delete "$name"
+        removed_bases=$((removed_bases + 1))
+        warn "retention: removed base $name (and its artefact) - every kept base is newer"
+    done
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        bare="${name%.age}"
+        case "$bare" in
+            *.history) continue;;
+            "${db}_"*_mark.json)
+                rem_get "$name" "$tmp/mark.json" 2>/dev/null || continue
+                mfile="$(json_str "$tmp/mark.json" wal_file)"
+                [ -n "$mfile" ] || continue
+                [ "$(wal_name_timeline "$mfile")" = "$cut_tl" ] || continue
+                if [ "$(wal_name_index "$mfile" "$seg_bytes")" -lt "$cut_idx" ]; then
+                    rem_delete "$name"
+                    removed_marks=$((removed_marks + 1))
+                    warn "retention: removed mark $name - it points below $cut_file, where no kept base can reach"
+                fi;;
+            *)
+                [[ "$bare" =~ ^[0-9A-F]{24}$ ]] || continue
+                [ "$(wal_name_timeline "$bare")" = "$cut_tl" ] || continue
+                if [ "$(wal_name_index "$bare" "$seg_bytes")" -lt "$cut_idx" ]; then
+                    rem_delete "$name"
+                    removed_segs=$((removed_segs + 1))
+                fi;;
+        esac
+    done <<< "$listing"
+    rm -rf "$tmp"
+    ok "retention: kept the newest $KEEP base(s), line drawn at $cut_file - dropped $removed_bases base(s), $removed_segs segment(s), $removed_marks mark(s) no kept base could replay"
 }
 
 # --- pull ----------------------------------------------------------------------

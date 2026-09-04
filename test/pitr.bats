@@ -17,6 +17,7 @@ setup() {
     [[ "$output" == *"verify"* ]]
     [[ "$output" == *"--archive"* ]]
     [[ "$output" == *"--timeout"* ]]
+    [[ "$output" == *"--keep N"* ]]
     [[ "$output" == *"-h, --help"* ]]
 }
 
@@ -430,4 +431,16 @@ fabricate_pair() {
     [ "$status" -ne 0 ]
     [[ "$output" == *"records no ciphertext size"* ]]
     rm -rf "$tmp"
+}
+
+@test "pitr.sh --keep must be a non-negative integer" {
+    run bash "$REPO/pitr.sh" push --base /nonexistent --mark /nonexistent --archive /tmp --remote /tmp --keep many
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep must be a non-negative integer"* ]]
+}
+
+@test "pitr.sh --keep belongs to push, not to the other subcommands" {
+    run bash "$REPO/pitr.sh" check --remote /tmp --keep 3
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep belongs to push"* ]]
 }
