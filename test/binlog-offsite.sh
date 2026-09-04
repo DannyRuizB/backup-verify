@@ -104,6 +104,7 @@ if [ "$KIND" = ssh ]; then
     remote_rot()     { remote_sh "F=${REMOTE#*:}/$1; touch -r \$F /tmp/mt; printf XXXX | dd of=\$F bs=1 seek=200 conv=notrunc 2>/dev/null; touch -r /tmp/mt \$F"; }
     remote_plant()   { printf '%s' "$1" | remote_sh "cat > ${REMOTE#*:}/$2"; }
     remote_rm()      { remote_sh "rm -f ${REMOTE#*:}/$1"; }
+    remote_ls()      { remote_sh "find ${REMOTE#*:} -maxdepth 1 -type f" | sed 's|.*/||' | LC_ALL=C sort; }
 else
     REMOTE="$OUT/nas"
     OS=()
@@ -111,6 +112,7 @@ else
     remote_rot()     { local f="$REMOTE/$1"; touch -r "$f" "$OUT/mt"; printf XXXX | dd of="$f" bs=1 seek=200 conv=notrunc 2>/dev/null; touch -r "$OUT/mt" "$f"; }
     remote_plant()   { printf '%s' "$1" > "$REMOTE/$2"; }
     remote_rm()      { rm -f "$REMOTE/$1"; }
+    remote_ls()      { find "$REMOTE" -maxdepth 1 -type f | sed 's|.*/||' | LC_ALL=C sort; }
 fi
 
 traffic() {
@@ -257,7 +259,65 @@ fi
 remote_rm "binlog.000042.part"
 
 printf '\n'
-echo '== Case 6: the fire - source, archive and every local manifest destroyed =='
+echo '== Case 6: retention draws its line at the oldest KEPT anchored dump - never at a count or an mtime =='
+# A second anchored dump after a binlog rotation, more traffic, a fourth mark.
+# Pushing that pair with --keep 1 must drop the FIRST dump, its artefact and
+# every binlog file below the second dump's anchor - and nothing above it:
+# check --remote stays green and the fire (case 7) must still recover the
+# newest mark exactly.
+traffic case6a
+eng_query "$SRC" mysql 'FLUSH BINARY LOGS;' >/dev/null
+./binlog.sh base --container "$SRC" --db app --out "$BK" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/base2.log" 2>&1 \
+    || { fail_case 'the second anchored dump failed'; sed -n '1,10p' "$OUT/base2.log" | sed 's/^/        /'; }
+B2=$(find "$BK" -name '*_binlogbase.json' | LC_ALL=C sort | tail -1)
+traffic case6b
+eng_query "$SRC" mysql 'FLUSH BINARY LOGS;' >/dev/null
+traffic case6c
+./binlog.sh mark --container "$SRC" --db app --archive "$ARCHIVE" --out "$BK" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark4.log" 2>&1 \
+    || { fail_case 'the fourth mark failed'; sed -n '1,10p' "$OUT/mark4.log" | sed 's/^/        /'; }
+M4=$(find "$BK" -name '*_binlogmark.json' | LC_ALL=C sort | tail -1)
+CUT=$(json_str "$B2" anchor_file)
+OLD_ART=$(json_str "$B" artefact)
+# Same prefix and zero-padded indexes: lexical order IS chronological order.
+below_cut() { awk -v cut="$CUT" -v pfx="${CUT%.*}." 'index($0, pfx) == 1 { s = $0; sub(/\.age$/, "", s); if (s < cut) n++ } END { print n + 0 }'; }
+BELOW=$(remote_ls | below_cut)
+if [ "$B2" = "$B" ] || [ "$BELOW" -eq 0 ]; then
+    fail_case "could not set the scene: second dump $(basename "$B2"), $BELOW binlog file(s) below its anchor $CUT at the remote"
+fi
+if ./binlog.sh push --base "$B2" --mark "$M4" --archive "$ARCHIVE" --remote "$REMOTE" --keep 1 "${OS[@]}" >"$OUT/push6.log" 2>&1; then
+    LEFT=$(remote_ls)
+    STILL_BELOW=$(printf '%s\n' "$LEFT" | below_cut)
+    if ! printf '%s\n' "$LEFT" | grep -qxF "$(basename "$B")" && ! printf '%s\n' "$LEFT" | grep -qxF "$OLD_ART" \
+       && [ "$STILL_BELOW" -eq 0 ] && printf '%s\n' "$LEFT" | grep -qxF "$CUT$SFX" \
+       && printf '%s\n' "$LEFT" | grep -qxF "$(basename "$B2")" && printf '%s\n' "$LEFT" | grep -qxF "$(basename "$M4")"; then
+        pass_case "--keep 1 dropped the older dump, its artefact and $BELOW binlog file(s) below $CUT - and kept the new dump, its anchor file and the mark"
+    else
+        fail_case "retention removed the wrong things (files still below the cut: $STILL_BELOW; old dump still there: $(printf '%s\n' "$LEFT" | grep -cxF "$(basename "$B")"))"
+        sed -n '1,25p' "$OUT/push6.log" | sed 's/^/        /'
+    fi
+    M1_FILE=$(json_str "$M1" mark_file)
+    if [[ "$M1_FILE" < "$CUT" ]]; then
+        if printf '%s\n' "$LEFT" | grep -qxF "$(basename "$M1")"; then
+            fail_case "mark $(basename "$M1") points at $M1_FILE, below the cut, and survived the prune"
+        else
+            pass_case "the mark below the cut ($(basename "$M1") at $M1_FILE) went with the dump that alone could prove it"
+        fi
+    else
+        pass_case "mark $(basename "$M1") sits at $M1_FILE, not below the cut $CUT - kept (reachable from the kept dump)"
+    fi
+    if ./binlog.sh check --remote "$REMOTE" "${OS[@]}" >"$OUT/check6.log" 2>&1; then
+        pass_case 'check --remote stays green after the prune: the line was drawn where a kept dump anchors, not where a count ran out'
+    else
+        fail_case 'check --remote failed after retention - the prune cut into a chain a kept dump needs'
+        sed -n '1,25p' "$OUT/check6.log" | sed 's/^/        /'
+    fi
+else
+    fail_case 'the push with --keep 1 failed'
+    sed -n '1,25p' "$OUT/push6.log" | sed 's/^/        /'
+fi
+
+printf '\n'
+echo '== Case 7: the fire - source, archive and every local manifest destroyed =='
 log "DESTROYING the source, the local archive and the local backups (this is the whole point)"
 docker rm -f "$SRC" >/dev/null 2>&1
 rm -rf "$ARCHIVE" "$BK"

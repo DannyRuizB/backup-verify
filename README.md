@@ -385,6 +385,8 @@ The fire drill is the same as the WAL's: mark, push, lose the machine —
 source, local archive, every manifest — pull, and the instant comes back
 exactly, arrival proven by content on a bare machine.
 
+Retention at the binlog remote is `pitr.sh`'s rule with binlog names: `push --keep N` keeps the newest N anchored dumps **by name** and drops only what sits below the oldest kept dump's **anchor file** — the older dumps and their manifests, the binlog files only they needed, the marks only they could prove. A mark *in* the anchor file is kept (its position may still precede the anchor, and the file is the unit here); the prune runs after the mark landed, never before the receipt. Measured in the drill: after a rotation, a second dump and `--keep 1`, the remote lost the first dump and every binlog file below the new anchor, `check --remote` stayed green and the fire recovered the newest mark exactly.
+
 ### And the binlog is your rows too
 
 The WAL measurement repeats here almost verbatim — a seeded email address

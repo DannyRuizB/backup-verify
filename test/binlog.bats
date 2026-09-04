@@ -19,6 +19,7 @@ setup() {
     [[ "$output" == *"--tools"* ]]
     [[ "$output" == *"--archive"* ]]
     [[ "$output" == *"-h, --help"* ]]
+    [[ "$output" == *"--keep N"* ]]
 }
 
 @test "binlog.sh refuses to run without a subcommand, and names unknown ones" {
@@ -419,4 +420,16 @@ fabricate_pair() {
     [[ "$output" != *"disagrees about GTID mode"* ]]
     [[ "$output" == *"missing binlog.000003"* ]]
     rm -rf "$tmp"
+}
+
+@test "binlog.sh --keep must be a non-negative integer" {
+    run bash "$REPO/binlog.sh" push --base /nonexistent --mark /nonexistent --archive /tmp --remote /tmp --keep many
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep must be a non-negative integer"* ]]
+}
+
+@test "binlog.sh --keep belongs to push, not to the other subcommands" {
+    run bash "$REPO/binlog.sh" check --remote /tmp --keep 3
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep belongs to push"* ]]
 }

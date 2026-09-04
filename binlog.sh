@@ -53,7 +53,7 @@
 #   ./binlog.sh check  --remote REMOTE [--db NAME]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
 #                      [--image IMAGE] [--identity FILE]
-#   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE
+#   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N]
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
 #
 # Subcommands:
@@ -107,6 +107,12 @@
 #   --remote REMOTE   user@host:/path (ssh) or /path (a mounted disk) -
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
+#   --keep N          (push) after the push, keep the newest N anchored dumps
+#                     at the remote and drop only what no kept dump can
+#                     replay: older dumps, the binlog files below the oldest
+#                     kept dump's anchor, the marks only they could prove.
+#                     Decided by NAME and binlog arithmetic - never by mtime
+#                     or by counting files (pitr.sh's rule, binlog names).
 #   -h, --help        this help
 #
 # Exit codes: 0 the claim was proven, non-zero otherwise. A mark or a base
@@ -128,6 +134,7 @@ IMAGE=""
 LABEL=""
 TIMEOUT=90
 KEEP_CONTAINER=0
+KEEP=0
 TOOLS_DIR=""
 PROBE=""
 REMOTE=""
@@ -158,6 +165,7 @@ parse_args() {
             --timeout)        TIMEOUT="${2:-}"; shift 2;;
             --tools)          TOOLS_DIR="${2:-}"; shift 2;;
             --remote)         REMOTE="${2:-}"; shift 2;;
+            --keep)           KEEP="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
             --recipient)      RECIPIENT="${2:-}"; shift 2;;
             --identity)       IDENTITY="${2:-}"; shift 2;;
@@ -169,6 +177,11 @@ parse_args() {
     case "$TIMEOUT" in
         ''|*[!0-9]*) die "--timeout must be a non-negative integer, got '$TIMEOUT'";;
     esac
+    case "$KEEP" in
+        ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
+    esac
+    [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
+        || die "--keep belongs to push: retention happens where the copy lives, right after it arrived"
     # base needs no archive: the dump carries its anchor, the binlogs come
     # with the first mark. A remote check audits the off-site copy; pull
     # CREATES its archive directory - disaster recovery starts with nothing.
@@ -845,6 +858,81 @@ cmd_push() {
     upload_checked "$BASE_MANIFEST" "$(basename "$BASE_MANIFEST")" "$(sha256_of "$BASE_MANIFEST")"
     upload_checked "$MARK_MANIFEST" "$(basename "$MARK_MANIFEST")" "$(sha256_of "$MARK_MANIFEST")"
     ok "PUSHED: $pushed file(s) shipped, $skipped already proven at the remote - it can now prove $mark_file:$mark_pos${sfx:+ (ciphertext end to end; the key never travelled)}"
+    [ "$KEEP" -eq 0 ] || prune_remote_binlog "$db"
+}
+
+# --- retention at the remote --------------------------------------------------
+
+# pitr.sh's rule with binlog names: a binlog remote is CHAINS, not files. Every
+# file there is either part of a chain some kept anchored dump can replay, or
+# dead weight, and the line between the two is one number - the anchor file of
+# the OLDEST KEPT dump. Dumps are counted by NAME (the stamp sorts; mtime is
+# upload time), and everything below that anchor is unreachable from every
+# kept dump: the older dumps and their manifests, the binlog files only they
+# needed, the marks only they could prove. A mark IN the anchor file is kept
+# (its position may still precede the anchor, and a file is the unit here).
+# Runs only after the mark landed, so a prune never precedes the receipt.
+prune_remote_binlog() {
+    local db="$1" listing tmp total
+    local -a bases=() drop=()
+    listing=$(rem_list)
+    mapfile -t bases < <(printf '%s\n' "$listing" | grep -E "^${db}_.*_binlogbase\.json$" | LC_ALL=C sort || true)
+    total=${#bases[@]}
+    if [ "$total" -le "$KEEP" ]; then
+        ok "retention: $total anchored dump(s) at the remote, keeping up to $KEEP - nothing to drop"
+        return 0
+    fi
+    drop=("${bases[@]:0:$((total - KEEP))}")
+    local oldest_kept="${bases[$((total - KEEP))]}"
+    tmp=$(mktemp -d)
+    rem_get "$oldest_kept" "$tmp/oldest_kept.json" \
+        || { rm -rf "$tmp"; die "retention: could not read $oldest_kept back from the remote - nothing was dropped"; }
+    local cut_file cut_prefix cut_idx
+    cut_file="$(json_str "$tmp/oldest_kept.json" anchor_file)"
+    if [ -z "$cut_file" ]; then
+        rm -rf "$tmp"
+        die "retention: $oldest_kept carries no anchor_file - refusing to guess where the line is; nothing was dropped"
+    fi
+    cut_prefix=$(binlog_prefix_of "$cut_file")
+    cut_idx=$(binlog_index_of "$cut_file")
+
+    local name aname bare mfile idx removed_bases=0 removed_files=0 removed_marks=0
+    for name in "${drop[@]}"; do
+        if rem_get "$name" "$tmp/drop.json" 2>/dev/null; then
+            aname="$(json_str "$tmp/drop.json" artefact)"
+            [ -z "$aname" ] || rem_delete "$aname"
+        else
+            warn "retention: could not read $name back - dropping the manifest only, its artefact may linger"
+        fi
+        rem_delete "$name"
+        removed_bases=$((removed_bases + 1))
+        warn "retention: removed anchored dump $name (and its artefact) - every kept dump is newer"
+    done
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        bare="${name%.age}"
+        case "$bare" in
+            "${db}_"*_binlogmark.json)
+                rem_get "$name" "$tmp/mark.json" 2>/dev/null || continue
+                mfile="$(json_str "$tmp/mark.json" mark_file)"
+                [ -n "$mfile" ] || continue
+                [ "$(binlog_prefix_of "$mfile")" = "$cut_prefix" ] || continue
+                if [ "$(binlog_index_of "$mfile")" -lt "$cut_idx" ]; then
+                    rem_delete "$name"
+                    removed_marks=$((removed_marks + 1))
+                    warn "retention: removed mark $name - it points below $cut_file, where no kept dump can reach"
+                fi;;
+            "$cut_prefix".*)
+                idx="${bare##*.}"
+                [[ "$idx" =~ ^[0-9]+$ ]] || continue
+                if [ "$(binlog_index_of "$bare")" -lt "$cut_idx" ]; then
+                    rem_delete "$name"
+                    removed_files=$((removed_files + 1))
+                fi;;
+        esac
+    done <<< "$listing"
+    rm -rf "$tmp"
+    ok "retention: kept the newest $KEEP anchored dump(s), line drawn at $cut_file - dropped $removed_bases dump(s), $removed_files binlog file(s), $removed_marks mark(s) no kept dump could replay"
 }
 
 # --- pull ----------------------------------------------------------------------
