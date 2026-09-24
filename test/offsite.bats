@@ -172,7 +172,7 @@ setup() {
 
 # ---- retention by age (--keep-days): the pure decision ------------------------
 # Four pairs on days 1, 5, 9 and 10 of September; "now" is pinned with
-# OFFSITE_NOW so the tests never depend on the clock.
+# BV_NOW so the tests never depend on the clock.
 retention_names() {
     printf '%s\n' app_20260910T000000Z.tar.gz app_20260901T000000Z.tar.gz \
                   app_20260909T000000Z.tar.gz app_20260905T000000Z.tar.gz
@@ -204,24 +204,24 @@ NOW_SEP10_NOON=1789041600   # 2026-09-10T12:00:00Z
 
 @test "--keep-days alone: pairs older than the window go, by NAME stamp" {
     # window 3 days back from Sep 10 12:00 = Sep 7 12:00: days 1 and 5 go
-    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=3 OFFSITE_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=3 BV_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
     [ "$status" -eq 0 ]
     [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz)" ]
 }
 
 @test "backups that stopped: age never removes the newest pair" {
     # a month later, every pair is out of a 7-day window - the newest stays
-    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=7 OFFSITE_NOW=$((NOW_SEP10_NOON + 30 * 86400)); $(declare -f retention_names); retention_names | retention_victims"
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=7 BV_NOW=$((NOW_SEP10_NOON + 30 * 86400)); $(declare -f retention_names); retention_names | retention_victims"
     [ "$status" -eq 0 ]
     [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz app_20260909T000000Z.tar.gz)" ]
 }
 
 @test "--keep and --keep-days together: a pair survives if EITHER keeps it" {
     # newest 3 (5, 9, 10) or under 1 day old (10): only day 1 goes
-    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=3 KEEP_DAYS=1 OFFSITE_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=3 KEEP_DAYS=1 BV_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
     [ "$output" = "app_20260901T000000Z.tar.gz" ]
     # newest 1 or under 3 days old (9, 10): days 1 and 5 go
-    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=1 KEEP_DAYS=3 OFFSITE_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=1 KEEP_DAYS=3 BV_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
     [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz)" ]
 }
 
@@ -234,12 +234,12 @@ NOW_SEP10_NOON=1789041600   # 2026-09-10T12:00:00Z
 }
 
 @test "a pair whose name carries no stamp is never aged out" {
-    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=1 OFFSITE_NOW=$NOW_SEP10_NOON; printf '%s\n' app_manual-copy.tar.gz app_20260901T000000Z.tar.gz app_20260910T000000Z.tar.gz | retention_victims"
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=1 BV_NOW=$NOW_SEP10_NOON; printf '%s\n' app_manual-copy.tar.gz app_20260901T000000Z.tar.gz app_20260910T000000Z.tar.gz | retention_victims"
     [ "$output" = "app_20260901T000000Z.tar.gz" ]
 }
 
 @test "a single pair is never a victim, whatever the rules" {
-    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=1 OFFSITE_NOW=$((NOW_SEP10_NOON + 400 * 86400)); printf '%s\n' app_20260901T000000Z.tar.gz | retention_victims"
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=1 BV_NOW=$((NOW_SEP10_NOON + 400 * 86400)); printf '%s\n' app_20260901T000000Z.tar.gz | retention_victims"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }

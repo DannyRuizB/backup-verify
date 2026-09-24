@@ -92,6 +92,50 @@ name_stamp() {
     if [[ "$stamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then printf '%s' "$stamp"; fi
 }
 
+# Retention, as a pure decision: no filesystem, no remote (the bats tests call
+# it directly, and backup.sh's local retention and offsite.sh's remote one
+# share it - two copies of "which backups go" would drift). Reads
+# the pair names of ONE database on stdin, prints the ones to delete, oldest
+# first. A pair is KEPT when any rule keeps it:
+#   * it is among the newest $KEEP (when KEEP > 0);
+#   * its name stamp is not older than now - $KEEP_DAYS days (when
+#     KEEP_DAYS > 0), "now" being $BV_NOW (epoch seconds) if set - the
+#     drills use it to age a backup without waiting a week;
+#   * it is the newest pair of all: age alone never removes the last copy.
+#     Backups that silently stopped a month ago plus a 7-day window would
+#     otherwise delete every copy the remote still has - retention by age is
+#     only safe when something new keeps arriving, and nothing guarantees it.
+# A name with no stamp where backup.sh puts one is not this database's pair
+# (see below) or not one backup.sh made: it is neither counted nor deleted.
+retention_victims() {
+    local -a sorted=()
+    local name cutoff="" total i stamp
+    # Only names with a stamp right after "DB_" belong to this database: a
+    # sibling database "app_prod" also matches the "app_" prefix, and its
+    # pairs sort AFTER every "app_2026..." one - counted, they would take the
+    # "newest" slots and --keep 1 on app deleted every copy of app (measured
+    # on the pre-fix code). They are not counted and never touched.
+    while IFS= read -r name; do
+        [ -n "$(name_stamp "$name")" ] && sorted+=("$name")
+    done < <(sort)
+    total=${#sorted[@]}
+    [ "$total" -gt 1 ] || return 0
+    local keep="${KEEP:-0}" keep_days="${KEEP_DAYS:-0}"
+    if [ "$keep_days" -gt 0 ]; then
+        cutoff=$(date -u -d "@$(( ${BV_NOW:-$(date -u +%s)} - keep_days * 86400 ))" +%Y%m%dT%H%M%SZ)
+    fi
+    for ((i = 0; i < total - 1; i++)); do
+        name="${sorted[$i]}"
+        # newest KEEP: index total-KEEP and up
+        if [ "$keep" -gt 0 ] && [ "$i" -ge $((total - keep)) ]; then continue; fi
+        stamp=$(name_stamp "$name")
+        if [ -n "$cutoff" ] && [[ ! "$stamp" < "$cutoff" ]]; then continue; fi
+        # With only --keep-days, an old pair goes; with only --keep, a pair
+        # outside the newest N goes; with both, only what neither keeps.
+        printf '%s\n' "$name"
+    done
+}
+
 # Manifest path for an artefact, encrypted or not, whatever the engine's
 # extension. One place so the mapping cannot drift between the two scripts.
 manifest_for() {
