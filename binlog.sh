@@ -963,6 +963,10 @@ cmd_prune() {
     mapfile -t all < <(find "$OUT_DIR" -maxdepth 1 -name "${DB}_*_binlogbase.json" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
     local name
     for name in ${all[@]+"${all[@]}"}; do
+        # a sibling database ("app_prod" for app) matches the glob; counted,
+        # its base could become "the oldest kept" and draw the line in the
+        # WRONG archive. Only names stamped right after DB_ are this one's.
+        [ -n "$(name_stamp "$name")" ] || continue
         [ "$(json_str "$OUT_DIR/$name" kind)" = "binlog-base" ] && dumps+=("$name")
     done
     local total=${#dumps[@]}
@@ -988,6 +992,7 @@ cmd_prune() {
     done
     while IFS= read -r name; do
         [ -n "$name" ] || continue
+        [ -n "$(name_stamp "$name")" ] || continue   # not a sibling's mark
         [ "$(json_str "$OUT_DIR/$name" kind)" = "binlog-mark" ] || continue
         mfile="$(json_str "$OUT_DIR/$name" mark_file)"
         [ -n "$mfile" ] || continue

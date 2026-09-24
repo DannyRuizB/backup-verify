@@ -441,3 +441,17 @@ INSERT INTO t VALUES(1"
     [ "$output" = "1" ]
     rm -f "$tmp"
 }
+
+@test "local retention never counts (or deletes) a sibling database sharing the prefix" {
+    # app_prod matches the app_ glob and sorts after every app_2026* name:
+    # counted, it took the newest slot and --keep 1 deleted app's own backup
+    d="$BATS_TEST_TMPDIR/out"; mkdir -p "$d"
+    for n in app_20260901T000000Z app_20260905T000000Z app_prod_20260920T000000Z; do
+        : > "$d/$n.tar.gz"; echo '{}' > "$d/$n.json"
+    done
+    run bash -c "source '$REPO/backup.sh'; DB=app KEEP=1 OUT_DIR='$d'; load_engine files; prune_old"
+    [ "$status" -eq 0 ]
+    [ ! -e "$d/app_20260901T000000Z.tar.gz" ]
+    [ -e "$d/app_20260905T000000Z.tar.gz" ]
+    [ -e "$d/app_prod_20260920T000000Z.tar.gz" ]
+}

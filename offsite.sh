@@ -24,7 +24,7 @@
 # stamps), never by mtime.
 #
 # Usage:
-#   ./offsite.sh push  --manifest FILE --remote REMOTE [--keep N]
+#   ./offsite.sh push  --manifest FILE --remote REMOTE [--keep N] [--keep-days D]
 #   ./offsite.sh pull  --db NAME --remote REMOTE [--out DIR]
 #   ./offsite.sh check --remote REMOTE [--db NAME]
 #
@@ -50,6 +50,11 @@
 #   --out DIR         where pull writes (default ./restored; never overwrites)
 #   --keep N          after a push, keep only the newest N pairs of this
 #                     database AT THE REMOTE - decided by name, never mtime
+#   --keep-days D     after a push, also keep every pair whose NAME stamp is
+#                     less than D days old. With --keep, a pair survives if
+#                     EITHER rule keeps it. The newest pair is never removed
+#                     by age: backups that stopped must not age away the
+#                     last copy.
 #   --ssh-opts STR    extra ssh options, e.g. '-p 2222 -i ~/.ssh/backup_key'
 #   -h, --help        this help
 #
@@ -66,6 +71,7 @@ REMOTE=""
 DB=""
 OUT_DIR="./restored"
 KEEP=0
+KEEP_DAYS=0
 SSH_OPTS_STR=""
 
 usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -84,6 +90,7 @@ parse_args() {
             --db)       DB="${2:-}"; shift 2;;
             --out)      OUT_DIR="${2:-}"; shift 2;;
             --keep)     KEEP="${2:-0}"; shift 2;;
+            --keep-days) KEEP_DAYS="${2:-0}"; shift 2;;
             --ssh-opts) SSH_OPTS_STR="${2:-}"; shift 2;;
             -h|--help)  usage 0;;
             *)          printf 'unknown option: %s\n' "$1" >&2; usage 1;;
@@ -92,6 +99,9 @@ parse_args() {
     [ -n "$REMOTE" ] || die "--remote is required"
     case "$KEEP" in
         ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
+    esac
+    case "$KEEP_DAYS" in
+        ''|*[!0-9]*) die "--keep-days must be a non-negative integer, got '$KEEP_DAYS'";;
     esac
     case "$SUBCMD" in
         push) [ -n "$MANIFEST" ] || die "push needs --manifest (which backup to send)";;
@@ -110,10 +120,52 @@ parse_args() {
 # so one re-uploaded old backup would make "delete the oldest by mtime"
 # delete the newest backup instead. Only artefact+manifest PAIRS count,
 # mirroring backup.sh's local retention.
+
+# Pure decision, no remote involved (the bats tests call it directly): reads
+# the pair names of ONE database on stdin, prints the ones to delete, oldest
+# first. A pair is KEPT when any rule keeps it:
+#   * it is among the newest $KEEP (when KEEP > 0);
+#   * its name stamp is not older than now - $KEEP_DAYS days (when
+#     KEEP_DAYS > 0), "now" being $OFFSITE_NOW (epoch seconds) if set - the
+#     drill uses it to age a backup without waiting a week;
+#   * it is the newest pair of all: age alone never removes the last copy.
+#     Backups that silently stopped a month ago plus a 7-day window would
+#     otherwise delete every copy the remote still has - retention by age is
+#     only safe when something new keeps arriving, and nothing guarantees it.
+# A name with no stamp where backup.sh puts one is not this database's pair
+# (see below) or not one backup.sh made: it is neither counted nor deleted.
+retention_victims() {
+    local -a sorted=()
+    local name cutoff="" total i stamp
+    # Only names with a stamp right after "DB_" belong to this database: a
+    # sibling database "app_prod" also matches the "app_" prefix, and its
+    # pairs sort AFTER every "app_2026..." one - counted, they would take the
+    # "newest" slots and --keep 1 on app deleted every copy of app (measured
+    # on the pre-fix code). They are not counted and never touched.
+    while IFS= read -r name; do
+        [ -n "$(name_stamp "$name")" ] && sorted+=("$name")
+    done < <(sort)
+    total=${#sorted[@]}
+    [ "$total" -gt 1 ] || return 0
+    if [ "$KEEP_DAYS" -gt 0 ]; then
+        cutoff=$(date -u -d "@$(( ${OFFSITE_NOW:-$(date -u +%s)} - KEEP_DAYS * 86400 ))" +%Y%m%dT%H%M%SZ)
+    fi
+    for ((i = 0; i < total - 1; i++)); do
+        name="${sorted[$i]}"
+        # newest KEEP: index total-KEEP and up
+        if [ "$KEEP" -gt 0 ] && [ "$i" -ge $((total - KEEP)) ]; then continue; fi
+        stamp=$(name_stamp "$name")
+        if [ -n "$cutoff" ] && [[ ! "$stamp" < "$cutoff" ]]; then continue; fi
+        # With only --keep-days, an old pair goes; with only --keep, a pair
+        # outside the newest N goes; with both, only what neither keeps.
+        printf '%s\n' "$name"
+    done
+}
+
 prune_remote() {
-    [ "$KEEP" -gt 0 ] || return 0
-    local listing name total to_delete i
-    local -a pairs=() sorted=()
+    [ "$KEEP" -gt 0 ] || [ "$KEEP_DAYS" -gt 0 ] || return 0
+    local listing name total victim removed=0
+    local -a pairs=()
     listing=$(rem_list)
     while IFS= read -r name; do
         [ -n "$name" ] || continue
@@ -127,15 +179,17 @@ prune_remote() {
         fi
     done <<< "$listing"
     total=${#pairs[@]}
-    [ "$total" -gt "$KEEP" ] || { ok "retention: $total pair(s) at the remote, keeping up to $KEEP"; return 0; }
-    while IFS= read -r name; do sorted+=("$name"); done < <(printf '%s\n' "${pairs[@]}" | sort)
-    to_delete=$((total - KEEP))
-    for ((i = 0; i < to_delete; i++)); do
-        rem_delete "${sorted[$i]}"
-        rem_delete "$(manifest_for "${sorted[$i]}")"
-        warn "retention: removed ${sorted[$i]} (and its manifest) from the remote"
-    done
-    ok "retention: kept the newest $KEEP of $total at the remote"
+    local rule="newest $KEEP"
+    if [ "$KEEP" -gt 0 ] && [ "$KEEP_DAYS" -gt 0 ]; then rule="newest $KEEP or under $KEEP_DAYS day(s) old"
+    elif [ "$KEEP_DAYS" -gt 0 ]; then rule="under $KEEP_DAYS day(s) old (and always the newest)"; fi
+    while IFS= read -r victim; do
+        [ -n "$victim" ] || continue
+        rem_delete "$victim"
+        rem_delete "$(manifest_for "$victim")"
+        warn "retention: removed $victim (and its manifest) from the remote"
+        removed=$((removed + 1))
+    done < <(printf '%s\n' "${pairs[@]}" | retention_victims)
+    ok "retention: kept $((total - removed)) of $total at the remote ($rule)"
 }
 
 push_pair() {
@@ -175,6 +229,9 @@ pull_pair() {
         case "$name" in
             *.part) continue;;
             "${DB}_"*.json)
+                # the stamp check keeps a sibling ("app_prod" for app) out: its
+                # names sort after app's and would be pulled as "the newest"
+                [ -n "$(name_stamp "$name")" ] || continue
                 if [ -z "$newest" ] || [ "$name" \> "$newest" ]; then newest="$name"; fi;;
         esac
     done <<< "$listing"
@@ -233,6 +290,7 @@ check_remote() {
         # --db narrows the audit; everything else at the remote is ignored.
         if [ -n "$DB" ]; then
             case "$name" in "${DB}_"*) ;; *) continue;; esac
+            [ -n "$(name_stamp "$name")" ] || continue   # not a sibling's pair
         fi
         case "$name" in
             *.part)

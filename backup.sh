@@ -165,6 +165,10 @@ prune_old() {
     # rather than the unexpanded pattern.
     shopt -s nullglob
     for d in "$OUT_DIR/${DB}_"*"$ENG_ARTEFACT_EXT" "$OUT_DIR/${DB}_"*"$ENG_ARTEFACT_EXT$ENC_SUFFIX"; do
+        # a sibling database ("app_prod" for app) matches the glob and sorts
+        # after app's names: counted, it takes the "newest" slots and --keep
+        # deletes app's own backups. Only names stamped right after DB_ count.
+        [ -n "$(name_stamp "$(basename "$d")")" ] || continue
         [ -f "$(manifest_for "$d")" ] && dumps+=("$d")
     done
     shopt -u nullglob

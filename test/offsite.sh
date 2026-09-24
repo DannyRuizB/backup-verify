@@ -98,12 +98,12 @@ fi
 # Returns the manifest path. sleep 1.1 where a case needs DISTINCT stamps:
 # artefact names carry second-resolution UTC stamps.
 mk_backup() {
-    local dest="$1" src
+    local dest="$1" db="${2:-app}" src
     src=$(mktemp -d "$OUT/srcXXXXXX")
     seed_files "$src"
-    ./backup.sh --engine files --path "$src" --db app --out "$dest" >/dev/null
+    ./backup.sh --engine files --path "$src" --db "$db" --out "$dest" >/dev/null
     rm -rf "$src"
-    find "$dest" -name '*.json' | sort | tail -1
+    find "$dest" -name "${db}_[0-9]*.json" | sort | tail -1
 }
 
 printf '\n'
@@ -345,6 +345,58 @@ if command -v sqlite3 >/dev/null 2>&1; then
     fi
 else
     fail_case 'sqlite3 is not installed - case 7 cannot run (the CI installs it; do the same locally)'
+fi
+printf '\n'
+
+echo '== Case 8: a sibling database shares the prefix, and retention by age keeps the last copy =='
+# "app_prod" matches the "app_" prefix and its names sort AFTER every
+# "app_2026..." one. Measured on the pre-fix code: counted as app's pairs, it
+# took the "newest" slot - push --keep 1 for app deleted EVERY copy of app,
+# and pull --db app brought back app_prod's backup instead.
+BK8=$(mktemp -d "$OUT/bk8XXXXXX")
+R8="$BASE/case8"
+MA1=$(mk_backup "$BK8" app); sleep 1.1
+MP1=$(mk_backup "$BK8" app_prod); sleep 1.1
+MA2=$(mk_backup "$BK8" app); sleep 1.1
+MA3=$(mk_backup "$BK8" app)
+./offsite.sh push --manifest "$MA1" --remote "$R8" "${OS[@]}" >/dev/null 2>&1
+./offsite.sh push --manifest "$MP1" --remote "$R8" "${OS[@]}" >/dev/null 2>&1
+./offsite.sh push --manifest "$MA2" --remote "$R8" --keep 1 "${OS[@]}" >"$OUT/c8-keep.log" 2>&1
+LISTING=$(remote_ls "$R8")
+if ! printf '%s\n' "$LISTING" | grep -q "$(basename "$MA1" .json)" \
+   && printf '%s\n' "$LISTING" | grep -q "$(basename "$MA2" .json)" \
+   && printf '%s\n' "$LISTING" | grep -q "$(basename "$MP1" .json)"; then
+    pass_case '--keep 1 for app kept the newest app pair and never touched app_prod'
+else
+    fail_case 'retention for app counted (or deleted) the wrong database'
+    printf '%s\n' "$LISTING" | sed 's/^/        /'
+fi
+if ./offsite.sh pull --db app --remote "$R8" --out "$OUT/restored8" "${OS[@]}" >"$OUT/c8-pull.log" 2>&1 \
+   && [ "$(json_str "$(find "$OUT/restored8" -name '*.json' | head -1)" database)" = app ]; then
+    pass_case 'pull --db app brought back an app backup, not the sibling that sorts after it'
+else
+    fail_case "pull --db app brought back the wrong database: $(find "$OUT/restored8" -name '*.json' -printf '%f ' 2>/dev/null)"
+fi
+# Retention by age, a month from now: every app pair is out of a 7-day
+# window, but the newest is kept - backups that stop must not age away the
+# last copy. app_prod is out of the window too and still untouched.
+OFFSITE_NOW=$(( $(date -u +%s) + 30 * 86400 )) \
+    ./offsite.sh push --manifest "$MA3" --remote "$R8" --keep-days 7 "${OS[@]}" >"$OUT/c8-age.log" 2>&1
+LISTING=$(remote_ls "$R8")
+if ! printf '%s\n' "$LISTING" | grep -q "$(basename "$MA2" .json)" \
+   && printf '%s\n' "$LISTING" | grep -q "$(basename "$MA3" .json)" \
+   && printf '%s\n' "$LISTING" | grep -q "$(basename "$MP1" .json)"; then
+    pass_case '--keep-days 7 a month later: the old app pair went, the newest stayed, app_prod untouched'
+else
+    fail_case 'retention by age removed the wrong pairs'
+    printf '%s\n' "$LISTING" | sed 's/^/        /'
+    sed -n '1,12p' "$OUT/c8-age.log" | sed 's/^/        /'
+fi
+if ./offsite.sh check --remote "$R8" "${OS[@]}" >"$OUT/c8-check.log" 2>&1; then
+    pass_case 'check: every pair left at the remote still matches its manifest'
+else
+    fail_case 'check failed after retention'
+    sed -n '1,12p' "$OUT/c8-check.log" | sed 's/^/        /'
 fi
 printf '\n'
 
