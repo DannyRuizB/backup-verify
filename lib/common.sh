@@ -80,6 +80,18 @@ load_engine() {
 # shellcheck disable=SC2034  # used by backup.sh/verify.sh, which source this
 ENC_SUFFIX=".age"
 
+# The UTC stamp of a backup name ($DB_YYYYmmddTHHMMSSZ[_label]...), or nothing
+# when the name has no stamp right after "$DB_". That is also the test for
+# "this name belongs to $DB": a sibling database "app_prod" matches the
+# "app_" glob, but "prod_..." is no stamp. Retention and "the newest" both
+# sort by name, and a sibling's names sort AFTER every "app_2026..." one.
+name_stamp() {
+    local rest="${1#"${DB}_"}" stamp
+    [ "$rest" != "$1" ] || return 0
+    stamp="${rest:0:16}"
+    if [[ "$stamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then printf '%s' "$stamp"; fi
+}
+
 # Manifest path for an artefact, encrypted or not, whatever the engine's
 # extension. One place so the mapping cannot drift between the two scripts.
 manifest_for() {

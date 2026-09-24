@@ -39,7 +39,7 @@ age-keygen -o key.txt
 ./verify.sh --manifest ./backups/app_....json --identity key.txt
 
 # off-site, with the REMOTE hashing what actually landed:
-./offsite.sh push  --manifest ./backups/app_....json --remote bk@nas:/srv/backups --keep 14
+./offsite.sh push  --manifest ./backups/app_....json --remote bk@nas:/srv/backups --keep 14 --keep-days 30
 ./offsite.sh check --remote bk@nas:/srv/backups
 ./offsite.sh pull  --db app --remote bk@nas:/srv/backups --out ./restored
 
@@ -226,6 +226,8 @@ end) before `offsite.sh` was written:
 | The file is there, the size looks right | **A killed upload leaves a partial file under its final name** — measured: 261 120 bytes of a 10 485 760-byte artefact, sitting at the destination as if it were the backup. Every "is the file there?" check signs it off. |
 | `stat` at the remote agrees with the manifest | **A full remote disk produced a file with the RIGHT apparent size and the wrong bytes** — `stat` reported the full 1 048 576 (exactly what the manifest promises), `du` showed 256K of real blocks. Even a size comparison lies here; only hashing *at the remote* disagreed. |
 | Prune "the oldest" at the remote by mtime | **A remote mtime is the upload time, not the backup time** (measured: scp stamps "now"). Re-upload one old backup — after a restore drill, say — and it becomes the "newest" file on the remote: an mtime-based prune then deletes the genuinely newest backup and keeps January's. |
+| `--keep 1` for `app` keeps the newest backup of `app` | **Not when a sibling database shares the prefix.** `app_prod`'s names match the `app_` glob and sort *after* every `app_2026…` name, so counted as `app`'s they took the "newest" slots — measured on the pre-fix code: `push --db app --keep 1` deleted **every** copy of `app` and kept `app_prod`'s, and `pull --db app` brought back `app_prod`'s backup instead. The same glob sat in `backup.sh`'s local retention and in the local `prune` of `pitr.sh`/`binlog.sh` (where a sibling's base could draw the WAL/binlog line). A name now belongs to a database only when a UTC stamp follows `DB_` directly — case 8 plants the sibling. |
+| "Keep 7 days" is a safe retention policy | **Only while new backups keep arriving.** When the backup job silently stops, an age window keeps moving and every copy eventually falls out of it — the retention step, running on the last successful push, deletes the last copies. `--keep-days D` therefore never removes the **newest** pair by age, and ages pairs by the stamp in their **name** (the upload's mtime is the wrong clock, measured above). |
 | `pg_dump \| ssh nas 'cat > backup.sql'` exits 0 | The straight-to-NAS pipe from every tutorial: with the dump **failing**, the pipeline's status is the remote `cat`'s — a 20-byte file with a final-looking name lands at the remote and the cron reports success. The gzip lie, with a network in the middle. |
 | The drill ran one engine; the protocol is "engine-agnostic", so the rest are covered | **Engine-agnostic by construction is not engine-tested.** Case 7 runs the fourth engine through the same fire: push the SQLite `.dump`, burn the source database and every local copy, pull, restore into a scratch database — and then truncate the pulled dump the way a dying upload would, which `verify` must **refuse** (the hash disagrees first; the closing `COMMIT` is the parse gate behind it). Half a database is not a backup, whatever the exit code says. |
 
@@ -247,9 +249,13 @@ Hence `offsite.sh`'s protocol, suspicious in both directions:
   it vouches for. In-place rot, artefacts no manifest vouches for, and crashed
   uploads (`.part` leftovers) are all named. `check` proves the remote holds the
   right bytes; only `verify.sh` proves those bytes restore.
-- Retention at the remote (`--keep N`) counts complete pairs and decides **by
-  name** — names carry sortable UTC stamps — never by mtime, for the measured
-  reason above.
+- Retention at the remote (`--keep N`, `--keep-days D`) counts complete pairs
+  and decides **by name** — names carry sortable UTC stamps — never by mtime,
+  for the measured reason above. With both flags a pair survives if **either**
+  rule keeps it (`restic`'s `--keep-last` + `--keep-within` semantics), the
+  newest pair is never aged out, and a name without a stamp right after `DB_`
+  (a sibling database's, or one `backup.sh` did not make) is neither counted
+  nor deleted.
 
 A remote is `user@host:/path` (ssh, key-based — the far end needs only a POSIX
 shell and `sha256sum`, busybox qualifies) or a plain `/path` (a mounted NAS or
@@ -516,8 +522,10 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   failing `check` from the manifest alone, with `pull` refusing to hand the
   corrupt bytes over (and cleaning up what it fetched); a full remote disk
   failing the push with nothing plausible left behind; retention pruning by
-  name while the re-uploaded old backup's mtime says "newest"; and the
-  encrypted chain through the same fire. The ssh run boots a real sshd in
+  name while the re-uploaded old backup's mtime says "newest"; the
+  encrypted chain through the same fire; and a sibling database sharing the
+  prefix, which retention and `pull` must ignore, plus retention by age a
+  month into the future (via `OFFSITE_NOW`), which must keep the newest pair. The ssh run boots a real sshd in
   Docker (with a 256K tmpfs for the disk-full case); the dir run drives the
   same protocol against a local directory, the mounted-NAS case.
 - **`test/pitr.sh [--encrypted]`** — the point-in-time fire drill: seed, base

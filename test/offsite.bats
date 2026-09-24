@@ -169,3 +169,77 @@ setup() {
     run bash -c "grep -v '^ *#' '$REPO/lib/remote_ssh.sh' | grep -c 'scp \|rsync ' || true"
     [ "$output" = "0" ]
 }
+
+# ---- retention by age (--keep-days): the pure decision ------------------------
+# Four pairs on days 1, 5, 9 and 10 of September; "now" is pinned with
+# OFFSITE_NOW so the tests never depend on the clock.
+retention_names() {
+    printf '%s\n' app_20260910T000000Z.tar.gz app_20260901T000000Z.tar.gz \
+                  app_20260909T000000Z.tar.gz app_20260905T000000Z.tar.gz
+}
+NOW_SEP10_NOON=1789041600   # 2026-09-10T12:00:00Z
+
+@test "offsite.sh rejects a non-numeric --keep-days" {
+    run bash -c "source '$REPO/offsite.sh'; parse_args push --manifest m --remote /tmp/r --keep-days week"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep-days must be a non-negative integer"* ]]
+}
+
+@test "--help documents --keep-days and the newest-pair guarantee" {
+    run bash "$REPO/offsite.sh" --help
+    [[ "$output" == *"--keep-days D"* ]]
+    [[ "$output" == *"never removed"* ]]
+}
+
+@test "the pinned now really is 2026-09-10 12:00 UTC" {
+    run date -u -d "@$NOW_SEP10_NOON" +%Y%m%dT%H%M%SZ
+    [ "$output" = "20260910T120000Z" ]
+}
+
+@test "--keep N alone: everything outside the newest N goes, oldest first" {
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=2 KEEP_DAYS=0; $(declare -f retention_names); retention_names | retention_victims"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz)" ]
+}
+
+@test "--keep-days alone: pairs older than the window go, by NAME stamp" {
+    # window 3 days back from Sep 10 12:00 = Sep 7 12:00: days 1 and 5 go
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=3 OFFSITE_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz)" ]
+}
+
+@test "backups that stopped: age never removes the newest pair" {
+    # a month later, every pair is out of a 7-day window - the newest stays
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=7 OFFSITE_NOW=$((NOW_SEP10_NOON + 30 * 86400)); $(declare -f retention_names); retention_names | retention_victims"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz app_20260909T000000Z.tar.gz)" ]
+}
+
+@test "--keep and --keep-days together: a pair survives if EITHER keeps it" {
+    # newest 3 (5, 9, 10) or under 1 day old (10): only day 1 goes
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=3 KEEP_DAYS=1 OFFSITE_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
+    [ "$output" = "app_20260901T000000Z.tar.gz" ]
+    # newest 1 or under 3 days old (9, 10): days 1 and 5 go
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=1 KEEP_DAYS=3 OFFSITE_NOW=$NOW_SEP10_NOON; $(declare -f retention_names); retention_names | retention_victims"
+    [ "$output" = "$(printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz)" ]
+}
+
+@test "a sibling database sharing the prefix is neither counted nor touched" {
+    # app_prod_* matches "app_" and sorts after every app_2026*: counted, it
+    # took the newest slot and --keep 1 deleted every copy of app (pre-fix)
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=1 KEEP_DAYS=0; printf '%s\n' app_20260901T000000Z.tar.gz app_20260905T000000Z.tar.gz app_prod_20260920T000000Z.tar.gz | retention_victims"
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_20260901T000000Z.tar.gz" ]
+}
+
+@test "a pair whose name carries no stamp is never aged out" {
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=1 OFFSITE_NOW=$NOW_SEP10_NOON; printf '%s\n' app_manual-copy.tar.gz app_20260901T000000Z.tar.gz app_20260910T000000Z.tar.gz | retention_victims"
+    [ "$output" = "app_20260901T000000Z.tar.gz" ]
+}
+
+@test "a single pair is never a victim, whatever the rules" {
+    run bash -c "source '$REPO/offsite.sh'; DB=app KEEP=0 KEEP_DAYS=1 OFFSITE_NOW=$((NOW_SEP10_NOON + 400 * 86400)); printf '%s\n' app_20260901T000000Z.tar.gz | retention_victims"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
