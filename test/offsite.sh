@@ -380,7 +380,7 @@ fi
 # Retention by age, a month from now: every app pair is out of a 7-day
 # window, but the newest is kept - backups that stop must not age away the
 # last copy. app_prod is out of the window too and still untouched.
-OFFSITE_NOW=$(( $(date -u +%s) + 30 * 86400 )) \
+BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) \
     ./offsite.sh push --manifest "$MA3" --remote "$R8" --keep-days 7 "${OS[@]}" >"$OUT/c8-age.log" 2>&1
 LISTING=$(remote_ls "$R8")
 if ! printf '%s\n' "$LISTING" | grep -q "$(basename "$MA2" .json)" \

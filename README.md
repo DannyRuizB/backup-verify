@@ -20,7 +20,7 @@ deliberately broken backups to prove the checks actually catch them — on every
 engine.
 
 ```bash
-./backup.sh --container my-postgres --db app --out ./backups --keep 7
+./backup.sh --container my-postgres --db app --out ./backups --keep 7 --keep-days 14
 ./verify.sh --manifest ./backups/app_20260803T120447Z.json
 
 # MySQL / MariaDB: same promise, same gates
@@ -455,7 +455,7 @@ interface.)
 fails is deleted, an artefact below a floor size is deleted, and an archive
 that does not parse (`pg_restore --list`; for MySQL, the header plus the
 trailing `Dump completed` line an interrupted dump never writes) is deleted.
-`--keep N` prunes old backups, counting only complete artefact+manifest pairs.
+`--keep N` prunes old backups, counting only complete artefact+manifest pairs; `--keep-days D` keeps everything whose **name** stamp is under D days old (with both, a backup survives if either keeps it — the same `retention_victims` decision `offsite.sh` applies at the remote, one function in `lib/common.sh` for both), and **the newest backup is never removed by age**: a backup job that silently stops must not age away the last local copy either.
 
 **`verify.sh`** runs six gates, in cost order:
 
@@ -525,7 +525,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   name while the re-uploaded old backup's mtime says "newest"; the
   encrypted chain through the same fire; and a sibling database sharing the
   prefix, which retention and `pull` must ignore, plus retention by age a
-  month into the future (via `OFFSITE_NOW`), which must keep the newest pair. The ssh run boots a real sshd in
+  month into the future (via `BV_NOW`), which must keep the newest pair. The ssh run boots a real sshd in
   Docker (with a 256K tmpfs for the disk-full case); the dir run drives the
   same protocol against a local directory, the mounted-NAS case.
 - **`test/pitr.sh [--encrypted]`** — the point-in-time fire drill: seed, base

@@ -455,3 +455,46 @@ INSERT INTO t VALUES(1"
     [ -e "$d/app_20260905T000000Z.tar.gz" ]
     [ -e "$d/app_prod_20260920T000000Z.tar.gz" ]
 }
+
+# ---- local retention by age (--keep-days) ------------------------------------
+@test "backup.sh rejects a non-numeric --keep-days, and --help documents it" {
+    run bash -c "source '$REPO/backup.sh'; parse_args --container c --db app --keep-days week"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep-days must be a non-negative integer"* ]]
+    run bash "$REPO/backup.sh" --help
+    [[ "$output" == *"--keep-days D"* ]]
+    [[ "$output" == *"never removed by age"* ]]
+}
+
+@test "local --keep-days removes backups older than the window by NAME, and never the newest" {
+    d="$BATS_TEST_TMPDIR/out"; mkdir -p "$d"
+    for n in app_20260901T000000Z app_20260905T000000Z app_20260909T000000Z app_20260910T000000Z; do
+        : > "$d/$n.tar.gz"; echo '{}' > "$d/$n.json"
+    done
+    # 3-day window back from 2026-09-10T12:00Z: days 1 and 5 go
+    run bash -c "source '$REPO/backup.sh'; DB=app KEEP=0 KEEP_DAYS=3 BV_NOW=1789041600 OUT_DIR='$d'; load_engine files; prune_old"
+    [ "$status" -eq 0 ]
+    [ ! -e "$d/app_20260901T000000Z.tar.gz" ] && [ ! -e "$d/app_20260905T000000Z.json" ]
+    [ -e "$d/app_20260909T000000Z.tar.gz" ] && [ -e "$d/app_20260910T000000Z.tar.gz" ]
+    [[ "$output" == *"kept 2 of 4"* ]]
+    # a month later everything is out of the window: only the newest stays
+    run bash -c "source '$REPO/backup.sh'; DB=app KEEP=0 KEEP_DAYS=3 BV_NOW=$((1789041600 + 30 * 86400)) OUT_DIR='$d'; load_engine files; prune_old"
+    [ ! -e "$d/app_20260909T000000Z.tar.gz" ]
+    [ -e "$d/app_20260910T000000Z.tar.gz" ] && [ -e "$d/app_20260910T000000Z.json" ]
+}
+
+@test "backup.sh end to end: --keep-days a month ahead keeps only the backup it just made" {
+    src="$BATS_TEST_TMPDIR/src"; out="$BATS_TEST_TMPDIR/bk"; mkdir -p "$src"
+    echo hello > "$src/a.txt"
+    bash "$REPO/backup.sh" --engine files --path "$src" --db app --out "$out" >/dev/null 2>&1
+    sleep 1.1
+    bash "$REPO/backup.sh" --engine files --path "$src" --db app --out "$out" >/dev/null 2>&1
+    [ "$(find "$out" -name 'app_*.json' | wc -l)" -eq 2 ]
+    newest=$(find "$out" -name 'app_*.json' -printf '%f\n' | sort | tail -1)
+    sleep 1.1
+    run env BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) bash "$REPO/backup.sh" --engine files --path "$src" --db app --out "$out" --keep-days 7
+    [ "$status" -eq 0 ]
+    [ "$(find "$out" -name 'app_*.json' | wc -l)" -eq 1 ]
+    [ ! -e "$out/$newest" ]
+    [[ "$output" == *"kept 1 of 3"* ]]
+}

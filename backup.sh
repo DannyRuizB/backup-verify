@@ -10,8 +10,8 @@
 # --routines forced, because it omits them by default and says nothing).
 #
 # Usage:
-#   ./backup.sh --container <name> --db <database> [--out DIR] [--keep N]
-#   ./backup.sh --engine files --path <directory> [--out DIR] [--keep N]
+#   ./backup.sh --container <name> --db <database> [--out DIR] [--keep N] [--keep-days D]
+#   ./backup.sh --engine files --path <directory> [--out DIR] [--keep N] [--keep-days D]
 #
 # Options:
 #   --engine NAME      postgres (default), mysql or files
@@ -21,6 +21,9 @@
 #                      the manifest defaults to its basename (--db overrides)
 #   --out DIR          output directory (default ./backups)
 #   --keep N           keep only the N most recent backups of this database
+#   --keep-days D      also keep every backup whose NAME stamp is under D days
+#                      old; with --keep, a backup survives if EITHER rule keeps
+#                      it, and the newest is never removed by age
 #   --label TEXT       extra label in the artefact name
 #   --recipient KEY    encrypt with age; KEY is an age public key or a file of
 #                      recipients. The plaintext dump NEVER touches disk.
@@ -44,6 +47,7 @@ DB=""
 SRC_PATH=""
 OUT_DIR="./backups"
 KEEP=0
+KEEP_DAYS=0
 LABEL=""
 RECIPIENT=""
 IDENTITY=""
@@ -59,6 +63,7 @@ parse_args() {
             --path)      SRC_PATH="${2:-}"; shift 2;;
             --out)       OUT_DIR="${2:-}"; shift 2;;
             --keep)      KEEP="${2:-0}"; shift 2;;
+            --keep-days) KEEP_DAYS="${2:-0}"; shift 2;;
             --label)     LABEL="${2:-}"; shift 2;;
             --recipient) RECIPIENT="${2:-}"; shift 2;;
             --identity)  IDENTITY="${2:-}"; shift 2;;
@@ -86,6 +91,9 @@ parse_args() {
     [ -n "$DB" ] || die "--db is required"
     case "$KEEP" in
         ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
+    esac
+    case "$KEEP_DAYS" in
+        ''|*[!0-9]*) die "--keep-days must be a non-negative integer, got '$KEEP_DAYS'";;
     esac
     if [ -n "$IDENTITY" ] && [ -z "$RECIPIENT" ]; then
         die "--identity only makes sense with --recipient (there is nothing to decrypt)"
@@ -152,13 +160,15 @@ EOF
     ok "manifest written: $count ${ENG_UNIT} fingerprint(s) + $(printf '%s' "$SCHEMA_CLASSES" | wc -w) object class(es)"
 }
 
-# Delete the oldest artefacts of THIS database, keeping the newest N. Only
-# artefact+manifest pairs are considered, so a half-written pair is never
-# counted as a keeper.
+# Local retention: which backups of THIS database go is retention_victims'
+# decision (lib/common.sh - the same one offsite.sh applies at the remote):
+# the newest --keep N, anything under --keep-days D old by its NAME stamp,
+# never the newest by age. Only artefact+manifest pairs are considered, so a
+# half-written pair is never counted as a keeper.
 prune_old() {
-    [ "$KEEP" -gt 0 ] || return 0
+    [ "$KEEP" -gt 0 ] || [ "$KEEP_DAYS" -gt 0 ] || return 0
     local -a dumps=()
-    local d
+    local d victim removed=0
     # The glob goes straight into the `for`: assigning it to a variable stores
     # it LITERALLY (shellcheck SC2125) and only works by accident through word
     # splitting. nullglob so a database with no backups yet yields nothing
@@ -169,20 +179,20 @@ prune_old() {
         # after app's names: counted, it takes the "newest" slots and --keep
         # deletes app's own backups. Only names stamped right after DB_ count.
         [ -n "$(name_stamp "$(basename "$d")")" ] || continue
-        [ -f "$(manifest_for "$d")" ] && dumps+=("$d")
+        [ -f "$(manifest_for "$d")" ] && dumps+=("$(basename "$d")")
     done
     shopt -u nullglob
     local total=${#dumps[@]}
-    [ "$total" -gt "$KEEP" ] || { ok "retention: $total backup(s) on disk, keeping up to $KEEP"; return 0; }
-    # Names carry a sortable UTC timestamp, so lexical order is chronological.
-    local -a sorted=()
-    while IFS= read -r d; do sorted+=("$d"); done < <(printf '%s\n' "${dumps[@]}" | sort)
-    local to_delete=$((total - KEEP)) i
-    for ((i = 0; i < to_delete; i++)); do
-        rm -f -- "${sorted[$i]}" "$(manifest_for "${sorted[$i]}")"
-        warn "retention: removed $(basename "${sorted[$i]}") (and its manifest)"
-    done
-    ok "retention: kept the newest $KEEP of $total"
+    while IFS= read -r victim; do
+        [ -n "$victim" ] || continue
+        rm -f -- "$OUT_DIR/$victim" "$(manifest_for "$OUT_DIR/$victim")"
+        warn "retention: removed $victim (and its manifest)"
+        removed=$((removed + 1))
+    done < <(if [ "$total" -gt 0 ]; then printf '%s\n' "${dumps[@]}" | retention_victims; fi)
+    local rule="newest $KEEP"
+    if [ "$KEEP" -gt 0 ] && [ "$KEEP_DAYS" -gt 0 ]; then rule="newest $KEEP or under $KEEP_DAYS day(s) old"
+    elif [ "$KEEP_DAYS" -gt 0 ]; then rule="under $KEEP_DAYS day(s) old (and always the newest)"; fi
+    ok "retention: kept $((total - removed)) of $total backup(s) on disk ($rule)"
 }
 
 main() {
