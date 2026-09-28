@@ -243,3 +243,12 @@ NOW_SEP10_NOON=1789041600   # 2026-09-10T12:00:00Z
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
+
+@test "retention_rule says in words what retention_victims applies" {
+    run bash -c "source '$REPO/offsite.sh'; KEEP=3 KEEP_DAYS=0 retention_rule"
+    [ "$output" = "newest 3" ]
+    run bash -c "source '$REPO/offsite.sh'; KEEP=0 KEEP_DAYS=7 retention_rule"
+    [ "$output" = "under 7 day(s) old (and always the newest)" ]
+    run bash -c "source '$REPO/offsite.sh'; KEEP=2 KEEP_DAYS=7 retention_rule"
+    [ "$output" = "newest 2 or under 7 day(s) old" ]
+}

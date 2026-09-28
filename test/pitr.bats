@@ -439,6 +439,41 @@ fabricate_pair() {
     [[ "$output" == *"--keep must be a non-negative integer"* ]]
 }
 
+@test "pitr.sh --keep-days must be a non-negative integer" {
+    run bash "$REPO/pitr.sh" push --base /nonexistent --mark /nonexistent --archive /tmp --remote /tmp --keep-days week
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep-days must be a non-negative integer"* ]]
+}
+
+@test "pitr.sh --keep-days belongs to push only (not check, not the local prune)" {
+    run bash "$REPO/pitr.sh" check --remote /tmp --keep-days 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep-days belongs to push"* ]]
+    run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp --keep 1 --keep-days 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--keep-days belongs to push"* ]]
+}
+
+@test "pitr.sh --help documents --keep-days" {
+    run bash "$REPO/pitr.sh" --help
+    [[ "$output" == *"--keep-days D"* ]]
+    [[ "$output" == *"never removed by age"* ]]
+}
+
+@test "pitr.sh remote retention by age: _base.json names go through retention_victims; the sibling and the newest stay" {
+    # 2026-09-10T12:00Z pinned; bases on Sep 1, 5 and 9, plus a sibling
+    # database whose name also starts with "app_".
+    run bash -c "source '$REPO/pitr.sh'; printf '%s\n' app_20260901T000000Z_base.json app_20260905T000000Z_base.json \
+        app_20260909T000000Z_base.json app_prod_20260801T000000Z_base.json | LC_ALL=C sort \
+        | DB=app KEEP=0 KEEP_DAYS=3 BV_NOW=1789041600 retention_victims"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(printf '%s\n' app_20260901T000000Z_base.json app_20260905T000000Z_base.json)" ]
+    # a month on, age alone would take everything: the newest stays
+    run bash -c "source '$REPO/pitr.sh'; printf '%s\n' app_20260901T000000Z_base.json app_20260909T000000Z_base.json \
+        | DB=app KEEP=0 KEEP_DAYS=3 BV_NOW=1791633600 retention_victims"
+    [ "$output" = "app_20260901T000000Z_base.json" ]
+}
+
 @test "pitr.sh --keep belongs to push, not to the other subcommands" {
     run bash "$REPO/pitr.sh" check --remote /tmp --keep 3
     [ "$status" -ne 0 ]

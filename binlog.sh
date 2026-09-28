@@ -53,7 +53,7 @@
 #   ./binlog.sh check  --remote REMOTE [--db NAME]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
 #                      [--image IMAGE] [--identity FILE]
-#   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N]
+#   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
 #   ./binlog.sh prune  --db NAME --out DIR --archive DIR --keep N
 #
@@ -118,6 +118,11 @@
 #                     kept dump's anchor, the marks only they could prove.
 #                     Decided by NAME and binlog arithmetic - never by mtime
 #                     or by counting files (pitr.sh's rule, binlog names).
+#   --keep-days D     (push) also keep every anchored dump whose NAME stamp
+#                     is under D days old; with --keep, a dump survives if
+#                     EITHER rule keeps it (offsite.sh's rule, the same
+#                     function). The newest is never removed by age, and the
+#                     line is still drawn by the oldest dump that survives.
 #   -h, --help        this help
 #
 # Exit codes: 0 the claim was proven, non-zero otherwise. A mark or a base
@@ -140,6 +145,7 @@ LABEL=""
 TIMEOUT=90
 KEEP_CONTAINER=0
 KEEP=0
+KEEP_DAYS=0
 TOOLS_DIR=""
 PROBE=""
 REMOTE=""
@@ -171,6 +177,7 @@ parse_args() {
             --tools)          TOOLS_DIR="${2:-}"; shift 2;;
             --remote)         REMOTE="${2:-}"; shift 2;;
             --keep)           KEEP="${2:-}"; shift 2;;
+            --keep-days)      KEEP_DAYS="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
             --recipient)      RECIPIENT="${2:-}"; shift 2;;
             --identity)       IDENTITY="${2:-}"; shift 2;;
@@ -185,6 +192,11 @@ parse_args() {
     case "$KEEP" in
         ''|*[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'";;
     esac
+    case "$KEEP_DAYS" in
+        ''|*[!0-9]*) die "--keep-days must be a non-negative integer, got '$KEEP_DAYS'";;
+    esac
+    [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] \
+        || die "--keep-days belongs to push (remote retention by age)"
     [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
         || [ "$SUBCMD" = prune ] || die "--keep belongs to push (remote retention) and prune (local retention)"
     # base needs no archive: the dump carries its anchor, the binlogs come
@@ -868,7 +880,7 @@ cmd_push() {
     upload_checked "$BASE_MANIFEST" "$(basename "$BASE_MANIFEST")" "$(sha256_of "$BASE_MANIFEST")"
     upload_checked "$MARK_MANIFEST" "$(basename "$MARK_MANIFEST")" "$(sha256_of "$MARK_MANIFEST")"
     ok "PUSHED: $pushed file(s) shipped, $skipped already proven at the remote - it can now prove $mark_file:$mark_pos${sfx:+ (ciphertext end to end; the key never travelled)}"
-    [ "$KEEP" -eq 0 ] || prune_remote_binlog "$db"
+    if [ "$KEEP" -gt 0 ] || [ "$KEEP_DAYS" -gt 0 ]; then prune_remote_binlog "$db"; fi
 }
 
 # --- retention at the remote --------------------------------------------------
@@ -886,14 +898,27 @@ prune_remote_binlog() {
     local db="$1" listing tmp total
     local -a bases=() drop=()
     listing=$(rem_list)
-    mapfile -t bases < <(printf '%s\n' "$listing" | grep -E "^${db}_.*_binlogbase\.json$" | LC_ALL=C sort || true)
+    local -a all=()
+    mapfile -t all < <(printf '%s\n' "$listing" | grep -E "^${db}_.*_binlogbase\.json$" | LC_ALL=C sort || true)
+    # Only names with a stamp right after "db_" are this database's: a
+    # sibling "app_prod" also matches "app_" (retention_victims' lesson).
+    local b
+    for b in "${all[@]}"; do
+        if [ -n "$(DB="$db" name_stamp "$b")" ]; then bases+=("$b"); fi
+    done
     total=${#bases[@]}
-    if [ "$total" -le "$KEEP" ]; then
-        ok "retention: $total anchored dump(s) at the remote, keeping up to $KEEP - nothing to drop"
+    # Which go is retention_victims' decision (--keep N, --keep-days D, the
+    # newest never by age), shared with offsite.sh. Both rules keep a SUFFIX
+    # of the sorted list, so the victims are always its oldest prefix and the
+    # line is still drawn by the first survivor.
+    if [ "$total" -gt 0 ]; then
+        mapfile -t drop < <(printf '%s\n' "${bases[@]}" | DB="$db" retention_victims)
+    fi
+    if [ "${#drop[@]}" -eq 0 ]; then
+        ok "retention: $total anchored dump(s) at the remote, keeping $(retention_rule) - nothing to drop"
         return 0
     fi
-    drop=("${bases[@]:0:$((total - KEEP))}")
-    local oldest_kept="${bases[$((total - KEEP))]}"
+    local oldest_kept="${bases[${#drop[@]}]}"
     tmp=$(mktemp -d)
     rem_get "$oldest_kept" "$tmp/oldest_kept.json" \
         || { rm -rf "$tmp"; die "retention: could not read $oldest_kept back from the remote - nothing was dropped"; }
@@ -942,7 +967,7 @@ prune_remote_binlog() {
         esac
     done <<< "$listing"
     rm -rf "$tmp"
-    ok "retention: kept the newest $KEEP anchored dump(s), line drawn at $cut_file - dropped $removed_bases dump(s), $removed_files binlog file(s), $removed_marks mark(s) no kept dump could replay"
+    ok "retention: kept $((total - ${#drop[@]})) of $total anchored dump(s) ($(retention_rule)), line drawn at $cut_file - dropped $removed_bases dump(s), $removed_files binlog file(s), $removed_marks mark(s) no kept dump could replay"
 }
 
 # --- prune (local retention) ------------------------------------------------------

@@ -284,13 +284,32 @@ BELOW=$(remote_ls | below_cut)
 if [ "$B2" = "$B" ] || [ "$BELOW" -eq 0 ]; then
     fail_case "could not set the scene: second dump $(basename "$B2"), $BELOW binlog file(s) below its anchor $CUT at the remote"
 fi
-if ./binlog.sh push --base "$B2" --mark "$M4" --archive "$ARCHIVE" --remote "$REMOTE" --keep 1 "${OS[@]}" >"$OUT/push6.log" 2>&1; then
+# --keep-days alone, at the real clock: both dumps are minutes old, so the
+# window keeps them both and nothing goes - age never removes what is younger
+# than the window. (The push itself still ships the new dump and mark.)
+if ./binlog.sh push --base "$B2" --mark "$M4" --archive "$ARCHIVE" --remote "$REMOTE" --keep-days 7 "${OS[@]}" >"$OUT/push6a.log" 2>&1; then
+    LEFT=$(remote_ls)
+    if printf '%s\n' "$LEFT" | grep -qxF "$(basename "$B")" && printf '%s\n' "$LEFT" | grep -qxF "$(basename "$B2")" \
+       && [ "$(printf '%s\n' "$LEFT" | below_cut)" -eq "$BELOW" ] && grep -q 'nothing to drop' "$OUT/push6a.log"; then
+        pass_case "--keep-days 7 at the real clock kept both dumps and all $BELOW binlog file(s) below $CUT - nothing is old enough to go"
+    else
+        fail_case '--keep-days 7 at the real clock dropped something younger than the window'
+        sed -n '1,25p' "$OUT/push6a.log" | sed 's/^/        /'
+    fi
+else
+    fail_case 'the push with --keep-days 7 failed'
+    sed -n '1,25p' "$OUT/push6a.log" | sed 's/^/        /'
+fi
+# Then both rules a month on (BV_NOW, the drills' clock): --keep 1 keeps the
+# newest, --keep-days 7 keeps nothing else - their union is the newest alone,
+# so the line lands exactly where --keep 1 alone would draw it.
+if BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) ./binlog.sh push --base "$B2" --mark "$M4" --archive "$ARCHIVE" --remote "$REMOTE" --keep 1 --keep-days 7 "${OS[@]}" >"$OUT/push6.log" 2>&1; then
     LEFT=$(remote_ls)
     STILL_BELOW=$(printf '%s\n' "$LEFT" | below_cut)
     if ! printf '%s\n' "$LEFT" | grep -qxF "$(basename "$B")" && ! printf '%s\n' "$LEFT" | grep -qxF "$OLD_ART" \
        && [ "$STILL_BELOW" -eq 0 ] && printf '%s\n' "$LEFT" | grep -qxF "$CUT$SFX" \
        && printf '%s\n' "$LEFT" | grep -qxF "$(basename "$B2")" && printf '%s\n' "$LEFT" | grep -qxF "$(basename "$M4")"; then
-        pass_case "--keep 1 dropped the older dump, its artefact and $BELOW binlog file(s) below $CUT - and kept the new dump, its anchor file and the mark"
+        pass_case "--keep 1 --keep-days 7, a month on, dropped the older dump, its artefact and $BELOW binlog file(s) below $CUT - and kept the new dump, its anchor file and the mark"
     else
         fail_case "retention removed the wrong things (files still below the cut: $STILL_BELOW; old dump still there: $(printf '%s\n' "$LEFT" | grep -cxF "$(basename "$B")"))"
         sed -n '1,25p' "$OUT/push6.log" | sed 's/^/        /'
@@ -312,7 +331,7 @@ if ./binlog.sh push --base "$B2" --mark "$M4" --archive "$ARCHIVE" --remote "$RE
         sed -n '1,25p' "$OUT/check6.log" | sed 's/^/        /'
     fi
 else
-    fail_case 'the push with --keep 1 failed'
+    fail_case 'the push with --keep 1 --keep-days 7 failed'
     sed -n '1,25p' "$OUT/push6.log" | sed 's/^/        /'
 fi
 
