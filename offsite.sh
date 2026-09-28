@@ -138,9 +138,8 @@ prune_remote() {
         fi
     done <<< "$listing"
     total=${#pairs[@]}
-    local rule="newest $KEEP"
-    if [ "$KEEP" -gt 0 ] && [ "$KEEP_DAYS" -gt 0 ]; then rule="newest $KEEP or under $KEEP_DAYS day(s) old"
-    elif [ "$KEEP_DAYS" -gt 0 ]; then rule="under $KEEP_DAYS day(s) old (and always the newest)"; fi
+    local rule
+    rule=$(retention_rule)
     while IFS= read -r victim; do
         [ -n "$victim" ] || continue
         rem_delete "$victim"

@@ -136,6 +136,15 @@ retention_victims() {
     done
 }
 
+# The rule retention_victims applies, in words, for the log line that reports
+# what a retention pass kept.
+retention_rule() {
+    local keep="${KEEP:-0}" keep_days="${KEEP_DAYS:-0}"
+    if [ "$keep" -gt 0 ] && [ "$keep_days" -gt 0 ]; then printf 'newest %s or under %s day(s) old' "$keep" "$keep_days"
+    elif [ "$keep_days" -gt 0 ]; then printf 'under %s day(s) old (and always the newest)' "$keep_days"
+    else printf 'newest %s' "$keep"; fi
+}
+
 # Manifest path for an artefact, encrypted or not, whatever the engine's
 # extension. One place so the mapping cannot drift between the two scripts.
 manifest_for() {
