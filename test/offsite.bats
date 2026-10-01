@@ -16,6 +16,7 @@ setup() {
     [[ "$output" == *"check"* ]]
     [[ "$output" == *"--remote"* ]]
     [[ "$output" == *"--keep"* ]]
+    [[ "$output" == *"--max-age"* ]]
     [[ "$output" == *"--ssh-opts"* ]]
     [[ "$output" == *"-h, --help"* ]]
 }
@@ -252,3 +253,44 @@ NOW_SEP10_NOON=1789041600   # 2026-09-10T12:00:00Z
     run bash -c "source '$REPO/offsite.sh'; KEEP=2 KEEP_DAYS=7 retention_rule"
     [ "$output" = "newest 2 or under 7 day(s) old" ]
 }
+
+# --- check --max-age: backups that stopped --------------------------------
+
+@test "stale_databases: a database whose newest pair is past the window is reported" {
+    # Sep 10 12:00, 7 days: app's newest (Sep 9) is fresh, its old pairs do
+    # not count; web stopped on Aug 20
+    run bash -c "source '$REPO/offsite.sh'; BV_NOW=$NOW_SEP10_NOON; printf '%s\n' app_20260801T000000Z.json app_20260909T000000Z.json web_20260815T000000Z.json web_20260820T000000Z.json | stale_databases 7"
+    [ "$status" -eq 0 ]
+    [ "$output" = "web 20260820T000000Z" ]
+}
+
+@test "stale_databases: a sibling sharing the prefix is its own database" {
+    # app_prod is a month behind; app is fresh - neither hides the other
+    run bash -c "source '$REPO/offsite.sh'; BV_NOW=$NOW_SEP10_NOON; printf '%s\n' app_20260909T000000Z.json app_prod_20260801T000000Z.json app_prod_20260810T000000Z_full.json | stale_databases 7"
+    [ "$output" = "app_prod 20260810T000000Z" ]
+    run bash -c "source '$REPO/offsite.sh'; BV_NOW=$NOW_SEP10_NOON; printf '%s\n' app_20260801T000000Z.json app_prod_20260909T000000Z.json | stale_databases 7"
+    [ "$output" = "app 20260801T000000Z" ]
+}
+
+@test "stale_databases: the edge of the window, and names without a stamp" {
+    # exactly 7 days old is still inside a 7-day window; a second more is not
+    run bash -c "source '$REPO/offsite.sh'; BV_NOW=$NOW_SEP10_NOON; printf '%s\n' app_20260903T120000Z.json manual-copy.json | stale_databases 7"
+    [ -z "$output" ]
+    run bash -c "source '$REPO/offsite.sh'; BV_NOW=$NOW_SEP10_NOON; printf '%s\n' app_20260903T115959Z.json | stale_databases 7"
+    [ "$output" = "app 20260903T115959Z" ]
+}
+
+@test "stamp_age_days counts whole days to now" {
+    run bash -c "source '$REPO/offsite.sh'; BV_NOW=$NOW_SEP10_NOON stamp_age_days 20260820T000000Z"
+    [ "$output" = "21" ]
+}
+
+@test "--max-age is validated, and only check takes it" {
+    run bash "$REPO/offsite.sh" check --remote /tmp --max-age soon
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age must be a non-negative integer"* ]]
+    run bash "$REPO/offsite.sh" push --remote /tmp --manifest x.json --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age is a check option"* ]]
+}
+
