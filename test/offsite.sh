@@ -399,6 +399,38 @@ else
     sed -n '1,12p' "$OUT/c8-check.log" | sed 's/^/        /'
 fi
 printf '\n'
+echo '== Case 9: backups that stopped - every pair hashes, and the newest is a month old =='
+# The remote of case 8 (app and its sibling app_prod) as it is now, and as it
+# will look in a month if nothing new arrives: every pair still hashes
+# exactly, so a plain check says OK forever. --max-age is the alarm.
+if ./offsite.sh check --remote "$R8" --max-age 7 "${OS[@]}" >"$OUT/c9-fresh.log" 2>&1; then
+    pass_case 'check --max-age 7 right after the pushes: fresh, OK'
+else
+    fail_case 'check --max-age 7 failed on pairs pushed seconds ago'
+    sed -n '1,12p' "$OUT/c9-fresh.log" | sed 's/^/        /'
+fi
+LATER=$(( $(date -u +%s) + 30 * 86400 ))
+PLAIN_RC=0; STALE_RC=0   # set -e: the rc is captured, not fatal
+BV_NOW=$LATER ./offsite.sh check --remote "$R8" "${OS[@]}" >"$OUT/c9-plain.log" 2>&1 || PLAIN_RC=$?
+BV_NOW=$LATER ./offsite.sh check --remote "$R8" --max-age 7 "${OS[@]}" >"$OUT/c9-stale.log" 2>&1 || STALE_RC=$?
+if [ "$PLAIN_RC" -eq 0 ] && [ "$STALE_RC" -ne 0 ] \
+   && grep -q 'app - its newest pair is 30 days old' "$OUT/c9-stale.log" \
+   && grep -q 'app_prod - its newest pair is 30 days old' "$OUT/c9-stale.log" \
+   && grep -q 'artefact hashes at the remote exactly as promised' "$OUT/c9-stale.log"; then
+    pass_case 'a month later: plain check still OK, --max-age 7 FAILS naming app and app_prod (every hash still fine)'
+else
+    fail_case "stopped backups were not caught (plain rc $PLAIN_RC, --max-age rc $STALE_RC)"
+    sed -n '1,14p' "$OUT/c9-stale.log" | sed 's/^/        /'
+fi
+if ! BV_NOW=$LATER ./offsite.sh check --remote "$R8" --db app --max-age 7 "${OS[@]}" >"$OUT/c9-db.log" 2>&1 \
+   && grep -q 'app - its newest pair' "$OUT/c9-db.log" \
+   && ! grep -q 'app_prod' "$OUT/c9-db.log"; then
+    pass_case 'check --db app --max-age 7: only app is judged, the sibling stays out'
+else
+    fail_case 'check --db app --max-age 7 judged the wrong databases'
+    sed -n '1,12p' "$OUT/c9-db.log" | sed 's/^/        /'
+fi
+printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then
     die "$FAILURES off-site case(s) behaved wrongly ($KIND remote)"

@@ -40,7 +40,7 @@ age-keygen -o key.txt
 
 # off-site, with the REMOTE hashing what actually landed:
 ./offsite.sh push  --manifest ./backups/app_....json --remote bk@nas:/srv/backups --keep 14 --keep-days 30
-./offsite.sh check --remote bk@nas:/srv/backups
+./offsite.sh check --remote bk@nas:/srv/backups --max-age 2   # and fail if the newest pair of any database is > 2 days old
 ./offsite.sh pull  --db app --remote bk@nas:/srv/backups --out ./restored
 
 # point-in-time: prove that base backup + WAL archive reproduce a NAMED instant
@@ -228,6 +228,7 @@ end) before `offsite.sh` was written:
 | Prune "the oldest" at the remote by mtime | **A remote mtime is the upload time, not the backup time** (measured: scp stamps "now"). Re-upload one old backup — after a restore drill, say — and it becomes the "newest" file on the remote: an mtime-based prune then deletes the genuinely newest backup and keeps January's. |
 | `--keep 1` for `app` keeps the newest backup of `app` | **Not when a sibling database shares the prefix.** `app_prod`'s names match the `app_` glob and sort *after* every `app_2026…` name, so counted as `app`'s they took the "newest" slots — measured on the pre-fix code: `push --db app --keep 1` deleted **every** copy of `app` and kept `app_prod`'s, and `pull --db app` brought back `app_prod`'s backup instead. The same glob sat in `backup.sh`'s local retention and in the local `prune` of `pitr.sh`/`binlog.sh` (where a sibling's base could draw the WAL/binlog line). A name now belongs to a database only when a UTC stamp follows `DB_` directly — case 8 plants the sibling. |
 | "Keep 7 days" is a safe retention policy | **Only while new backups keep arriving.** When the backup job silently stops, an age window keeps moving and every copy eventually falls out of it — the retention step, running on the last successful push, deletes the last copies. `--keep-days D` therefore never removes the **newest** pair by age, and ages pairs by the stamp in their **name** (the upload's mtime is the wrong clock, measured above). |
+| `check` is green: every pair at the remote hashes exactly | **A remote can be perfectly consistent and a month behind.** Comment out the cron line, let the credentials expire, fill the source disk: nothing new arrives, every pair already there keeps hashing, and `check` says OK every night — measured in case 9: a month later (`BV_NOW` +30 days) the plain check still exits 0. `check --max-age D` fails when the newest pair of any database (or of `--db`) carries a name stamp more than D days old, naming it: `FAIL app - its newest pair is 30 days old (…): backups have stopped arriving`. Siblings are separate databases (`app_prod` stopping is not hidden by `app` being fresh). It is the alarm half of the rule above: retention refuses to delete the last copy, `--max-age` says out loud that it IS the last. |
 | `pg_dump \| ssh nas 'cat > backup.sql'` exits 0 | The straight-to-NAS pipe from every tutorial: with the dump **failing**, the pipeline's status is the remote `cat`'s — a 20-byte file with a final-looking name lands at the remote and the cron reports success. The gzip lie, with a network in the middle. |
 | The drill ran one engine; the protocol is "engine-agnostic", so the rest are covered | **Engine-agnostic by construction is not engine-tested.** Case 7 runs the fourth engine through the same fire: push the SQLite `.dump`, burn the source database and every local copy, pull, restore into a scratch database — and then truncate the pulled dump the way a dying upload would, which `verify` must **refuse** (the hash disagrees first; the closing `COMMIT` is the parse gate behind it). Half a database is not a backup, whatever the exit code says. |
 
@@ -247,8 +248,10 @@ Hence `offsite.sh`'s protocol, suspicious in both directions:
 - **`check`** audits every pair at the remote **without downloading artefacts**:
   each manifest is fetched (they are small) and the remote hashes the artefact
   it vouches for. In-place rot, artefacts no manifest vouches for, and crashed
-  uploads (`.part` leftovers) are all named. `check` proves the remote holds the
-  right bytes; only `verify.sh` proves those bytes restore.
+  uploads (`.part` leftovers) are all named. With `--max-age D` it also fails
+  when a database's **newest** pair is more than D days old (by name stamp):
+  backups that stopped arriving. `check` proves the remote holds the right
+  bytes; only `verify.sh` proves those bytes restore.
 - Retention at the remote (`--keep N`, `--keep-days D`) counts complete pairs
   and decides **by name** — names carry sortable UTC stamps — never by mtime,
   for the measured reason above. With both flags a pair survives if **either**

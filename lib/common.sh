@@ -136,6 +136,33 @@ retention_victims() {
     done
 }
 
+# Freshness, as a pure decision (offsite.sh check --max-age; the bats tests
+# call it directly). Reads manifest names on stdin, groups them by database
+# (the name up to "_YYYYmmddTHHMMSSZ"), and prints "DB STAMP" for every
+# database whose NEWEST stamp is more than $1 days before now ($BV_NOW if
+# set). A remote that hashes perfectly can still be a month behind: the
+# cron line was commented out, the credentials expired, the disk filled -
+# every pair there is consistent and the newest one is old, and nothing
+# else in check says so. Retention by age already refuses to delete the
+# last copy for the same reason (see retention_victims); this is the alarm.
+stale_databases() {
+    local max_days="$1" cutoff name db stamp
+    cutoff=$(date -u -d "@$(( ${BV_NOW:-$(date -u +%s)} - max_days * 86400 ))" +%Y%m%dT%H%M%SZ)
+    while IFS= read -r name; do
+        [[ "$name" =~ ^(.+)_([0-9]{8}T[0-9]{6}Z) ]] || continue
+        printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    done | sort -k1,1 -k2,2r | sort -u -k1,1 -s | while read -r db stamp; do
+        if [[ "$stamp" < "$cutoff" ]]; then printf '%s %s\n' "$db" "$stamp"; fi
+    done
+}
+
+# Whole days between a name stamp and now ($BV_NOW if set), for the message.
+stamp_age_days() {
+    local s="$1" t0
+    t0=$(date -u -d "${s:0:4}-${s:4:2}-${s:6:2} ${s:9:2}:${s:11:2}:${s:13:2}" +%s)
+    printf '%s' $(( ( ${BV_NOW:-$(date -u +%s)} - t0 ) / 86400 ))
+}
+
 # The rule retention_victims applies, in words, for the log line that reports
 # what a retention pass kept.
 retention_rule() {

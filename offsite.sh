@@ -26,7 +26,7 @@
 # Usage:
 #   ./offsite.sh push  --manifest FILE --remote REMOTE [--keep N] [--keep-days D]
 #   ./offsite.sh pull  --db NAME --remote REMOTE [--out DIR]
-#   ./offsite.sh check --remote REMOTE [--db NAME]
+#   ./offsite.sh check --remote REMOTE [--db NAME] [--max-age D]
 #
 # REMOTE is either
 #   user@host:/path    over ssh (key-based; the far end needs only a POSIX
@@ -41,7 +41,8 @@
 #   check   audit every pair at the remote against its manifest WITHOUT
 #           downloading artefacts: rot, orphans, crashed uploads. check proves
 #           the remote holds the right bytes; only verify.sh proves they
-#           restore.
+#           restore. With --max-age it also fails when a database's
+#           NEWEST pair is older than D days: backups that stopped.
 #
 # Options:
 #   --manifest FILE   manifest of the backup to push (artefact sits beside it)
@@ -55,6 +56,10 @@
 #                     EITHER rule keeps it. The newest pair is never removed
 #                     by age: backups that stopped must not age away the
 #                     last copy.
+#   --max-age D       check: fail when the newest pair of any database (or of
+#                     --db) carries a name stamp more than D days old - every
+#                     pair can hash perfectly while the job that makes them
+#                     died a month ago
 #   --ssh-opts STR    extra ssh options, e.g. '-p 2222 -i ~/.ssh/backup_key'
 #   -h, --help        this help
 #
@@ -72,6 +77,7 @@ DB=""
 OUT_DIR="./restored"
 KEEP=0
 KEEP_DAYS=0
+MAX_AGE=0
 SSH_OPTS_STR=""
 
 usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -91,6 +97,7 @@ parse_args() {
             --out)      OUT_DIR="${2:-}"; shift 2;;
             --keep)     KEEP="${2:-0}"; shift 2;;
             --keep-days) KEEP_DAYS="${2:-0}"; shift 2;;
+            --max-age)  MAX_AGE="${2:-0}"; shift 2;;
             --ssh-opts) SSH_OPTS_STR="${2:-}"; shift 2;;
             -h|--help)  usage 0;;
             *)          printf 'unknown option: %s\n' "$1" >&2; usage 1;;
@@ -103,6 +110,12 @@ parse_args() {
     case "$KEEP_DAYS" in
         ''|*[!0-9]*) die "--keep-days must be a non-negative integer, got '$KEEP_DAYS'";;
     esac
+    case "$MAX_AGE" in
+        ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
+    esac
+    if [ "$MAX_AGE" -gt 0 ] && [ "$SUBCMD" != check ]; then
+        die "--max-age is a check option (how old may the newest pair be?)"
+    fi
     case "$SUBCMD" in
         push) [ -n "$MANIFEST" ] || die "push needs --manifest (which backup to send)";;
         pull) [ -n "$DB" ] || die "pull needs --db (which database to bring back)";;
@@ -294,6 +307,19 @@ check_remote() {
                 fi;;
         esac
     done <<< "$listing"
+
+    if [ "$MAX_AGE" -gt 0 ]; then
+        local db stamp
+        while read -r db stamp; do
+            [ -n "$db" ] || continue
+            printf '  %sFAIL%s %s - its newest pair is %s days old (%s): backups have stopped arriving\n' \
+                "$c_red" "$c_reset" "$db" "$(stamp_age_days "$stamp")" "$stamp"
+            problems=$((problems + 1))
+        done < <(printf '%s\n' "$listing" | grep '\.json$' | while IFS= read -r name; do
+                     # --db narrows it like the audit above: siblings out.
+                     if [ -z "$DB" ] || [ -n "$(name_stamp "$name")" ]; then printf '%s\n' "$name"; fi
+                 done | stale_databases "$MAX_AGE")
+    fi
 
     printf '\n'
     if [ "$problems" -gt 0 ]; then
