@@ -32,7 +32,7 @@
 #   ./pitr.sh verify --base FILE --mark FILE --archive DIR [--image IMAGE]
 #   ./pitr.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./pitr.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
-#   ./pitr.sh prune  --db NAME --out DIR --archive DIR --keep N
+#   ./pitr.sh prune  --db NAME --out DIR --archive DIR [--keep N] [--keep-days D]
 #
 # Subcommands:
 #   base    take a pg_basebackup (tar, no WAL of its own - the archive is the
@@ -87,11 +87,12 @@
 #                     bases in --out, everything below the oldest kept
 #                     base's start segment retired from --archive and from
 #                     --out (bases, marks). N >= 1 for prune.
-#   --keep-days D     (push) also keep every base whose NAME stamp is under D
-#                     days old; with --keep, a base survives if EITHER rule
-#                     keeps it (offsite.sh's rule, the same function). The
-#                     newest is never removed by age, and the line is still
-#                     drawn by the oldest base that survives.
+#   --keep-days D     (push, prune) also keep every base whose NAME stamp is
+#                     under D days old - at the remote for push, in --out and
+#                     --archive for prune; with --keep, a base survives if
+#                     EITHER rule keeps it (offsite.sh's rule, the same
+#                     function). The newest is never removed by age, and the
+#                     line is still drawn by the oldest base that survives.
 #   --max-age D       (check --remote) also fail when the newest mark of any
 #                     database (or of --db) has a NAME stamp more than D days
 #                     old: every hash can be true and the remote still prove
@@ -192,8 +193,8 @@ parse_args() {
     case "$KEEP_DAYS" in
         ''|*[!0-9]*) die "--keep-days must be a non-negative integer, got '$KEEP_DAYS'";;
     esac
-    [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] \
-        || die "--keep-days belongs to push (remote retention by age)"
+    [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] || [ "$SUBCMD" = prune ] \
+        || die "--keep-days belongs to push (remote retention by age) and prune (local retention by age)"
     case "$MAX_AGE" in
         ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
     esac
@@ -223,7 +224,8 @@ parse_args() {
             [ -n "$REMOTE" ] || die "pull needs --remote (where the copy lives)";;
         prune)
             [ -n "$DB" ] || die "prune needs --db (whose bases and marks to count)"
-            [ "$KEEP" -ge 1 ] || die "prune needs --keep N with N >= 1 (keeping nothing is not retention, it is deletion)";;
+            [ "$KEEP" -ge 1 ] || [ "$KEEP_DAYS" -ge 1 ] \
+                || die "prune needs --keep N (N >= 1) and/or --keep-days D (D >= 1) - keeping nothing is not retention, it is deletion";;
     esac
 }
 
@@ -1091,11 +1093,17 @@ cmd_prune() {
         [ "$(json_str "$OUT_DIR/$name" kind)" = "pitr-base" ] && bases+=("$name")
     done
     local total=${#bases[@]}
-    if [ "$total" -le "$KEEP" ]; then
-        ok "retention: $total base backup(s) of '$DB' in $OUT_DIR, keeping up to $KEEP - nothing to drop"
+    # The same decision push makes at the remote (retention_victims: --keep N
+    # and/or --keep-days D, the newest never removed). Its victims are always
+    # the OLDEST names, so the first survivor is the oldest kept.
+    local -a victims=()
+    mapfile -t victims < <(printf '%s\n' ${bases[@]+"${bases[@]}"} | retention_victims)
+    local nvict=${#victims[@]}
+    if [ "$nvict" -eq 0 ]; then
+        ok "retention: $total base backup(s) of '$DB' in $OUT_DIR, keeping the $(retention_rule) - nothing to drop"
         return 0
     fi
-    local oldest_kept="${bases[$((total - KEEP))]}"
+    local oldest_kept="${bases[$nvict]}"
     local cut_file seg_bytes cut_tl cut_idx
     cut_file="$(json_str "$OUT_DIR/$oldest_kept" wal_start_file)"
     seg_bytes="$(json_num "$OUT_DIR/$oldest_kept" wal_segment_bytes)"
@@ -1104,10 +1112,10 @@ cmd_prune() {
     fi
     cut_tl=$(wal_name_timeline "$cut_file")
     cut_idx=$(wal_name_index "$cut_file" "$seg_bytes")
-    log "retention: keeping the newest $KEEP base(s) of '$DB'; the line is $cut_file (start of $oldest_kept)"
+    log "retention: keeping $((total - nvict)) of $total base(s) of '$DB' ($(retention_rule)); the line is $cut_file (start of $oldest_kept)"
 
     local aname removed_bases=0 removed_marks=0 removed_segs=0
-    for name in "${bases[@]:0:$((total - KEEP))}"; do
+    for name in "${victims[@]}"; do
         aname="$(json_str "$OUT_DIR/$name" artefact)"
         [ -z "$aname" ] || rm -f -- "$OUT_DIR/$aname"
         rm -f -- "$OUT_DIR/$name"
@@ -1153,7 +1161,7 @@ cmd_prune() {
             || die "retention: could not remove segments from the archive (the bases and marks above were already retired)"
         removed_segs=${#doomed[@]}
     fi
-    ok "retention: kept the newest $KEEP base(s), line drawn at $cut_file - dropped $removed_bases base(s), $removed_marks mark(s), $removed_segs archived segment(s) no kept base could replay"
+    ok "retention: kept $((total - nvict)) base(s) ($(retention_rule)), line drawn at $cut_file - dropped $removed_bases base(s), $removed_marks mark(s), $removed_segs archived segment(s) no kept base could replay"
 }
 
 # --- pull ----------------------------------------------------------------------

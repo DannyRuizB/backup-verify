@@ -390,11 +390,22 @@ BELOW8=$(find "$ARCHIVE8" -maxdepth 1 -type f -printf '%f\n' | below8)
 if [ "$B8B" = "$B8A" ] || [ "$BELOW8" -eq 0 ]; then
     fail_case "could not set the scene: dumps $(basename "$B8A") / $(basename "$B8B"), $BELOW8 binlog(s) below the second anchor $CUT8"
 fi
-if ./binlog.sh prune --db app --out "$BK8" --archive "$ARCHIVE8" --keep 1 >"$OUT/prune8.log" 2>&1; then
+# --keep-days first at the real clock: both dumps are seconds old, so the
+# age rule keeps them and nothing moves.
+if ./binlog.sh prune --db app --out "$BK8" --archive "$ARCHIVE8" --keep-days 7 >"$OUT/prune8-now.log" 2>&1 \
+   && grep -q 'nothing to drop' "$OUT/prune8-now.log" && [ -e "$B8A" ] && [ -e "$B8B" ]; then
+    pass_case 'prune --keep-days 7 at the real clock: both dumps are under a week old - nothing to drop'
+else
+    fail_case 'prune --keep-days 7 at the real clock touched dumps that are seconds old'
+    sed -n '1,10p' "$OUT/prune8-now.log" | sed 's/^/        /'
+fi
+# Then the cut itself, by age: a month on, only the newest survives (never
+# removed by age) and the line must land exactly where --keep 1 drew it.
+if BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) ./binlog.sh prune --db app --out "$BK8" --archive "$ARCHIVE8" --keep-days 7 >"$OUT/prune8.log" 2>&1; then
     STILL8=$(find "$ARCHIVE8" -maxdepth 1 -type f -printf '%f\n' | below8)
     if [ ! -e "$B8A" ] && [ ! -e "$BK8/$OLD_ART8" ] && [ "$STILL8" -eq 0 ] && [ -e "$B8B" ] && [ -e "$M8B" ] \
        && [ -e "$ARCHIVE8/$CUT8$SFX" ]; then
-        pass_case "--keep 1 retired the older dump, its artefact and $BELOW8 archived binlog(s) below $CUT8 - and kept the new dump, its anchor binlog and the mark"
+        pass_case "--keep-days 7 a month on retired the older dump, its artefact and $BELOW8 archived binlog(s) below $CUT8 - and kept the new dump, its anchor binlog and the mark"
     else
         fail_case "prune removed the wrong things (binlogs still below the cut: $STILL8; old dump present: $([ -e "$B8A" ] && echo yes || echo no))"
         sed -n '1,20p' "$OUT/prune8.log" | sed 's/^/        /'

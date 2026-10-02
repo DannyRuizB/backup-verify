@@ -405,11 +405,22 @@ BELOW9=$(root_sh 'ls -1 /work/archive9' | below_cut9)
 if [ "$B9B" = "$B9A" ] || [ "$BELOW9" -eq 0 ]; then
     fail_case "could not set the scene: bases $(basename "$B9A") / $(basename "$B9B"), $BELOW9 segment(s) below the second start $CUT9"
 fi
-if ./pitr.sh prune --db app --out "$BK9" --archive "$ARCHIVE9" --keep 1 >"$OUT/prune9.log" 2>&1; then
+# --keep-days first at the real clock: both bases are seconds old, so the
+# age rule keeps them and nothing moves.
+if ./pitr.sh prune --db app --out "$BK9" --archive "$ARCHIVE9" --keep-days 7 >"$OUT/prune9-now.log" 2>&1 \
+   && grep -q 'nothing to drop' "$OUT/prune9-now.log" && [ -e "$B9A" ] && [ -e "$B9B" ]; then
+    pass_case 'prune --keep-days 7 at the real clock: both bases are under a week old - nothing to drop'
+else
+    fail_case 'prune --keep-days 7 at the real clock touched bases that are seconds old'
+    sed -n '1,10p' "$OUT/prune9-now.log" | sed 's/^/        /'
+fi
+# Then the cut itself, by age: a month on, only the newest survives (never
+# removed by age) and the line must land exactly where --keep 1 drew it.
+if BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) ./pitr.sh prune --db app --out "$BK9" --archive "$ARCHIVE9" --keep-days 7 >"$OUT/prune9.log" 2>&1; then
     STILL9=$(root_sh 'ls -1 /work/archive9' | below_cut9)
     if [ ! -e "$B9A" ] && [ ! -e "$BK9/$OLD_ART9" ] && [ "$STILL9" -eq 0 ] && [ -e "$B9B" ] && [ -e "$M9B" ] \
        && root_sh "test -e /work/archive9/$CUT9$SEGSFX" >/dev/null 2>&1; then
-        pass_case "--keep 1 retired the older base, its artefact and $BELOW9 archived segment(s) below $CUT9 - and kept the new base, its start segment and the mark"
+        pass_case "--keep-days 7 a month on retired the older base, its artefact and $BELOW9 archived segment(s) below $CUT9 - and kept the new base, its start segment and the mark"
     else
         fail_case "prune removed the wrong things (segments still below the cut: $STILL9; old base present: $([ -e "$B9A" ] && echo yes || echo no))"
         sed -n '1,20p' "$OUT/prune9.log" | sed 's/^/        /'
