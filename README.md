@@ -54,7 +54,7 @@ age-keygen -o key.txt
 ./pitr.sh push  --base ./backups/app_..._base.json --mark ./backups/app_..._mark.json \
                 --archive /srv/wal-archive --remote bk@nas:/srv/pitr --keep 14 --keep-days 30
 ./pitr.sh prune --db app --out ./backups --archive /srv/wal-archive --keep 7
-./pitr.sh check --remote bk@nas:/srv/pitr
+./pitr.sh check --remote bk@nas:/srv/pitr --max-age 2   # and fail if the newest provable instant is > 2 days old
 ./pitr.sh pull  --db app --remote bk@nas:/srv/pitr --archive ./recovered-wal --out ./recovered
 
 # encrypted end to end: segments leave the server as ciphertext...
@@ -76,7 +76,7 @@ age-keygen -o key.txt
 ./binlog.sh push  --base ./backups/app_..._binlogbase.json \
                   --mark ./backups/app_..._binlogmark.json \
                   --archive /srv/binlog-archive --remote bk@nas:/srv/binlogs
-./binlog.sh check --remote bk@nas:/srv/binlogs
+./binlog.sh check --remote bk@nas:/srv/binlogs --max-age 2
 ./binlog.sh pull  --db app --remote bk@nas:/srv/binlogs --archive ./recovered-binlogs
 
 # encrypted end to end: the mark encrypts as it archives (and proves the
@@ -328,6 +328,7 @@ artefact copies above don't — each one measured before `push`, `pull` and
 | The archive was synced an hour ago | **An archive pushed at 12:00 cannot prove a 12:05 mark** — the mark's segment never travelled. Measured: recovery against the stale copy, newer mark named = refused, `missing segment ... the chain is broken here`. So the mark manifest travels **last**, behind everything it stands on: a mark at the remote is a receipt, and `pull` returns the newest instant the remote can *prove*, never the newest that merely exists. |
 | The segment is there, the "skip existing" sync is fast | **A killed upload leaves a partial under the segment's final name, and an exists-check never repairs it** — measured: 262 144 of 16 777 216 bytes squatting as the segment, invisible to `test -f`-style syncs forever. `push` uploads under a temporary name, has the **remote** hash it, renames only on a match — and re-ships anything whose remote hash disagrees with the inventory, because "the file is already there" is a claim about a name, not about bytes. |
 | Prune the WAL remote like the dump remote: keep the newest N files | **A WAL remote is chains, not files.** Every segment there is either below the oldest *kept* base's start (dead weight) or part of a chain a kept base needs — and neither a file count nor an mtime can tell the two apart. `push --keep N` keeps the newest N bases **by name** and drops only what sits below the oldest kept base's start segment on its timeline: the older bases and their manifests, the segments only they needed, the marks only they could prove; history files and other timelines stay, and the prune runs after the mark landed, never before the receipt. Measured in the drill: after `--keep 1` the remote lost the older base and every segment below the new base's start, `check --remote` stayed green and the fire recovered the newest mark exactly. `--keep-days D` adds retention **by age** with `offsite.sh`'s rule — the same function decides: a base survives if *either* rule keeps it, the newest never goes by age, and since both rules keep the newest end of the list, the line is still drawn at the oldest survivor's start. Measured in the drill: `--keep-days 7` at the real clock dropped nothing (both bases minutes old), and `--keep 1 --keep-days 7` a month on (`BV_NOW`) drew exactly the line `--keep 1` draws. |
+| `check --remote` is green: every segment the newest mark stands on hashes true | **It also says nothing about WHEN that mark was taken.** Stop the cron that marks and pushes, and the remote keeps hashing perfectly while it proves nothing newer than the day it stopped. Measured in the drill with the clock a month ahead: plain `check --remote` rc 0, every pair `OK`; `--max-age 7` fails naming the database — *its newest provable instant is 30 days old: marks have stopped arriving*. Decided by the mark's **name** stamp (a remote mtime is the upload time), the same function as `offsite.sh check --max-age`, in `pitr.sh` and `binlog.sh` alike. |
 
 The protocol is offsite.sh's, applied per file: the same `rem_*` transports
 (ssh, or a mounted directory), upload to `.part`, hash at the remote, rename;
@@ -552,7 +553,9 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   prove; an unpushed mark being unclaimable (pull returns the newest instant
   the remote can *prove*); in-place rot named by `check --remote` from the
   inventory alone, refused and cleaned up by `pull`, and *repaired* by the
-  next `push`; and the crashed `.part` upload named for what it is.
+  next `push`; the crashed `.part` upload named for what it is; and, with
+  the clock a month ahead, marks that stopped arriving: plain `check
+  --remote` still green, `--max-age 7` failing.
 - **`test/binlog.sh [--encrypted] [--gtid]`** — the MySQL fire drill: seed,
   anchored
   dump, mark —
@@ -578,7 +581,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   the remote's contents — plus the incremental push, the unpushed mark being
   unclaimable, rot at the remote (shapeless here even as truncation —
   measured) named by `check --remote`, refused by `pull` and repaired by the
-  next `push`, and the `.part` debris named. `--encrypted` sends the same
+  next `push`, the `.part` debris named, and stopped marks caught by
+  `check --remote --max-age`. `--encrypted` sends the same
   instant as ciphertext the remote never gets a key for.
 - **`test/backup.bats`**, **`test/offsite.bats`**, **`test/pitr.bats`** and
   **`test/binlog.bats`** —

@@ -497,3 +497,33 @@ fabricate_pair() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"./pitr.sh prune"* ]]
 }
+
+# --- check --remote --max-age: marks that stopped arriving -------------------
+
+@test "pitr.sh --max-age must be a non-negative integer" {
+    run bash "$REPO/pitr.sh" check --remote /tmp --max-age soon
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age must be a non-negative integer"* ]]
+}
+
+@test "pitr.sh --max-age belongs to check --remote (not push, not the local check)" {
+    run bash "$REPO/pitr.sh" push --base /nonexistent --mark /nonexistent --archive /tmp --remote /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age belongs to check --remote"* ]]
+    run bash "$REPO/pitr.sh" check --archive /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age belongs to check --remote"* ]]
+}
+
+@test "pitr.sh --help documents --max-age" {
+    run bash "$REPO/pitr.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--max-age D"* ]]
+}
+
+@test "pitr mark names: stale_databases takes the newest mark per database, siblings apart" {
+    # 2026-09-10T12:00:00Z; app's newest mark is 1 day old, app_prod's 20.
+    run bash -c "source '$REPO/pitr.sh'; BV_NOW=1789041600; printf '%s\n' app_20260801T000000Z_mark.json app_20260909T120000Z_mark.json app_prod_20260821T000000Z_mark.json | stale_databases 7"
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_prod 20260821T000000Z" ]
+}

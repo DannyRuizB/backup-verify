@@ -28,7 +28,7 @@
 #   ./pitr.sh base   --container NAME --db NAME --archive DIR [--out DIR]
 #   ./pitr.sh mark   --container NAME --db NAME --archive DIR [--out DIR]
 #   ./pitr.sh check  --archive DIR [--container NAME]
-#   ./pitr.sh check  --remote REMOTE [--db NAME]
+#   ./pitr.sh check  --remote REMOTE [--db NAME] [--max-age D]
 #   ./pitr.sh verify --base FILE --mark FILE --archive DIR [--image IMAGE]
 #   ./pitr.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./pitr.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
@@ -47,7 +47,8 @@
 #           and, with --container, whether the archiver is behind or failing
 #           right now (the server never volunteers either). With --remote,
 #           audit the off-site copy instead: every segment the newest mark
-#           stands on, hashed AT the remote against the mark's inventory.
+#           stands on, hashed AT the remote against the mark's inventory;
+#           with --max-age, also that the newest mark is recent enough.
 #   verify  the drill: boot a throwaway instance from the base backup,
 #           recover THROUGH the archive to the mark by name, and compare
 #           every fingerprint the mark recorded
@@ -76,21 +77,26 @@
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
 #   --keep N          (push) after the push, keep the newest N base backups
-#                     at the remote; (prune) the same line drawn LOCALLY -
-#                     the newest N bases in --out, everything below the oldest
-#                     kept base's start segment retired from --archive and
-#                     from --out (bases, marks). N >= 1 for prune.
 #                     at the remote and drop only what no kept base can
 #                     replay: older bases, the segments below the oldest
 #                     kept base's start, the marks only they could prove.
 #                     Decided by NAME and WAL arithmetic - never by mtime
 #                     or by counting files (a WAL remote is chains, not
 #                     files). History files and other timelines stay.
+#                     (prune) the same line drawn LOCALLY - the newest N
+#                     bases in --out, everything below the oldest kept
+#                     base's start segment retired from --archive and from
+#                     --out (bases, marks). N >= 1 for prune.
 #   --keep-days D     (push) also keep every base whose NAME stamp is under D
 #                     days old; with --keep, a base survives if EITHER rule
 #                     keeps it (offsite.sh's rule, the same function). The
 #                     newest is never removed by age, and the line is still
 #                     drawn by the oldest base that survives.
+#   --max-age D       (check --remote) also fail when the newest mark of any
+#                     database (or of --db) has a NAME stamp more than D days
+#                     old: every hash can be true and the remote still prove
+#                     nothing newer than that - marks have stopped arriving.
+#                     offsite.sh's rule, the same function.
 #   --recipient KEY   (base) encrypt the base backup with age; KEY is an age
 #                     public key or a file of them. Requires --identity: a
 #                     base whose backup_label cannot be read is not a base,
@@ -126,6 +132,7 @@ SCRATCH=""
 REMOTE=""
 KEEP=0
 KEEP_DAYS=0
+MAX_AGE=0
 SSH_OPTS_STR=""
 RECIPIENT=""
 IDENTITY=""
@@ -155,6 +162,7 @@ parse_args() {
             --remote)         REMOTE="${2:-}"; shift 2;;
             --keep)           KEEP="${2:-}"; shift 2;;
             --keep-days)      KEEP_DAYS="${2:-}"; shift 2;;
+            --max-age)        MAX_AGE="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
             --recipient)      RECIPIENT="${2:-}"; shift 2;;
             --identity)       IDENTITY="${2:-}"; shift 2;;
@@ -186,6 +194,11 @@ parse_args() {
     esac
     [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] \
         || die "--keep-days belongs to push (remote retention by age)"
+    case "$MAX_AGE" in
+        ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
+    esac
+    { [ "$MAX_AGE" -eq 0 ] || { [ "$SUBCMD" = check ] && [ -n "$REMOTE" ]; }; } \
+        || die "--max-age belongs to check --remote (how old may the newest provable instant be?)"
     [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] || [ "$SUBCMD" = prune ] \
         || die "--keep belongs to push (remote retention) and prune (local retention)"
     if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
@@ -672,6 +685,19 @@ cmd_check_remote() {
         fi
     done
     rm -rf "$tmp"
+
+    # Freshness: every hash above can be true and the remote still prove
+    # nothing newer than a month ago (the cron that pushes died). Decided by
+    # the mark's NAME stamp, never by remote mtime (the upload time).
+    if [ "$MAX_AGE" -gt 0 ]; then
+        local sdb sstamp
+        while read -r sdb sstamp; do
+            [ -n "$sdb" ] || continue
+            printf '  %sFAIL%s %s - its newest provable instant is %s days old (%s): marks have stopped arriving\n' \
+                "$c_red" "$c_reset" "$sdb" "$(stamp_age_days "$sstamp")" "$sstamp"
+            problems=$((problems + 1))
+        done < <(printf '%s\n' "$mark_list" | stale_databases "$MAX_AGE")
+    fi
 
     printf '\n'
     if [ "$problems" -gt 0 ]; then

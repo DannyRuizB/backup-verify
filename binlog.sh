@@ -50,7 +50,7 @@
 #   ./binlog.sh mark   --container NAME --db NAME --archive DIR [--out DIR]
 #                      [--recipient KEY --identity FILE]
 #   ./binlog.sh check  --archive DIR [--container NAME [--identity FILE]]
-#   ./binlog.sh check  --remote REMOTE [--db NAME]
+#   ./binlog.sh check  --remote REMOTE [--db NAME] [--max-age D]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
 #                      [--image IMAGE] [--identity FILE]
 #   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
@@ -68,7 +68,9 @@
 #           no archive_command, so the mark IS the archiver.
 #   check   audit the archive TODAY: numbering holes, strays, and - with
 #           --container - whether the server's closed binlogs match the
-#           archived copies byte for byte.
+#           archived copies byte for byte. With --remote, audit the
+#           off-site copy (every file the newest mark replays, hashed AT the
+#           remote); with --max-age, also that the newest mark is recent.
 #   verify  the drill: boot a throwaway MySQL, load the dump, replay the
 #           chain from the anchor to the mark position (checksums verified),
 #           then prove ARRIVAL with the mark's fingerprints - because the
@@ -92,6 +94,11 @@
 #                     from the official mysql-community-client RPM)
 #   --image IMAGE     image for the throwaway instance (default: mysql:<major>
 #                     from the base manifest)
+#   --max-age D       (check --remote) also fail when the newest mark of any
+#                     database (or of --db) has a NAME stamp more than D days
+#                     old: every hash can be true and the remote still prove
+#                     nothing newer than that - marks have stopped arriving.
+#                     offsite.sh's rule, the same function.
 #   --recipient KEY   (base, mark) encrypt with age; KEY is an age public key
 #                     or a file of them. Requires --identity: base cannot even
 #                     read its own anchor without it (the anchor lives INSIDE
@@ -108,16 +115,15 @@
 #   --remote REMOTE   user@host:/path (ssh) or /path (a mounted disk) -
 #                     same remotes, same rem_* modules as offsite.sh
 #   --ssh-opts OPTS   extra ssh options, e.g. "-p 2222 -i key" (ssh remotes)
-#   --keep N          (push) keep the newest N anchored dumps at the remote;
+#   --keep N          (push) keep the newest N anchored dumps at the remote
+#                     and drop only what no kept dump can replay: older
+#                     dumps, the binlog files below the oldest kept dump's
+#                     anchor, the marks only they could prove. Decided by
+#                     NAME and binlog arithmetic - never by mtime or by
+#                     counting files (pitr.sh's rule, binlog names).
 #                     (prune) the same line drawn LOCALLY - newest N dumps in
 #                     --out, everything below the oldest kept dump's anchor
 #                     file retired from --archive and --out. N >= 1 for prune.
-#                     Original push wording: keep the newest N anchored dumps
-#                     at the remote and drop only what no kept dump can
-#                     replay: older dumps, the binlog files below the oldest
-#                     kept dump's anchor, the marks only they could prove.
-#                     Decided by NAME and binlog arithmetic - never by mtime
-#                     or by counting files (pitr.sh's rule, binlog names).
 #   --keep-days D     (push) also keep every anchored dump whose NAME stamp
 #                     is under D days old; with --keep, a dump survives if
 #                     EITHER rule keeps it (offsite.sh's rule, the same
@@ -146,6 +152,7 @@ TIMEOUT=90
 KEEP_CONTAINER=0
 KEEP=0
 KEEP_DAYS=0
+MAX_AGE=0
 TOOLS_DIR=""
 PROBE=""
 REMOTE=""
@@ -178,6 +185,7 @@ parse_args() {
             --remote)         REMOTE="${2:-}"; shift 2;;
             --keep)           KEEP="${2:-}"; shift 2;;
             --keep-days)      KEEP_DAYS="${2:-}"; shift 2;;
+            --max-age)        MAX_AGE="${2:-}"; shift 2;;
             --ssh-opts)       SSH_OPTS_STR="${2:-}"; shift 2;;
             --recipient)      RECIPIENT="${2:-}"; shift 2;;
             --identity)       IDENTITY="${2:-}"; shift 2;;
@@ -197,6 +205,11 @@ parse_args() {
     esac
     [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] \
         || die "--keep-days belongs to push (remote retention by age)"
+    case "$MAX_AGE" in
+        ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
+    esac
+    { [ "$MAX_AGE" -eq 0 ] || { [ "$SUBCMD" = check ] && [ -n "$REMOTE" ]; }; } \
+        || die "--max-age belongs to check --remote (how old may the newest provable instant be?)"
     [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
         || [ "$SUBCMD" = prune ] || die "--keep belongs to push (remote retention) and prune (local retention)"
     # base needs no archive: the dump carries its anchor, the binlogs come
@@ -1284,6 +1297,19 @@ cmd_check_remote() {
         fi
     done
     rm -rf "$tmp"
+
+    # Freshness: every hash above can be true and the remote still prove
+    # nothing newer than a month ago (the cron that pushes died). Decided by
+    # the mark's NAME stamp, never by remote mtime (the upload time).
+    if [ "$MAX_AGE" -gt 0 ]; then
+        local sdb sstamp
+        while read -r sdb sstamp; do
+            [ -n "$sdb" ] || continue
+            printf '  %sFAIL%s %s - its newest provable instant is %s days old (%s): marks have stopped arriving\n' \
+                "$c_red" "$c_reset" "$sdb" "$(stamp_age_days "$sstamp")" "$sstamp"
+            problems=$((problems + 1))
+        done < <(printf '%s\n' "$mark_list" | stale_databases "$MAX_AGE")
+    fi
 
     printf '\n'
     if [ "$problems" -gt 0 ]; then

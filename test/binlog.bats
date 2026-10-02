@@ -486,3 +486,33 @@ fabricate_pair() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"./binlog.sh prune"* ]]
 }
+
+# --- check --remote --max-age: marks that stopped arriving -------------------
+
+@test "binlog.sh --max-age must be a non-negative integer" {
+    run bash "$REPO/binlog.sh" check --remote /tmp --max-age soon
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age must be a non-negative integer"* ]]
+}
+
+@test "binlog.sh --max-age belongs to check --remote (not push, not the local check)" {
+    run bash "$REPO/binlog.sh" push --base /nonexistent --mark /nonexistent --archive /tmp --remote /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age belongs to check --remote"* ]]
+    run bash "$REPO/binlog.sh" check --archive /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age belongs to check --remote"* ]]
+}
+
+@test "binlog.sh --help documents --max-age" {
+    run bash "$REPO/binlog.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--max-age D"* ]]
+}
+
+@test "binlog mark names: stale_databases takes the newest mark per database, siblings apart" {
+    # 2026-09-10T12:00:00Z; app's newest mark is 1 day old, app_prod's 20.
+    run bash -c "source '$REPO/binlog.sh'; BV_NOW=1789041600; printf '%s\n' app_20260801T000000Z_binlogmark.json app_20260909T120000Z_binlogmark.json app_prod_20260821T000000Z_binlogmark.json | stale_databases 7"
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_prod 20260821T000000Z" ]
+}
