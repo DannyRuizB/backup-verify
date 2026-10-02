@@ -55,7 +55,7 @@
 #                      [--image IMAGE] [--identity FILE]
 #   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
-#   ./binlog.sh prune  --db NAME --out DIR --archive DIR --keep N
+#   ./binlog.sh prune  --db NAME --out DIR --archive DIR [--keep N] [--keep-days D]
 #
 # Subcommands:
 #   base    mysqldump with --source-data: the dump plus its ANCHOR (the
@@ -124,8 +124,9 @@
 #                     (prune) the same line drawn LOCALLY - newest N dumps in
 #                     --out, everything below the oldest kept dump's anchor
 #                     file retired from --archive and --out. N >= 1 for prune.
-#   --keep-days D     (push) also keep every anchored dump whose NAME stamp
-#                     is under D days old; with --keep, a dump survives if
+#   --keep-days D     (push, prune) also keep every anchored dump whose NAME
+#                     stamp is under D days old - at the remote for push,
+#                     locally for prune; with --keep, a dump survives if
 #                     EITHER rule keeps it (offsite.sh's rule, the same
 #                     function). The newest is never removed by age, and the
 #                     line is still drawn by the oldest dump that survives.
@@ -203,8 +204,8 @@ parse_args() {
     case "$KEEP_DAYS" in
         ''|*[!0-9]*) die "--keep-days must be a non-negative integer, got '$KEEP_DAYS'";;
     esac
-    [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] \
-        || die "--keep-days belongs to push (remote retention by age)"
+    [ "$KEEP_DAYS" -eq 0 ] || [ "$SUBCMD" = push ] || [ "$SUBCMD" = prune ] \
+        || die "--keep-days belongs to push (remote retention by age) and prune (local retention by age)"
     case "$MAX_AGE" in
         ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
     esac
@@ -271,7 +272,8 @@ parse_args() {
             [ -n "$DB" ] || die "prune needs --db (whose dumps and marks to count)"
             [ -n "$OUT_DIR" ] || die "prune needs --out (where the dumps live)"
             [ -n "$ARCHIVE_DIR" ] || die "prune needs --archive (where the binlogs live)"
-            [ "$KEEP" -ge 1 ] || die "prune needs --keep N with N >= 1 (keeping nothing is not retention, it is deletion)";;
+            [ "$KEEP" -ge 1 ] || [ "$KEEP_DAYS" -ge 1 ] \
+                || die "prune needs --keep N (N >= 1) and/or --keep-days D (D >= 1) - keeping nothing is not retention, it is deletion";;
     esac
 }
 
@@ -1008,20 +1010,26 @@ cmd_prune() {
         [ "$(json_str "$OUT_DIR/$name" kind)" = "binlog-base" ] && dumps+=("$name")
     done
     local total=${#dumps[@]}
-    if [ "$total" -le "$KEEP" ]; then
-        ok "retention: $total anchored dump(s) of '$DB' in $OUT_DIR, keeping up to $KEEP - nothing to drop"
+    # The same decision push makes at the remote (retention_victims: --keep N
+    # and/or --keep-days D, the newest never removed). Its victims are always
+    # the OLDEST names, so the first survivor is the oldest kept.
+    local -a victims=()
+    mapfile -t victims < <(printf '%s\n' ${dumps[@]+"${dumps[@]}"} | retention_victims)
+    local nvict=${#victims[@]}
+    if [ "$nvict" -eq 0 ]; then
+        ok "retention: $total anchored dump(s) of '$DB' in $OUT_DIR, keeping the $(retention_rule) - nothing to drop"
         return 0
     fi
-    local oldest_kept="${dumps[$((total - KEEP))]}"
+    local oldest_kept="${dumps[$nvict]}"
     local cut_file cut_prefix cut_idx
     cut_file="$(json_str "$OUT_DIR/$oldest_kept" anchor_file)"
     [ -n "$cut_file" ] || die "retention: $oldest_kept carries no anchor_file - refusing to guess where the line is; nothing was dropped"
     cut_prefix=$(binlog_prefix_of "$cut_file")
     cut_idx=$(binlog_index_of "$cut_file")
-    log "retention: keeping the newest $KEEP dump(s) of '$DB'; the line is $cut_file (anchor of $oldest_kept)"
+    log "retention: keeping $((total - nvict)) of $total dump(s) of '$DB' ($(retention_rule)); the line is $cut_file (anchor of $oldest_kept)"
 
     local aname removed_dumps=0 removed_marks=0 removed_binlogs=0 mfile bare
-    for name in "${dumps[@]:0:$((total - KEEP))}"; do
+    for name in "${victims[@]}"; do
         aname="$(json_str "$OUT_DIR/$name" artefact)"
         [ -z "$aname" ] || rm -f -- "$OUT_DIR/$aname"
         rm -f -- "$OUT_DIR/$name"
@@ -1051,7 +1059,7 @@ cmd_prune() {
             removed_binlogs=$((removed_binlogs + 1))
         fi
     done < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
-    ok "retention: kept the newest $KEEP dump(s), line drawn at $cut_file - dropped $removed_dumps dump(s), $removed_marks mark(s), $removed_binlogs archived binlog(s) no kept dump could replay"
+    ok "retention: kept $((total - nvict)) dump(s) ($(retention_rule)), line drawn at $cut_file - dropped $removed_dumps dump(s), $removed_marks mark(s), $removed_binlogs archived binlog(s) no kept dump could replay"
 }
 
 # --- pull ----------------------------------------------------------------------

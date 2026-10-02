@@ -445,13 +445,20 @@ fabricate_pair() {
     [[ "$output" == *"--keep-days must be a non-negative integer"* ]]
 }
 
-@test "pitr.sh --keep-days belongs to push only (not check, not the local prune)" {
+@test "pitr.sh --keep-days belongs to push and prune (not check)" {
     run bash "$REPO/pitr.sh" check --remote /tmp --keep-days 7
     [ "$status" -ne 0 ]
     [[ "$output" == *"--keep-days belongs to push"* ]]
-    run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp --keep 1 --keep-days 7
+    run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp --keep-days week
     [ "$status" -ne 0 ]
-    [[ "$output" == *"--keep-days belongs to push"* ]]
+    [[ "$output" == *"--keep-days must be a non-negative integer"* ]]
+    # prune takes it now (alone or with --keep): past argument parsing, with
+    # nothing of app's in an empty dir, there is nothing to drop.
+    d=$(mktemp -d)
+    run bash "$REPO/pitr.sh" prune --db app --out "$d" --archive "$d" --keep-days 7
+    rm -rf "$d"
+    [[ "$output" != *"belongs to push"* ]]
+    [[ "$output" != *"prune needs"* ]]
 }
 
 @test "pitr.sh --help documents --keep-days" {
@@ -486,7 +493,7 @@ fabricate_pair() {
     [[ "$output" == *"prune needs --db"* ]]
     run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp
     [ "$status" -ne 0 ]
-    [[ "$output" == *"prune needs --keep N with N >= 1"* ]]
+    [[ "$output" == *"prune needs --keep N (N >= 1) and/or --keep-days D (D >= 1)"* ]]
     run bash "$REPO/pitr.sh" prune --db app --out /tmp --archive /tmp --keep 0
     [ "$status" -ne 0 ]
     [[ "$output" == *"keeping nothing is not retention"* ]]
