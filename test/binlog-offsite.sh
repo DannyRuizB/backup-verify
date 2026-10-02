@@ -355,6 +355,31 @@ else
     sed -n '1,15p' "$OUT/pull6.log" | sed 's/^/        /'
 fi
 
+
+printf '\n'
+echo '== Case 8: marks that stopped - every hash true, and the newest instant a month old =='
+# The cron that marks and pushes dies; the remote keeps hashing perfectly, so
+# a plain check --remote says OK forever. --max-age is the alarm.
+if ./binlog.sh check --remote "$REMOTE" --max-age 7 "${OS[@]}" >"$OUT/c8-fresh.log" 2>&1; then
+    pass_case 'check --remote --max-age 7 right after the pushes: fresh, OK'
+else
+    fail_case 'check --remote --max-age 7 failed on marks pushed minutes ago'
+    sed -n '1,15p' "$OUT/c8-fresh.log" | sed 's/^/        /'
+fi
+LATER=$(( $(date -u +%s) + 30 * 86400 ))
+PLAIN_RC=0
+BV_NOW=$LATER ./binlog.sh check --remote "$REMOTE" "${OS[@]}" >"$OUT/c8-plain.log" 2>&1 || PLAIN_RC=$?
+STALE_RC=0
+BV_NOW=$LATER ./binlog.sh check --remote "$REMOTE" --db app --max-age 7 "${OS[@]}" >"$OUT/c8-stale.log" 2>&1 || STALE_RC=$?
+if [ "$PLAIN_RC" -eq 0 ] && [ "$STALE_RC" -ne 0 ] \
+   && grep -q 'FAIL.* app - its newest provable instant is 30 days old' "$OUT/c8-stale.log" \
+   && grep -q 'OK .*hashing true at the remote' "$OUT/c8-stale.log"; then
+    pass_case 'a month later: plain check still OK, --max-age 7 FAILS naming app (every hash still true)'
+else
+    fail_case "stopped marks were not caught (plain rc $PLAIN_RC, --max-age rc $STALE_RC)"
+    sed -n '1,15p' "$OUT/c8-stale.log" | sed 's/^/        /'
+fi
+
 printf '\n'
 if [ "$FAILURES" -gt 0 ]; then
     die "$FAILURES case(s) failed ($KIND remote)"
