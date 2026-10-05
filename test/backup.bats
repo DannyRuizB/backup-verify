@@ -78,7 +78,7 @@ setup() {
 @test "verify.sh requires a manifest" {
     run bash -c "source '$REPO/verify.sh'; parse_args"
     [ "$status" -ne 0 ]
-    [[ "$output" == *"--manifest is required"* ]]
+    [[ "$output" == *"--manifest or --latest is required"* ]]
 }
 
 @test "verify.sh reads flat keys out of a manifest" {
@@ -537,4 +537,58 @@ INSERT INTO t VALUES(1"
     [ "$output" = "stale" ]
     run bash -c "source '$REPO/verify.sh'; BV_NOW=$((now + 30 * 86400)); past_window $t0 7 && echo stale; age_days $t0"
     [ "$output" = "$(printf 'stale\n37')" ]
+}
+
+# --- verify.sh --latest: newest by the NAME stamp, not by mtime --------------
+
+_mkman() { # dir, filename, database, [kind]
+    printf '{\n  "schema": 3,\n  "database": "%s"%s\n}\n' "$3" "${4:+,\n  \"kind\": \"$4\"}" > "$1/$2"
+}
+
+@test "verify.sh --latest picks the newest stamp even when mtime says otherwise" {
+    dir=$(mktemp -d)
+    _mkman "$dir" "app_20260101T000000Z.json" app
+    _mkman "$dir" "app_20260901T000000Z.json" app   # newest by stamp
+    _mkman "$dir" "app_20260401T000000Z.json" app
+    # make the OLD one the newest by mtime, to prove ls -t would pick wrong
+    touch "$dir/app_20260101T000000Z.json"
+    run bash -c "source '$REPO/verify.sh'; basename \"\$(pick_latest_manifest '$dir' '')\""
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_20260901T000000Z.json" ]
+    rm -rf "$dir"
+}
+
+@test "verify.sh --latest --db tells siblings apart and needs --db when several DBs are present" {
+    dir=$(mktemp -d)
+    _mkman "$dir" "app_20260901T000000Z.json" app
+    _mkman "$dir" "app_prod_20260905T000000Z.json" app_prod   # sibling, newer stamp, different DB
+    # no --db: two databases -> refuse
+    run bash -c "source '$REPO/verify.sh'; pick_latest_manifest '$dir' ''"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"several databases"* ]]
+    # --db app: the sibling does not hide app's own newest
+    run bash -c "source '$REPO/verify.sh'; basename \"\$(pick_latest_manifest '$dir' app)\""
+    [ "$output" = "app_20260901T000000Z.json" ]
+    run bash -c "source '$REPO/verify.sh'; basename \"\$(pick_latest_manifest '$dir' app_prod)\""
+    [ "$output" = "app_prod_20260905T000000Z.json" ]
+    rm -rf "$dir"
+}
+
+@test "verify.sh --latest skips PITR/binlog manifests and reports an empty directory" {
+    dir=$(mktemp -d)
+    _mkman "$dir" "app_20260901T000000Z.json" app "pitr-base"
+    _mkman "$dir" "db_20260902T000000Z.json" db "binlog-full"
+    run bash -c "source '$REPO/verify.sh'; pick_latest_manifest '$dir' ''"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no dump backups with a timestamp"* ]]
+    rm -rf "$dir"
+}
+
+@test "verify.sh --latest and --manifest are mutually exclusive; --db needs --latest" {
+    run bash -c "source '$REPO/verify.sh'; parse_args --manifest x.json --latest d"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"mutually exclusive"* ]]
+    run bash -c "source '$REPO/verify.sh'; parse_args --manifest x.json --db app"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--db only means something with --latest"* ]]
 }

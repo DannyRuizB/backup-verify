@@ -120,6 +120,23 @@ else
     ./verify.sh --manifest "$MANIFEST" --image "$IMAGE"
 fi
 
+# --latest: the nightly form. It must find the one backup in $OUT by its name
+# stamp (the dir has a single database, so no --db needed) and verify it - the
+# same artefact the --manifest run just proved.
+log "VERIFY via --latest (newest by name stamp, not mtime)"
+LATEST_ARGS=(--latest "$OUT" --image "$IMAGE")
+[ "$ENCRYPTED" -eq 1 ] && LATEST_ARGS+=(--identity "$KEYFILE")
+LATEST_LOG=$(mktemp)
+if ./verify.sh "${LATEST_ARGS[@]}" >"$LATEST_LOG" 2>&1 \
+    && grep -q "latest.* in $OUT: $(basename "$MANIFEST")" "$LATEST_LOG" \
+    && grep -q 'VERIFIED:' "$LATEST_LOG"; then
+    ok "--latest found and verified $(basename "$MANIFEST")"
+else
+    sed 's/^/      /' "$LATEST_LOG"; rm -f "$LATEST_LOG"
+    die '--latest did not find and verify the newest backup'
+fi
+rm -f "$LATEST_LOG"
+
 # --max-age: the same backup proved "a month later" (BV_NOW stands in for the
 # clock) is a schedule that stopped. It must still restore - VERIFIED stays in
 # the log, the positive anchor - and the run must fail anyway.
