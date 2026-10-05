@@ -17,18 +17,29 @@
 # Usage:
 #   ./verify.sh --manifest backups/app_2026....json [--image postgres:17-alpine]
 #               [--max-age D]
+#   ./verify.sh --latest backups --db app --max-age 2   # newest, by the name stamp
 #
 # Options:
 #   --manifest FILE   manifest produced by backup.sh (the artefact sits beside it)
+#   --latest DIR      verify the NEWEST backup in DIR, chosen by the UTC stamp in
+#                     its name (the backup's real time), not by file mtime. The
+#                     nightly cron people reach for - `--manifest "$(ls -t
+#                     DIR/*.json | head -1)"` - is subtly wrong: `ls -t` is
+#                     mtime, and a restored or rsync'd backup carries the COPY
+#                     time, so the "newest" file can be an old backup. Pair with
+#                     --db when DIR holds more than one database (required then),
+#                     and with --max-age to catch a schedule that has stopped.
+#   --db NAME         with --latest, which database's backups to consider
+#                     (siblings sharing a prefix are told apart by the manifest)
 #   --identity FILE   age identity, required when the backup is encrypted
 #   --image IMAGE     container image for the throwaway instance (engine default
 #                     if omitted)
 #   --keep-container  leave the throwaway container running (for debugging)
 #   --max-age D       fail when the backup was taken more than D days ago,
 #                     even if it restores perfectly (0 = off). A nightly
-#                     `verify.sh --manifest "$(ls -t backups/*.json | head -1)"`
-#                     stays green forever once the backups stop: it keeps
-#                     proving the same old one. This makes it say so.
+#                     `verify.sh --latest backups --db app --max-age 2` stays
+#                     honest once the backups stop: it keeps proving the same
+#                     old one, and --max-age makes it say so.
 #   -h, --help        this help
 #
 # Exit codes: 0 every table matched (and, with --max-age, the backup is recent
@@ -39,6 +50,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 MANIFEST=""
+LATEST_DIR=""
+DB_FILTER=""
 IDENTITY=""
 IMAGE=""  # engine default unless overridden
 KEEP_CONTAINER=0
@@ -51,6 +64,8 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --manifest)       MANIFEST="${2:-}"; shift 2;;
+            --latest)         LATEST_DIR="${2:-}"; shift 2;;
+            --db)             DB_FILTER="${2:-}"; shift 2;;
             --identity)       IDENTITY="${2:-}"; shift 2;;
             --image)          IMAGE="${2:-}"; shift 2;;
             --keep-container) KEEP_CONTAINER=1; shift;;
@@ -59,10 +74,55 @@ parse_args() {
             *)                printf 'unknown option: %s\n' "$1" >&2; usage 1;;
         esac
     done
-    [ -n "$MANIFEST" ] || die "--manifest is required"
     case "$MAX_AGE" in
         ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
     esac
+    if [ -n "$LATEST_DIR" ]; then
+        [ -z "$MANIFEST" ] || die "--latest and --manifest are mutually exclusive"
+        MANIFEST="$(pick_latest_manifest "$LATEST_DIR" "$DB_FILTER")" || exit 1
+        log "latest${DB_FILTER:+ $DB_FILTER} in $LATEST_DIR: $(basename "$MANIFEST")"
+    elif [ -n "$DB_FILTER" ]; then
+        die "--db only means something with --latest (it picks which database's newest backup to verify)"
+    fi
+    [ -n "$MANIFEST" ] || die "--manifest or --latest is required"
+}
+
+# The UTC stamp a backup name carries ($anything_YYYYmmddTHHMMSSZ...), else the
+# manifest's created_at. Both ISO, so they sort chronologically as strings - but
+# the name stamp is preferred so ordering never mixes the two spellings.
+manifest_order_key() {
+    if [[ "$(basename "$1")" =~ _([0-9]{8}T[0-9]{6}Z) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"; return
+    fi
+    json_str "$1" created_at
+}
+
+# The newest DUMP manifest in a directory, by that key. With a database name,
+# only that database's manifests count (read from the manifest, so a sibling
+# that shares a filename prefix is told apart correctly). PITR / binlog
+# manifests are skipped - verify.sh cannot restore those. Dies with a clear
+# message when the choice is ambiguous or empty.
+pick_latest_manifest() {
+    local dir="$1" want="$2" f db kind key best="" best_key="" dbs=""
+    [ -d "$dir" ] || die "--latest: not a directory: $dir"
+    shopt -s nullglob
+    for f in "$dir"/*.json; do
+        kind="$(json_str "$f" kind)"
+        case "$kind" in pitr-*|binlog-*) continue;; esac
+        db="$(json_str "$f" database)"
+        [ -n "$db" ] || continue
+        if [ -n "$want" ] && [ "$db" != "$want" ]; then continue; fi
+        key="$(manifest_order_key "$f")"
+        [ -n "$key" ] || continue
+        case ",$dbs," in *",$db,"*) ;; *) dbs="${dbs:+$dbs,}$db";; esac
+        if [ -z "$best_key" ] || [[ "$key" > "$best_key" ]]; then best_key="$key"; best="$f"; fi
+    done
+    shopt -u nullglob
+    [ -n "$best" ] || die "--latest: no ${want:+$want }dump backups with a timestamp in $dir"
+    if [ -z "$want" ] && [[ "$dbs" == *,* ]]; then
+        die "--latest: $dir holds backups of several databases ($dbs) - pass --db NAME to choose one"
+    fi
+    printf '%s' "$best"
 }
 
 # When the backup was taken, as "EPOCH WHEN": the manifest's created_at
