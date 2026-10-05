@@ -16,6 +16,7 @@
 #
 # Usage:
 #   ./verify.sh --manifest backups/app_2026....json [--image postgres:17-alpine]
+#               [--max-age D]
 #
 # Options:
 #   --manifest FILE   manifest produced by backup.sh (the artefact sits beside it)
@@ -23,9 +24,15 @@
 #   --image IMAGE     container image for the throwaway instance (engine default
 #                     if omitted)
 #   --keep-container  leave the throwaway container running (for debugging)
+#   --max-age D       fail when the backup was taken more than D days ago,
+#                     even if it restores perfectly (0 = off). A nightly
+#                     `verify.sh --manifest "$(ls -t backups/*.json | head -1)"`
+#                     stays green forever once the backups stop: it keeps
+#                     proving the same old one. This makes it say so.
 #   -h, --help        this help
 #
-# Exit codes: 0 every table matched, non-zero otherwise.
+# Exit codes: 0 every table matched (and, with --max-age, the backup is recent
+# enough), non-zero otherwise.
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -35,6 +42,7 @@ MANIFEST=""
 IDENTITY=""
 IMAGE=""  # engine default unless overridden
 KEEP_CONTAINER=0
+MAX_AGE=0
 PROBE=""
 
 usage() { sed -n '2,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -46,12 +54,36 @@ parse_args() {
             --identity)       IDENTITY="${2:-}"; shift 2;;
             --image)          IMAGE="${2:-}"; shift 2;;
             --keep-container) KEEP_CONTAINER=1; shift;;
+            --max-age)        MAX_AGE="${2:-}"; shift 2;;
             -h|--help)        usage 0;;
             *)                printf 'unknown option: %s\n' "$1" >&2; usage 1;;
         esac
     done
     [ -n "$MANIFEST" ] || die "--manifest is required"
+    case "$MAX_AGE" in
+        ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
+    esac
 }
+
+# When the backup was taken, as "EPOCH WHEN": the manifest's created_at
+# (schema 3), else the UTC stamp backup.sh puts in every name. Nothing when
+# neither is there - an age nobody can read is not an age.
+manifest_taken() {
+    local m="$1" when stamp
+    when="$(json_str "$m" created_at)"
+    if [ -z "$when" ] && [[ "$(basename "$m")" =~ _([0-9]{8}T[0-9]{6}Z) ]]; then
+        stamp="${BASH_REMATCH[1]}"
+        when="${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z"
+    fi
+    [ -n "$when" ] || return 0
+    printf '%s %s' "$(date -u -d "$when" +%s)" "$when"
+}
+
+# Whole days since EPOCH ($BV_NOW stands in for now), and whether that is
+# past a D-day window - exactly D days old is still inside, like
+# stale_databases.
+age_days() { printf '%s' $(( ( ${BV_NOW:-$(date -u +%s)} - $1 ) / 86400 )); }
+past_window() { [ $(( ${BV_NOW:-$(date -u +%s)} - $1 )) -gt $(( $2 * 86400 )) ]; }
 
 # The manifest readers (json_str, json_num, manifest_section, manifest_tables)
 # live in lib/common.sh: offsite.sh reads manifests too, and two copies of a
@@ -103,6 +135,16 @@ main() {
         encryption_available || die "the backup is age-encrypted but 'age' is not installed"
     elif [ -n "$IDENTITY" ]; then
         warn '--identity given but this backup is not encrypted - ignoring it'
+    fi
+
+    # Read the age before booting anything: with --max-age, a manifest that
+    # cannot say when it was taken is refused up front, not after a restore.
+    local taken="" taken_epoch="" taken_when=""
+    if [ "$MAX_AGE" -gt 0 ]; then
+        taken="$(manifest_taken "$MANIFEST")"
+        [ -n "$taken" ] || die "--max-age needs to know when the backup was taken, and this manifest has no created_at and no stamp in its name"
+        taken_epoch="${taken%% *}"
+        taken_when="${taken#* }"
     fi
 
     log "verifying $ENG_NAME backup of '$db' -> $(basename "$artefact")"
@@ -207,6 +249,16 @@ main() {
     ok "VERIFIED: $checked ${ENG_UNIT}(s) restored byte-for-byte identical to the source."
     if [ "$restore_rc" -ne 0 ]; then
         warn "note: the restore exited $restore_rc yet the content matched - inspect before trusting"
+    fi
+
+    # --- Gate 7: is it the backup you think it is? ---------------------------
+    # Last on purpose: the restore proof above stands either way, and the log
+    # keeps it. What fails here is the schedule, not the backup.
+    if [ "$MAX_AGE" -gt 0 ]; then
+        if past_window "$taken_epoch" "$MAX_AGE"; then
+            die "STALE: this backup restores, but it was taken $(age_days "$taken_epoch") days ago ($taken_when), past --max-age $MAX_AGE: backups have stopped arriving, and proving the newest one keeps proving an old one."
+        fi
+        ok "taken $(age_days "$taken_epoch") day(s) ago ($taken_when), within --max-age $MAX_AGE"
     fi
 }
 

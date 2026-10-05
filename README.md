@@ -22,6 +22,7 @@ engine.
 ```bash
 ./backup.sh --container my-postgres --db app --out ./backups --keep 7 --keep-days 14
 ./verify.sh --manifest ./backups/app_20260803T120447Z.json
+./verify.sh --manifest "$(ls -t ./backups/*.json | head -1)" --max-age 2   # nightly: and fail if the newest backup is > 2 days old
 
 # MySQL / MariaDB: same promise, same gates
 ./backup.sh --engine mysql --container my-mysql --db app --out ./backups
@@ -128,13 +129,14 @@ triggers — as a count plus a fingerprint of their definitions, and `verify.sh`
 compares each class. A missing index is a failure, and so is an index that came
 back on the wrong column.
 
-Three more ways a backup lies, all measured, all covered by the negative suite:
+More ways a backup lies, all measured, all covered by the test suites:
 
 | What looks fine | What is actually happening |
 |---|---|
 | `backup.sh` finished, file exists | A failed `pg_dump` leaves **0 bytes**; piped through `gzip`, **~20 bytes** of perfectly valid *empty* archive |
 | The nightly cron reported success | `pg_dump ... \| gzip > out.gz` exits **0 even when pg_dump fails** — without `set -o pipefail` the pipeline's status is gzip's |
 | The archive verified last month | Bit rot, a half-finished copy, a truncated upload: the sha256 in the manifest catches it *before* wasting a restore |
+| The nightly `verify.sh` on the newest backup is green, every night | **Once the backup job stops, "the newest" is the same old file every night** — and it keeps restoring perfectly. `--max-age D` fails it anyway: the restore proof stays in the log (`VERIFIED`), then `STALE: … taken 30 days ago`. Age comes from the manifest's `created_at` (the name stamp for older manifests); a manifest with neither is refused up front. The e2e proves it in every engine job with the clock moved 30 days ahead |
 
 ## Encryption, and why it needs the same suspicion
 

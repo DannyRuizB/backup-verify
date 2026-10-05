@@ -120,6 +120,24 @@ else
     ./verify.sh --manifest "$MANIFEST" --image "$IMAGE"
 fi
 
+# --max-age: the same backup proved "a month later" (BV_NOW stands in for the
+# clock) is a schedule that stopped. It must still restore - VERIFIED stays in
+# the log, the positive anchor - and the run must fail anyway.
+log "VERIFY again with --max-age 7 and the clock 30 days ahead (must restore AND fail)"
+VERIFY_ARGS=(--manifest "$MANIFEST" --image "$IMAGE" --max-age 7)
+[ "$ENCRYPTED" -eq 1 ] && VERIFY_ARGS+=(--identity "$KEYFILE")
+STALE_LOG=$(mktemp)
+STALE_RC=0
+BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) ./verify.sh "${VERIFY_ARGS[@]}" >"$STALE_LOG" 2>&1 || STALE_RC=$?
+if [ "$STALE_RC" -eq 0 ] || ! grep -q 'VERIFIED:' "$STALE_LOG" \
+    || ! grep -q 'STALE: this backup restores, but it was taken 30 days ago' "$STALE_LOG"; then
+    sed 's/^/      /' "$STALE_LOG"
+    rm -f "$STALE_LOG"
+    die "--max-age did not fail a 30-day-old backup that restores (rc $STALE_RC)"
+fi
+rm -f "$STALE_LOG"
+ok '--max-age 7 a month later: VERIFIED, and failed as STALE'
+
 if [ "$ENCRYPTED" -eq 1 ]; then
     ok "e2e passed: the ENCRYPTED $ENG_NAME backup decrypted and restored identically after the source was destroyed"
 else
