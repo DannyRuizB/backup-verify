@@ -498,3 +498,43 @@ INSERT INTO t VALUES(1"
     [ ! -e "$out/$newest" ]
     [[ "$output" == *"kept 1 of 3"* ]]
 }
+
+# --- verify.sh --max-age: a nightly verify that keeps proving an old backup ---
+
+@test "verify.sh --max-age is validated" {
+    run bash -c "source '$REPO/verify.sh'; parse_args --manifest x.json --max-age soon"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age must be a non-negative integer, got 'soon'"* ]]
+    run bash -c "source '$REPO/verify.sh'; parse_args --manifest x.json --max-age 7; echo \$MAX_AGE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "7" ]
+    run bash "$REPO/verify.sh" --help
+    [[ "$output" == *"--max-age D"* ]]
+}
+
+@test "verify.sh manifest_taken reads created_at, else the name stamp, else nothing" {
+    dir=$(mktemp -d)
+    printf '{\n  "schema": 3,\n  "created_at": "2026-08-20T03:00:00Z",\n  "database": "app"\n}\n' > "$dir/app_20260101T000000Z.json"
+    run bash -c "source '$REPO/verify.sh'; manifest_taken '$dir/app_20260101T000000Z.json'"
+    [ "$output" = "$(date -u -d 2026-08-20T03:00:00Z +%s) 2026-08-20T03:00:00Z" ]
+    # schema 1/2: no created_at, the name stamp answers
+    printf '{\n  "database": "app"\n}\n' > "$dir/app_20260815T120000Z.json"
+    run bash -c "source '$REPO/verify.sh'; manifest_taken '$dir/app_20260815T120000Z.json'"
+    [ "$output" = "$(date -u -d 2026-08-15T12:00:00Z +%s) 2026-08-15T12:00:00Z" ]
+    # neither: nothing, so --max-age can refuse instead of guessing
+    cp "$dir/app_20260815T120000Z.json" "$dir/manual-copy.json"
+    run bash -c "source '$REPO/verify.sh'; manifest_taken '$dir/manual-copy.json'"
+    [ -z "$output" ]
+    rm -rf "$dir"
+}
+
+@test "verify.sh past_window: exactly D days old is inside, a second more is not" {
+    t0=$(date -u -d 2026-09-03T12:00:00Z +%s)
+    now=$(date -u -d 2026-09-10T12:00:00Z +%s)
+    run bash -c "source '$REPO/verify.sh'; BV_NOW=$now; past_window $t0 7 && echo stale || echo fresh; age_days $t0"
+    [ "$output" = "$(printf 'fresh\n7')" ]
+    run bash -c "source '$REPO/verify.sh'; BV_NOW=$((now + 1)); past_window $t0 7 && echo stale || echo fresh"
+    [ "$output" = "stale" ]
+    run bash -c "source '$REPO/verify.sh'; BV_NOW=$((now + 30 * 86400)); past_window $t0 7 && echo stale; age_days $t0"
+    [ "$output" = "$(printf 'stale\n37')" ]
+}
