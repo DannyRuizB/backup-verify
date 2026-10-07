@@ -50,6 +50,7 @@ age-keygen -o key.txt
 ./pitr.sh check  --archive /srv/wal-archive --container my-postgres
 ./pitr.sh verify --base ./backups/app_..._base.json \
                  --mark ./backups/app_..._mark.json --archive /srv/wal-archive
+./pitr.sh verify --latest ./backups --db app --archive /srv/wal-archive   # nightly: the newest mark, from the newest base that reaches it
 
 # ...and get the instant off the machine, chain and all:
 ./pitr.sh push  --base ./backups/app_..._base.json --mark ./backups/app_..._mark.json \
@@ -72,6 +73,7 @@ age-keygen -o key.txt
 ./binlog.sh verify --base ./backups/app_..._binlogbase.json \
                    --mark ./backups/app_..._binlogmark.json \
                    --archive /srv/binlog-archive --tools ./tools
+./binlog.sh verify --latest ./backups --db app --archive /srv/binlog-archive --tools ./tools
 
 # ...and off the machine too, same remotes, same receipts:
 ./binlog.sh push  --base ./backups/app_..._binlogbase.json \
@@ -138,6 +140,7 @@ More ways a backup lies, all measured, all covered by the test suites:
 | The archive verified last month | Bit rot, a half-finished copy, a truncated upload: the sha256 in the manifest catches it *before* wasting a restore |
 | The nightly `verify.sh` on the newest backup is green, every night | **Once the backup job stops, "the newest" is the same old file every night** — and it keeps restoring perfectly. `--max-age D` fails it anyway: the restore proof stays in the log (`VERIFIED`), then `STALE: … taken 30 days ago`. Age comes from the manifest's `created_at` (the name stamp for older manifests); a manifest with neither is refused up front. The e2e proves it in every engine job with the clock moved 30 days ahead |
 | `verify.sh --manifest "$(ls -t *.json \| head -1)"` verifies the newest backup | **`ls -t` is mtime, not backup time.** A backup that was restored, rsync'd or `cp`'d carries the COPY time, so the "newest" file can be an *old* backup — the nightly check then proves the wrong one and stays green. `--latest DIR` chooses by the UTC **stamp in the name** (what `backup.sh` wrote at backup time) instead, tells sibling databases apart by the manifest, and refuses to guess when a directory holds several (pass `--db`). Measured in every engine e2e: `--latest` finds and verifies the backup the `--manifest` run just proved |
+| A nightly PITR drill on "the newest mark" | **Two files have to agree, and "newest" has to mean the same thing for both.** `pitr.sh verify --latest DIR` / `binlog.sh verify --latest DIR` pick the newest **mark** by the stamp in its name (never mtime), then the newest **base** that can actually replay to it — same timeline and a WAL start at or before the mark (PostgreSQL), same binlog series and an anchor at or before the mark (MySQL): the exact pair `pull` would bring back. A base taken *after* the mark is skipped, not tried. And when no base reaches the newest mark, it **fails** instead of quietly proving an older mark — a green tick on an instant nobody asked about would hide that the newest one is unprovable. Shares one picker (`lib/common.sh`) between both scripts; exercised in the e2e (the post-prune drill, and the drill to the second mark) and pinned by bats with fabricated manifests |
 
 ## Encryption, and why it needs the same suspicion
 

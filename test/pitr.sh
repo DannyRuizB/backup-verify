@@ -352,8 +352,14 @@ fi
 echo '== Case 7: after every mutation was undone, the drill still passes =='
 # The suite must leave the archive as it found it - proven the only honest
 # way: the same recovery, byte-for-byte, one more time.
-if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify2.log" 2>&1; then
-    pass_case 'the archive still reproduces the mark exactly'
+# ...and run as the nightly job would: `--latest` over the backup directory.
+if ./pitr.sh verify --latest "$OUT/backups" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify2.log" 2>&1; then
+    if grep -q "mark $(basename "$M") from base $(basename "$B")" "$OUT/verify2.log"; then
+        pass_case 'the archive still reproduces the mark exactly (picked by verify --latest)'
+    else
+        fail_case 'verify --latest passed, but not on the expected mark / base'
+        grep 'latest in' "$OUT/verify2.log" | sed 's/^/        /'
+    fi
 else
     fail_case 'the harness broke the archive it was testing'
     sed -n '1,20p' "$OUT/verify2.log" | sed 's/^/        /'
@@ -441,8 +447,15 @@ if BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) ./pitr.sh prune --db app --out "$BK
         fail_case 'check --archive failed after retention - the prune cut into a chain a kept base needs'
         sed -n '1,20p' "$OUT/check9.log" | sed 's/^/        /'
     fi
-    if ./pitr.sh verify --base "$B9B" --mark "$M9B" --archive "$ARCHIVE9" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify9.log" 2>&1; then
-        pass_case 'the newest mark still reproduces exactly on the pruned archive'
+    # By --latest: the first mark may have survived (when it sits above the
+    # cut), so the choice is real - the newest mark, from the kept base.
+    if ./pitr.sh verify --latest "$BK9" --archive "$ARCHIVE9" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify9.log" 2>&1; then
+        if grep -q "mark $(basename "$M9B") from base $(basename "$B9B")" "$OUT/verify9.log"; then
+            pass_case 'the newest mark still reproduces exactly on the pruned archive (picked by verify --latest)'
+        else
+            fail_case 'verify --latest passed on the pruned archive, but not on the newest mark / kept base'
+            grep 'latest in' "$OUT/verify9.log" | sed 's/^/        /'
+        fi
     else
         fail_case 'the newest mark no longer verifies after the prune'
         sed -n '1,25p' "$OUT/verify9.log" | sed 's/^/        /'

@@ -92,6 +92,50 @@ name_stamp() {
     if [[ "$stamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then printf '%s' "$stamp"; fi
 }
 
+# The newest provable PAIR in a local directory, for `verify --latest` of
+# pitr.sh and binlog.sh: the newest MARK by the stamp in its name (never by
+# mtime - a copied file lies), then the newest BASE of the same database that
+# can reach it, decided by the caller's reach function. The same choice pull
+# makes at a remote. When no base reaches the newest mark it dies instead of
+# falling back to an older mark: proving an instant nobody asked about would
+# be a green tick over the real question.
+#   $1 dir  $2 database or ""  $3 mark suffix (mark.json)  $4 mark kind
+#   $5 base suffix (base.json)  $6 base kind  $7 reach function (base mark)
+# Prints "BASE<TAB>MARK" (paths).
+pick_latest_pair() {
+    local dir="$1" want="$2" msuf="$3" mkind="$4" bsuf="$5" bkind="$6" reach="$7"
+    local f name db stamp best="" best_stamp="" best_db="" dbs=""
+    [ -d "$dir" ] || die "--latest: not a directory: $dir"
+    shopt -s nullglob
+    for f in "$dir"/*_"$msuf"; do
+        [ "$(json_str "$f" kind)" = "$mkind" ] || continue
+        db="$(json_str "$f" database)"
+        [ -n "$db" ] || continue
+        if [ -n "$want" ] && [ "$db" != "$want" ]; then continue; fi
+        name="$(basename "$f")"
+        stamp="$(DB="$db" name_stamp "$name")"
+        [ -n "$stamp" ] || continue   # a name that does not belong to its own database
+        case ",$dbs," in *",$db,"*) ;; *) dbs="${dbs:+$dbs,}$db";; esac
+        if [ -z "$best_stamp" ] || [[ "$stamp" > "$best_stamp" ]]; then
+            best_stamp="$stamp"; best="$f"; best_db="$db"
+        fi
+    done
+    shopt -u nullglob
+    [ -n "$best" ] || die "--latest: no ${want:+$want }marks ($mkind) with a timestamp in $dir"
+    if [ -z "$want" ] && [[ "$dbs" == *,* ]]; then
+        die "--latest: $dir holds marks of several databases ($dbs) - pass --db NAME to choose one"
+    fi
+    local base=""
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        [ -n "$(DB="$best_db" name_stamp "$name")" ] || continue   # a sibling's base
+        [ "$(json_str "$dir/$name" kind)" = "$bkind" ] || continue
+        if "$reach" "$dir/$name" "$best"; then base="$dir/$name"; break; fi
+    done < <(find "$dir" -maxdepth 1 -name "${best_db}_*_$bsuf" -printf '%f\n' 2>/dev/null | LC_ALL=C sort -r)
+    [ -n "$base" ] || die "--latest: the newest mark $(basename "$best") has no base in $dir that can reach it - refusing to fall back to an older mark (that would prove an instant nobody asked about)"
+    printf '%s\t%s' "$base" "$best"
+}
+
 # Retention, as a pure decision: no filesystem, no remote (the bats tests call
 # it directly, and backup.sh's local retention and offsite.sh's remote one
 # share it - two copies of "which backups go" would drift). Reads

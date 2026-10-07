@@ -534,3 +534,104 @@ fabricate_pair() {
     [ "$status" -eq 0 ]
     [ "$output" = "app_prod 20260821T000000Z" ]
 }
+
+# --- verify --latest: the newest MARK by name stamp, then the newest base that reaches it
+
+_pm() { # dir, file, db, kind, key=string... key#number...
+    local dir="$1" file="$2" db="$3" kind="$4"; shift 4
+    { printf '{\n  "database": "%s",\n  "kind": "%s"' "$db" "$kind"
+      local kv; for kv in "$@"; do
+          case "$kv" in
+              *=*) printf ',\n  "%s": "%s"' "${kv%%=*}" "${kv#*=}";;
+              *'#'*) printf ',\n  "%s": %s' "${kv%%#*}" "${kv#*#}";;
+          esac
+      done; printf '\n}\n'; } > "$dir/$file"
+}
+_pick_pitr() { # dir, db -> "BASE MARK" basenames, or the error
+    bash -c "source '$REPO/pitr.sh'; source '$REPO/lib/postgres.sh'; p=\"\$(pick_latest_pair '$1' '$2' mark.json pitr-mark base.json pitr-base pitr_base_reaches)\" || exit 1; b=\"\${p%%\$'\t'*}\"; m=\"\${p##*\$'\t'}\"; echo \"\$(basename \"\$b\") \$(basename \"\$m\")\""
+}
+
+@test "pitr verify --latest: newest mark by stamp (not mtime), newest base that can reach it" {
+    dir=$(mktemp -d)
+    S='wal_segment_bytes#16777216'
+    _pm "$dir" app_20260901T000000Z_base.json app pitr-base wal_start_file=000000010000000000000010 "$S"
+    _pm "$dir" app_20260903T000000Z_base.json app pitr-base wal_start_file=000000010000000000000020 "$S"
+    # a base taken AFTER the newest mark: its WAL starts past it, it cannot replay there
+    _pm "$dir" app_20260906T000000Z_base.json app pitr-base wal_start_file=000000010000000000000040 "$S"
+    _pm "$dir" app_20260902T000000Z_mark.json app pitr-mark wal_file=000000010000000000000015
+    _pm "$dir" app_20260905T000000Z_mark.json app pitr-mark wal_file=000000010000000000000030
+    touch "$dir/app_20260902T000000Z_mark.json"   # newest by mtime, oldest by stamp
+    run _pick_pitr "$dir" ""
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_20260903T000000Z_base.json app_20260905T000000Z_mark.json" ]
+    rm -rf "$dir"
+}
+
+@test "pitr verify --latest: a base on another timeline does not count" {
+    dir=$(mktemp -d)
+    S='wal_segment_bytes#16777216'
+    _pm "$dir" app_20260901T000000Z_base.json app pitr-base wal_start_file=000000010000000000000010 "$S"
+    _pm "$dir" app_20260903T000000Z_base.json app pitr-base wal_start_file=000000020000000000000011 "$S"
+    _pm "$dir" app_20260905T000000Z_mark.json app pitr-mark wal_file=000000010000000000000030
+    run _pick_pitr "$dir" ""
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_20260901T000000Z_base.json app_20260905T000000Z_mark.json" ]
+    rm -rf "$dir"
+}
+
+@test "pitr verify --latest: no base reaches the newest mark -> error, never an older mark" {
+    dir=$(mktemp -d)
+    S='wal_segment_bytes#16777216'
+    _pm "$dir" app_20260901T000000Z_base.json app pitr-base wal_start_file=000000010000000000000010 "$S"
+    _pm "$dir" app_20260902T000000Z_mark.json app pitr-mark wal_file=000000010000000000000015   # reachable, but older
+    _pm "$dir" app_20260905T000000Z_mark.json app pitr-mark wal_file=000000020000000000000030   # newest, timeline 2
+    run _pick_pitr "$dir" ""
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"app_20260905T000000Z_mark.json has no base"* ]]
+    [[ "$output" == *"refusing to fall back to an older mark"* ]]
+    rm -rf "$dir"
+}
+
+@test "pitr verify --latest: several databases need --db, and a sibling's files never count" {
+    dir=$(mktemp -d)
+    S='wal_segment_bytes#16777216'
+    _pm "$dir" app_20260901T000000Z_base.json app pitr-base wal_start_file=000000010000000000000010 "$S"
+    _pm "$dir" app_20260902T000000Z_mark.json app pitr-mark wal_file=000000010000000000000015
+    # app_prod: newer stamps, and its base would sort first under the app_* glob
+    _pm "$dir" app_prod_20260909T000000Z_base.json app_prod pitr-base wal_start_file=000000010000000000000001 "$S"
+    _pm "$dir" app_prod_20260910T000000Z_mark.json app_prod pitr-mark wal_file=000000010000000000000002
+    run _pick_pitr "$dir" ""
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"several databases"* ]]
+    run _pick_pitr "$dir" app
+    [ "$status" -eq 0 ]
+    [ "$output" = "app_20260901T000000Z_base.json app_20260902T000000Z_mark.json" ]
+    run _pick_pitr "$dir" app_prod
+    [ "$output" = "app_prod_20260909T000000Z_base.json app_prod_20260910T000000Z_mark.json" ]
+    rm -rf "$dir"
+}
+
+@test "pitr verify --latest: an empty directory says so; dump manifests are not marks" {
+    dir=$(mktemp -d)
+    printf '{\n  "database": "app"\n}\n' > "$dir/app_20260901T000000Z.json"
+    run _pick_pitr "$dir" ""
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no marks (pitr-mark) with a timestamp"* ]]
+    rm -rf "$dir"
+}
+
+@test "pitr verify --latest excludes --base/--mark, belongs to verify, and --db needs it" {
+    arch=$(mktemp -d)
+    run bash -c "source '$REPO/pitr.sh'; parse_args verify --latest /tmp --base b.json --archive '$arch'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"drop --base/--mark"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args check --latest /tmp --archive '$arch'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--latest belongs to verify"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args verify --base b.json --mark m.json --db app --archive '$arch'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--db only means something with --latest"* ]]
+    run bash -c "source '$REPO/pitr.sh'; parse_args verify --latest /tmp --db app --archive '$arch'"
+    [ "$status" -eq 0 ]
+    rm -rf "$arch"
+}

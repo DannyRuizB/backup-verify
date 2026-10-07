@@ -52,6 +52,7 @@
 #   ./binlog.sh check  --archive DIR [--container NAME [--identity FILE]]
 #   ./binlog.sh check  --remote REMOTE [--db NAME] [--max-age D]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
+#   ./binlog.sh verify --latest DIR [--db NAME] --archive DIR --tools DIR
 #                      [--image IMAGE] [--identity FILE]
 #   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
@@ -89,6 +90,12 @@
 #   --out DIR         where manifests are written (default ./backups)
 #   --base FILE       base-dump manifest (verify)
 #   --mark FILE       mark manifest to recover to (verify)
+#   --latest DIR      (verify) instead of --base/--mark: the NEWEST mark in DIR,
+#                     chosen by the UTC stamp in its name (not mtime), and the
+#                     newest base there that can reach it - the pair pull would
+#                     bring back. With several databases in DIR, --db picks one.
+#                     No base reaching the newest mark is an error, never a
+#                     quiet fall-back to an older mark.
 #   --tools DIR       directory holding a mysqlbinlog binary matching the
 #                     server major (the official image ships none; extract it
 #                     from the official mysql-community-client RPM)
@@ -147,6 +154,7 @@ ARCHIVE_DIR=""
 OUT_DIR="./backups"
 BASE_MANIFEST=""
 MARK_MANIFEST=""
+LATEST_DIR=""
 IMAGE=""
 LABEL=""
 TIMEOUT=90
@@ -179,6 +187,7 @@ parse_args() {
             --out)            OUT_DIR="${2:-}"; shift 2;;
             --base)           BASE_MANIFEST="${2:-}"; shift 2;;
             --mark)           MARK_MANIFEST="${2:-}"; shift 2;;
+            --latest)         LATEST_DIR="${2:-}"; shift 2;;
             --image)          IMAGE="${2:-}"; shift 2;;
             --label)          LABEL="${2:-}"; shift 2;;
             --timeout)        TIMEOUT="${2:-}"; shift 2;;
@@ -231,6 +240,8 @@ parse_args() {
     if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
         die "identity file not found: $IDENTITY"
     fi
+    [ -z "$LATEST_DIR" ] || [ "$SUBCMD" = verify ] \
+        || die "--latest belongs to verify (prove the newest mark in a directory)"
     case "$SUBCMD" in
         base|mark)
             [ -n "$CONTAINER" ] || die "$SUBCMD needs --container (where the database lives)"
@@ -245,8 +256,15 @@ parse_args() {
                 die "--identity only makes sense with --recipient here (there is nothing to decrypt)"
             fi;;
         verify)
-            [ -n "$BASE_MANIFEST" ] || die "verify needs --base (the base-dump manifest)"
-            [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove)"
+            if [ -n "$LATEST_DIR" ]; then
+                if [ -n "$BASE_MANIFEST" ] || [ -n "$MARK_MANIFEST" ]; then
+                    die "--latest picks the base and the mark itself - drop --base/--mark"
+                fi
+            else
+                [ -z "$DB" ] || die "verify --db only means something with --latest (it picks which database's newest mark to prove)"
+                [ -n "$BASE_MANIFEST" ] || die "verify needs --base (the base-dump manifest), or --latest DIR"
+                [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove), or --latest DIR"
+            fi
             [ -n "$TOOLS_DIR" ] || die "verify needs --tools (a directory holding mysqlbinlog - the official image ships none; see the header)"
             [ -x "$TOOLS_DIR/mysqlbinlog" ] || die "no executable mysqlbinlog in $TOOLS_DIR"
             [ -z "$RECIPIENT" ] || die "--recipient is a backup-time option - verify only ever needs --identity";;
@@ -1340,8 +1358,30 @@ cleanup() {
     fi
 }
 
+# verify --latest: a base can replay to a mark when both name the same binlog
+# series and the base's anchor sits at or before the mark - the test pull
+# applies at a remote.
+binlog_base_reaches() {
+    local base="$1" mark="$2" bfile bpos mfile mpos
+    bfile="$(json_str "$base" anchor_file)"
+    bpos="$(json_num "$base" anchor_pos)"
+    mfile="$(json_str "$mark" mark_file)"
+    mpos="$(json_num "$mark" mark_pos)"
+    [ -n "$bfile" ] && [ -n "$bpos" ] && [ -n "$mfile" ] && [ -n "$mpos" ] || return 1
+    [ "$(binlog_prefix_of "$bfile")" = "$(binlog_prefix_of "$mfile")" ] || return 1
+    [ "$(binlog_index_of "$bfile")" -lt "$(binlog_index_of "$mfile")" ] && return 0
+    [ "$(binlog_index_of "$bfile")" -eq "$(binlog_index_of "$mfile")" ] && [ "$bpos" -le "$mpos" ]
+}
+
 cmd_verify() {
     need docker
+    if [ -n "$LATEST_DIR" ]; then
+        local pair
+        pair="$(pick_latest_pair "$LATEST_DIR" "$DB" binlogmark.json binlog-mark binlogbase.json binlog-base binlog_base_reaches)" || exit 1
+        BASE_MANIFEST="${pair%%$'\t'*}"
+        MARK_MANIFEST="${pair##*$'\t'}"
+        log "latest in $LATEST_DIR: mark $(basename "$MARK_MANIFEST") from base $(basename "$BASE_MANIFEST")"
+    fi
     local kind
     [ -f "$BASE_MANIFEST" ] || die "base manifest not found: $BASE_MANIFEST"
     [ -f "$MARK_MANIFEST" ] || die "mark manifest not found: $MARK_MANIFEST"
