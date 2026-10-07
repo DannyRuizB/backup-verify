@@ -30,6 +30,7 @@
 #   ./pitr.sh check  --archive DIR [--container NAME]
 #   ./pitr.sh check  --remote REMOTE [--db NAME] [--max-age D]
 #   ./pitr.sh verify --base FILE --mark FILE --archive DIR [--image IMAGE]
+#   ./pitr.sh verify --latest DIR [--db NAME] --archive DIR
 #   ./pitr.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./pitr.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
 #   ./pitr.sh prune  --db NAME --out DIR --archive DIR [--keep N] [--keep-days D]
@@ -67,6 +68,12 @@
 #   --out DIR         where base/mark manifests are written (default ./backups)
 #   --base FILE       base-backup manifest (verify)
 #   --mark FILE       mark manifest to recover to (verify)
+#   --latest DIR      (verify) instead of --base/--mark: the NEWEST mark in DIR,
+#                     chosen by the UTC stamp in its name (not mtime), and the
+#                     newest base there that can reach it - the pair pull would
+#                     bring back. With several databases in DIR, --db picks one.
+#                     No base reaching the newest mark is an error, never a
+#                     quiet fall-back to an older mark.
 #   --image IMAGE     image for the throwaway instance (default: the major
 #                     version recorded in the base manifest, -alpine)
 #   --label TEXT      extra label in the base artefact name
@@ -124,6 +131,7 @@ ARCHIVE_DIR=""
 OUT_DIR="./backups"
 BASE_MANIFEST=""
 MARK_MANIFEST=""
+LATEST_DIR=""
 IMAGE=""
 LABEL=""
 TIMEOUT=90
@@ -156,6 +164,7 @@ parse_args() {
             --out)            OUT_DIR="${2:-}"; shift 2;;
             --base)           BASE_MANIFEST="${2:-}"; shift 2;;
             --mark)           MARK_MANIFEST="${2:-}"; shift 2;;
+            --latest)         LATEST_DIR="${2:-}"; shift 2;;
             --image)          IMAGE="${2:-}"; shift 2;;
             --label)          LABEL="${2:-}"; shift 2;;
             --timeout)        TIMEOUT="${2:-}"; shift 2;;
@@ -205,6 +214,8 @@ parse_args() {
     if [ -n "$IDENTITY" ] && [ ! -f "$IDENTITY" ]; then
         die "identity file not found: $IDENTITY"
     fi
+    [ -z "$LATEST_DIR" ] || [ "$SUBCMD" = verify ] \
+        || die "--latest belongs to verify (prove the newest mark in a directory)"
     case "$SUBCMD" in
         base|mark)
             [ -n "$CONTAINER" ] || die "$SUBCMD needs --container (where the database lives)"
@@ -213,8 +224,15 @@ parse_args() {
                 die "base --recipient requires --identity: the backup_label (which WAL segment recovery starts at) lives INSIDE the artefact, and a base whose birth certificate cannot be read is not a base - and the key gets proven today, not at restore time"
             fi;;
         verify)
-            [ -n "$BASE_MANIFEST" ] || die "verify needs --base (the base-backup manifest)"
-            [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove)";;
+            if [ -n "$LATEST_DIR" ]; then
+                if [ -n "$BASE_MANIFEST" ] || [ -n "$MARK_MANIFEST" ]; then
+                    die "--latest picks the base and the mark itself - drop --base/--mark"
+                fi
+            else
+                [ -z "$DB" ] || die "verify --db only means something with --latest (it picks which database's newest mark to prove)"
+                [ -n "$BASE_MANIFEST" ] || die "verify needs --base (the base-backup manifest), or --latest DIR"
+                [ -n "$MARK_MANIFEST" ] || die "verify needs --mark (the instant to prove), or --latest DIR"
+            fi;;
         push)
             [ -n "$BASE_MANIFEST" ] || die "push needs --base (the base-backup manifest)"
             [ -n "$MARK_MANIFEST" ] || die "push needs --mark (the instant the remote must be able to prove)"
@@ -1331,9 +1349,29 @@ cleanup() {
     fi
 }
 
+# verify --latest: a base can replay to a mark when both sit on the same
+# timeline and the base's WAL starts at or before the mark's segment - the
+# test pull applies at a remote.
+pitr_base_reaches() {
+    local base="$1" mark="$2" bstart bbytes mfile
+    bstart="$(json_str "$base" wal_start_file)"
+    bbytes="$(json_num "$base" wal_segment_bytes)"
+    mfile="$(json_str "$mark" wal_file)"
+    [ -n "$bstart" ] && [ -n "$bbytes" ] && [ -n "$mfile" ] || return 1
+    [ "$(wal_name_timeline "$bstart")" = "$(wal_name_timeline "$mfile")" ] || return 1
+    [ "$(wal_name_index "$bstart" "$bbytes")" -le "$(wal_name_index "$mfile" "$bbytes")" ]
+}
+
 cmd_verify() {
     need docker
     need tar
+    if [ -n "$LATEST_DIR" ]; then
+        local pair
+        pair="$(pick_latest_pair "$LATEST_DIR" "$DB" mark.json pitr-mark base.json pitr-base pitr_base_reaches)" || exit 1
+        BASE_MANIFEST="${pair%%$'\t'*}"
+        MARK_MANIFEST="${pair##*$'\t'}"
+        log "latest in $LATEST_DIR: mark $(basename "$MARK_MANIFEST") from base $(basename "$BASE_MANIFEST")"
+    fi
     [ -f "$BASE_MANIFEST" ] || die "base manifest not found: $BASE_MANIFEST"
     [ -f "$MARK_MANIFEST" ] || die "mark manifest not found: $MARK_MANIFEST"
 

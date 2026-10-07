@@ -523,3 +523,69 @@ fabricate_pair() {
     [ "$status" -eq 0 ]
     [ "$output" = "app_prod 20260821T000000Z" ]
 }
+
+# --- verify --latest: the newest MARK by name stamp, then the newest base that reaches it
+
+_bm() { # dir, file, db, kind, key=string... key#number...
+    local dir="$1" file="$2" db="$3" kind="$4"; shift 4
+    { printf '{\n  "database": "%s",\n  "kind": "%s"' "$db" "$kind"
+      local kv; for kv in "$@"; do
+          case "$kv" in
+              *=*) printf ',\n  "%s": "%s"' "${kv%%=*}" "${kv#*=}";;
+              *'#'*) printf ',\n  "%s": %s' "${kv%%#*}" "${kv#*#}";;
+          esac
+      done; printf '\n}\n'; } > "$dir/$file"
+}
+_pick_binlog() {
+    bash -c "source '$REPO/binlog.sh'; p=\"\$(pick_latest_pair '$1' '$2' binlogmark.json binlog-mark binlogbase.json binlog-base binlog_base_reaches)\" || exit 1; b=\"\${p%%\$'\t'*}\"; m=\"\${p##*\$'\t'}\"; echo \"\$(basename \"\$b\") \$(basename \"\$m\")\""
+}
+
+@test "binlog verify --latest: newest mark by stamp; a base anchored past it (same file, later pos) is skipped" {
+    dir=$(mktemp -d)
+    _bm "$dir" shop_20260901T000000Z_binlogbase.json shop binlog-base anchor_file=binlog.000002 'anchor_pos#157'
+    _bm "$dir" shop_20260903T000000Z_binlogbase.json shop binlog-base anchor_file=binlog.000003 'anchor_pos#900'
+    _bm "$dir" shop_20260902T000000Z_binlogmark.json shop binlog-mark mark_file=binlog.000002 'mark_pos#500'
+    _bm "$dir" shop_20260905T000000Z_binlogmark.json shop binlog-mark mark_file=binlog.000003 'mark_pos#400'
+    touch "$dir/shop_20260902T000000Z_binlogmark.json"   # newest by mtime, oldest by stamp
+    run _pick_binlog "$dir" ""
+    [ "$status" -eq 0 ]
+    # the 0903 base is anchored at 000003:900, AFTER the mark at 000003:400
+    [ "$output" = "shop_20260901T000000Z_binlogbase.json shop_20260905T000000Z_binlogmark.json" ]
+    rm -rf "$dir"
+}
+
+@test "binlog verify --latest: same file and pos <= mark counts; another binlog series does not" {
+    dir=$(mktemp -d)
+    _bm "$dir" shop_20260901T000000Z_binlogbase.json shop binlog-base anchor_file=binlog.000003 'anchor_pos#400'
+    _bm "$dir" shop_20260904T000000Z_binlogbase.json shop binlog-base anchor_file=mysql-bin.000001 'anchor_pos#4'
+    _bm "$dir" shop_20260905T000000Z_binlogmark.json shop binlog-mark mark_file=binlog.000003 'mark_pos#400'
+    run _pick_binlog "$dir" ""
+    [ "$status" -eq 0 ]
+    [ "$output" = "shop_20260901T000000Z_binlogbase.json shop_20260905T000000Z_binlogmark.json" ]
+    rm -rf "$dir"
+}
+
+@test "binlog verify --latest: no base reaches the newest mark -> error, never an older mark" {
+    dir=$(mktemp -d)
+    _bm "$dir" shop_20260901T000000Z_binlogbase.json shop binlog-base anchor_file=binlog.000002 'anchor_pos#157'
+    _bm "$dir" shop_20260902T000000Z_binlogmark.json shop binlog-mark mark_file=binlog.000002 'mark_pos#500'
+    _bm "$dir" shop_20260905T000000Z_binlogmark.json shop binlog-mark mark_file=binlog.000001 'mark_pos#900'
+    run _pick_binlog "$dir" ""
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"refusing to fall back to an older mark"* ]]
+    rm -rf "$dir"
+}
+
+@test "binlog verify --latest excludes --base/--mark, belongs to verify, and --db needs it" {
+    arch=$(mktemp -d)
+    run bash -c "source '$REPO/binlog.sh'; parse_args verify --latest /tmp --mark m.json --archive '$arch' --tools /tmp"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"drop --base/--mark"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args check --latest /tmp --archive '$arch'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--latest belongs to verify"* ]]
+    run bash -c "source '$REPO/binlog.sh'; parse_args verify --base b.json --mark m.json --db shop --archive '$arch' --tools /tmp"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--db only means something with --latest"* ]]
+    rm -rf "$arch"
+}

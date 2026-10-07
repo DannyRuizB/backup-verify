@@ -304,8 +304,15 @@ mv "$OUT/hidden" "$ARCHIVE/$MIDDLE$SFX"
 printf '\n'
 
 echo '== Case 7: the drill to the SECOND mark - the archived disaster is also an instant =='
-if ./binlog.sh verify --base "$B" --mark "$M2" --archive "$ARCHIVE" --tools "$TOOLS" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify2.log" 2>&1; then
-    pass_case 'the archive reproduces every instant it marked - including the one that contains the disaster'
+# Run as the nightly job would: `--latest` over the backup directory, which
+# must pick the second mark by its name stamp (the newest) and the one base.
+if ./binlog.sh verify --latest "$OUT/backups" --archive "$ARCHIVE" --tools "$TOOLS" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify2.log" 2>&1; then
+    if grep -q "mark $(basename "$M2") from base $(basename "$B")" "$OUT/verify2.log"; then
+        pass_case 'verify --latest picked the newest mark and reproduced it - including the instant that contains the disaster'
+    else
+        fail_case 'verify --latest passed, but not on the newest mark / its base'
+        grep 'latest in' "$OUT/verify2.log" | sed 's/^/        /'
+    fi
 else
     fail_case 'the second instant did not come back'
     sed -n '1,20p' "$OUT/verify2.log" | sed 's/^/        /'
