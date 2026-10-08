@@ -828,10 +828,19 @@ cmd_check() {
     if [ -n "$CONTAINER" ]; then
         eng_preflight "$CONTAINER"
         assert_archiving_on
-        local last_archived failed_count last_failed current behind=0
-        read -r last_archived failed_count last_failed < <(eng_query "$CONTAINER" postgres \
-            "SELECT coalesce(last_archived_wal, 'never') || ' ' || failed_count || ' ' || coalesce(last_failed_wal, '-') FROM pg_stat_archiver;")
-        current=$(eng_query "$CONTAINER" postgres 'SELECT pg_walfile_name(pg_current_wal_lsn());' | tr -d '\n')
+        local last_archived failed_count last_failed failing_now current behind=0
+        read -r last_archived failed_count last_failed failing_now < <(eng_query "$CONTAINER" postgres \
+            "SELECT coalesce(last_archived_wal, 'never') || ' ' || failed_count || ' ' || coalesce(last_failed_wal, '-') || ' ' || coalesce((last_failed_time > coalesce(last_archived_time, '-infinity'))::text, 'false') FROM pg_stat_archiver;")
+        # The segment being WRITTEN, from the INSERT position - not
+        # pg_current_wal_lsn(): right after a WAL switch on a quiet server that
+        # LSN sits exactly on the segment boundary, and pg_walfile_name() of a
+        # boundary names the PRECEDING file - the one just closed (measured on
+        # PostgreSQL 15 and 16: 0/3000000 -> ...02 while ...03 is being written;
+        # 17 changed it to the segment that starts there). With
+        # the archiver dying on that closed segment the backlog then counted 0
+        # and check blessed it (a nightly CI drill caught it, once in a while:
+        # any background WAL record after the switch hid the bug).
+        current=$(eng_query "$CONTAINER" postgres 'SELECT pg_walfile_name(pg_current_wal_insert_lsn());' | tr -d '\n')
         if [ "$last_archived" = "never" ]; then
             printf '  %sFAIL%s the server has never archived a single segment (failed attempts so far: %s)\n' \
                 "$c_red" "$c_reset" "$failed_count"
@@ -841,14 +850,21 @@ cmd_check() {
             if [ "$behind" -gt 0 ]; then
                 # One recheck: a segment legitimately in flight clears in moments.
                 sleep 3
-                read -r last_archived failed_count last_failed < <(eng_query "$CONTAINER" postgres \
-                    "SELECT coalesce(last_archived_wal, 'never') || ' ' || failed_count || ' ' || coalesce(last_failed_wal, '-') FROM pg_stat_archiver;")
+                read -r last_archived failed_count last_failed failing_now < <(eng_query "$CONTAINER" postgres \
+                    "SELECT coalesce(last_archived_wal, 'never') || ' ' || failed_count || ' ' || coalesce(last_failed_wal, '-') || ' ' || coalesce((last_failed_time > coalesce(last_archived_time, '-infinity'))::text, 'false') FROM pg_stat_archiver;")
                 behind=$(( $(wal_name_index "$current" "$seg_bytes") - $(wal_name_index "${last_archived:0:24}" "$seg_bytes") - 1 ))
             fi
             if [ "$behind" -gt 0 ]; then
                 printf '  %sFAIL%s the archive is %s completed segment(s) behind the server (last archived %s, server writing %s) - the application will never mention this\n' \
                     "$c_red" "$c_reset" "$behind" "$last_archived" "$current"
                 [ "$last_failed" = "-" ] || printf '        the archiver last choked on %s (failed attempts: %s)\n' "$last_failed" "$failed_count"
+                problems=$((problems + 1))
+            elif [ "$failing_now" = "true" ]; then
+                # A second witness, independent of the backlog arithmetic: the
+                # archiver's last attempt FAILED after its last success - it is
+                # failing right now, whatever the segment count says.
+                printf '  %sFAIL%s the archiver is failing right now: its last attempt (on %s) failed after its last success (%s) - %s failed attempt(s) so far\n' \
+                    "$c_red" "$c_reset" "$last_failed" "$last_archived" "$failed_count"
                 problems=$((problems + 1))
             elif [ "$failed_count" -gt 0 ]; then
                 log "archiver history: $failed_count failed attempt(s), last on ${last_failed} - it recovered, and the counter never resets (measured)"

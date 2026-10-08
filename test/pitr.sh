@@ -52,6 +52,7 @@ root_sh() { docker run --rm -u root --entrypoint sh -v "$OUT:/work" "$IMAGE" -c 
 
 cleanup() {
     docker rm -f "${SRC}9" >/dev/null 2>&1 || true
+    docker rm -f "${SRC}2b" >/dev/null 2>&1 || true
     docker rm -f "$SRC" >/dev/null 2>&1 || true
     root_sh 'rm -rf /work/archive /work/pristine' >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
@@ -160,8 +161,9 @@ else
 fi
 if ./pitr.sh check --archive "$ARCHIVE" --container "$SRC" >"$OUT/check-dead.log" 2>&1; then
     fail_case 'check blessed an archive the archiver cannot write'
+    sed -n '1,25p' "$OUT/check-dead.log" | sed 's/^/        /'
 else
-    if grep -Eq 'behind the server|never archived|choked' "$OUT/check-dead.log"; then
+    if grep -Eq 'behind the server|never archived|choked|failing right now' "$OUT/check-dead.log"; then
         pass_case 'check names the backlog the application will never mention'
     else
         fail_case 'check failed, but without naming the archiver problem'
@@ -190,6 +192,65 @@ else
     fail_case 'the archiver never caught up after the cause was fixed'
     sed -n '1,15p' "$OUT/check-heal.log" | sed 's/^/        /'
 fi
+printf '\n'
+
+echo '== Case 2b: ONE dead segment on a quiet server - the segment-boundary trap =='
+# A nightly drill once had check bless the dying archive of case 2. Measured
+# cause: right after a WAL switch on a quiet server the current LSN sits
+# exactly on the segment boundary, and pg_walfile_name() of a boundary names
+# the PRECEDING file on PostgreSQL 15 and 16 (17 changed it - measured) -
+# the one just closed, the one the archiver is choking on - so with exactly
+# ONE segment stuck the backlog counted 0. (The nightly failure was the
+# postgres:16-alpine job.) Case 2 cannot
+# show it deterministically (more than one segment gets stuck there, and
+# background WAL hides the boundary), so: its own server, autovacuum off, one
+# healthy archive, the archive dies, ONE switch, check at once. Plain copies
+# in both modes - the arithmetic under test is the same.
+SRC2B="${SRC}2b"; ARCHIVE2B="$OUT/archive2b"
+mkdir -p "$ARCHIVE2B"; chmod 777 "$ARCHIVE2B"
+docker rm -f "$SRC2B" >/dev/null 2>&1 || true
+docker run -d --name "$SRC2B" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
+    -v "$ARCHIVE2B:/archive" "$IMAGE" -c autovacuum=off \
+    -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
+eng_wait_ready "$SRC2B"
+eng_query "$SRC2B" app "CREATE TABLE t2b (x int); INSERT INTO t2b SELECT generate_series(1, 1000);" >/dev/null
+closed2b=$(eng_query "$SRC2B" app "SELECT pg_walfile_name(pg_switch_wal());" | tr -d '\n')
+# Wait for THAT segment, not for "something archived": the startup segment is
+# archived first, and killing the archive before the switched-out one lands
+# leaves two stuck - which counts 1 behind even at the boundary.
+tries=0
+until [ "$(eng_query "$SRC2B" postgres "SELECT coalesce(last_archived_wal, '') = '$closed2b' FROM pg_stat_archiver;" | tr -d '\n')" = t ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 40 ] || break; sleep 0.5
+done
+chmod 555 "$ARCHIVE2B"
+# Two calls, not one: `psql -c "INSERT ...; SELECT pg_switch_wal();"` is ONE
+# transaction, and its commit record lands AFTER the switch - past the
+# boundary (measured: that is how the first version of this case set nothing up).
+eng_query "$SRC2B" app "INSERT INTO t2b SELECT generate_series(1, 1000);" >/dev/null
+eng_query "$SRC2B" app "SELECT pg_switch_wal();" >/dev/null
+tries=0
+until [ "$(eng_query "$SRC2B" postgres "SELECT failed_count > 0 FROM pg_stat_archiver;" | tr -d '\n')" = t ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 40 ] || break; sleep 0.5
+done
+trap2b=$(eng_query "$SRC2B" postgres "SELECT pg_walfile_name(pg_current_wal_lsn()) = last_failed_wal FROM pg_stat_archiver;" | tr -d '\n')
+state2b=$(eng_query "$SRC2B" postgres "SELECT pg_current_wal_lsn() || ' names ' || pg_walfile_name(pg_current_wal_lsn()) || ', writing ' || pg_walfile_name(pg_current_wal_insert_lsn()) || ', archived ' || coalesce(last_archived_wal, '-') || ', failing on ' || coalesce(last_failed_wal, '-') FROM pg_stat_archiver;" | tr -d '\n')
+log "case 2b state: closed $closed2b; $state2b"
+ver2b=$(eng_query "$SRC2B" postgres "SHOW server_version_num;" | tr -d '\n')
+if ./pitr.sh check --archive "$ARCHIVE2B" --container "$SRC2B" >"$OUT/check-2b.log" 2>&1; then
+    fail_case 'check blessed a dying archiver with one segment stuck on a quiet server'
+    sed -n '1,25p' "$OUT/check-2b.log" | sed 's/^/        /'
+elif [ "$trap2b" != t ] && [ "$ver2b" -ge 170000 ]; then
+    # Measured: PostgreSQL 17 changed pg_walfile_name() at a boundary - it
+    # names the segment that STARTS there (15 and 16 name the one before). No
+    # trap to set on this server; check failing is all there is to prove.
+    pass_case 'one stuck segment on a quiet server: check fails (PostgreSQL 17+ has no boundary trap - measured)'
+elif [ "$trap2b" != t ]; then
+    fail_case "the boundary trap was not set up (current LSN did not name the stuck segment: '$trap2b'; $state2b) - this case proved nothing"
+else
+    pass_case 'one stuck segment at a segment boundary: check counts the segment being WRITTEN and fails'
+fi
+chmod 777 "$ARCHIVE2B"
+docker rm -f "$SRC2B" >/dev/null 2>&1 || true
 printf '\n'
 
 echo '== Case 1, continued: disaster, destruction, and the recovery that must be exact =='
