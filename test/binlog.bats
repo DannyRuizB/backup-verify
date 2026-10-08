@@ -589,3 +589,36 @@ _pick_binlog() {
     [[ "$output" == *"--db only means something with --latest"* ]]
     rm -rf "$arch"
 }
+
+# --- verify --max-age: a nightly drill that keeps proving an old instant ------
+
+@test "binlog.sh verify accepts --max-age (it no longer belongs to check --remote alone)" {
+    run bash "$REPO/binlog.sh" verify --latest /nonexistent --archive /tmp --tools /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"--max-age belongs to"* ]]
+    # base still refuses it
+    run bash "$REPO/binlog.sh" base --container x --db app --archive /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age belongs to check --remote and verify"* ]]
+}
+
+@test "binlog.sh verify --max-age refuses a mark with no date BEFORE booting anything" {
+    dir=$(mktemp -d)
+    # --tools is checked first: a stand-in mysqlbinlog gets the run to the manifests
+    mkdir "$dir/tools"; printf '#!/bin/sh\nexit 0\n' > "$dir/tools/mysqlbinlog"; chmod +x "$dir/tools/mysqlbinlog"
+    printf '{\n  "schema": 3,\n  "kind": "binlog-base",\n  "database": "app"\n}\n' > "$dir/base-copy.json"
+    printf '{\n  "schema": 3,\n  "kind": "binlog-mark",\n  "database": "app"\n}\n' > "$dir/mark-copy.json"
+    run bash "$REPO/binlog.sh" verify --base "$dir/base-copy.json" --mark "$dir/mark-copy.json" --archive "$dir" --tools "$dir/tools" --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age needs to know when the mark was taken"* ]]
+    # anchor: the same pair WITHOUT --max-age gets past that point (and fails later, on the missing fields)
+    run bash "$REPO/binlog.sh" verify --base "$dir/base-copy.json" --mark "$dir/mark-copy.json" --archive "$dir" --tools "$dir/tools"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"--max-age needs"* ]]
+    rm -rf "$dir"
+}
+
+@test "binlog.sh --help documents verify --max-age" {
+    run bash "$REPO/binlog.sh" --help
+    [[ "$output" == *"(verify) also fail when the mark it just proved"* ]]
+}

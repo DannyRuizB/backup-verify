@@ -52,7 +52,7 @@
 #   ./binlog.sh check  --archive DIR [--container NAME [--identity FILE]]
 #   ./binlog.sh check  --remote REMOTE [--db NAME] [--max-age D]
 #   ./binlog.sh verify --base FILE --mark FILE --archive DIR --tools DIR
-#   ./binlog.sh verify --latest DIR [--db NAME] --archive DIR --tools DIR
+#   ./binlog.sh verify --latest DIR [--db NAME] --archive DIR --tools DIR [--max-age D]
 #                      [--image IMAGE] [--identity FILE]
 #   ./binlog.sh push   --base FILE --mark FILE --archive DIR --remote REMOTE [--keep N] [--keep-days D]
 #   ./binlog.sh pull   --db NAME --remote REMOTE --archive DIR [--out DIR]
@@ -106,6 +106,14 @@
 #                     old: every hash can be true and the remote still prove
 #                     nothing newer than that - marks have stopped arriving.
 #                     offsite.sh's rule, the same function.
+#                     (verify) also fail when the mark it just proved was
+#                     taken more than D days ago (its created_at, else its
+#                     name stamp): `verify --latest DIR --max-age 2` every
+#                     night stays green when marks stop arriving - it keeps
+#                     proving the same old instant - and this makes it say
+#                     STALE. Checked AFTER the drill: the proof stands in the
+#                     log either way, what fails is the schedule. verify.sh's
+#                     rule, the same function.
 #   --recipient KEY   (base, mark) encrypt with age; KEY is an age public key
 #                     or a file of them. Requires --identity: base cannot even
 #                     read its own anchor without it (the anchor lives INSIDE
@@ -218,8 +226,8 @@ parse_args() {
     case "$MAX_AGE" in
         ''|*[!0-9]*) die "--max-age must be a non-negative integer, got '$MAX_AGE'";;
     esac
-    { [ "$MAX_AGE" -eq 0 ] || { [ "$SUBCMD" = check ] && [ -n "$REMOTE" ]; }; } \
-        || die "--max-age belongs to check --remote (how old may the newest provable instant be?)"
+    { [ "$MAX_AGE" -eq 0 ] || [ "$SUBCMD" = verify ] || { [ "$SUBCMD" = check ] && [ -n "$REMOTE" ]; }; } \
+        || die "--max-age belongs to check --remote and verify (how old may the newest provable instant be?)"
     [ "$KEEP" -eq 0 ] || [ "$SUBCMD" = push ] \
         || [ "$SUBCMD" = prune ] || die "--keep belongs to push (remote retention) and prune (local retention)"
     # base needs no archive: the dump carries its anchor, the binlogs come
@@ -1392,6 +1400,16 @@ cmd_verify() {
     [ "$kind" = "binlog-mark" ] \
         || die "'$MARK_MANIFEST' is not a binlog-mark manifest (kind '${kind:-none}') - pass the instant to prove"
 
+    # With --max-age, read the mark's age before booting anything: a mark that
+    # cannot say when it was taken is refused up front, not after a drill.
+    local taken="" taken_epoch="" taken_when=""
+    if [ "$MAX_AGE" -gt 0 ]; then
+        taken="$(manifest_taken "$MARK_MANIFEST")"
+        [ -n "$taken" ] || die "--max-age needs to know when the mark was taken, and its manifest has no created_at and no stamp in its name"
+        taken_epoch="${taken%% *}"
+        taken_when="${taken#* }"
+    fi
+
     local db base_db dir artefact anchor_file anchor_pos mark_file mark_pos
     db="$(json_str "$MARK_MANIFEST" database)"
     base_db="$(json_str "$BASE_MANIFEST" database)"
@@ -1671,6 +1689,14 @@ cmd_verify() {
     fi
 
     ok "BINLOG PITR VERIFIED: base dump + archived binlogs reproduce $mark_file:$mark_pos exactly ($checked table(s), byte-for-byte)${chain_sfx:+ - the chain decrypted only inside the throwaway}."
+    # Last on purpose: the drill above stands either way, and the log keeps it.
+    # What fails here is the schedule, not the archive.
+    if [ "$MAX_AGE" -gt 0 ]; then
+        if past_window "$taken_epoch" "$MAX_AGE"; then
+            die "STALE: this mark reproduces, but it was taken $(age_days "$taken_epoch") days ago ($taken_when), past --max-age $MAX_AGE: marks have stopped arriving, and proving the newest one keeps proving an old instant."
+        fi
+        ok "mark taken $(age_days "$taken_epoch") day(s) ago ($taken_when), within --max-age $MAX_AGE"
+    fi
 }
 
 main() {

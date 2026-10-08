@@ -353,8 +353,9 @@ echo '== Case 7: after every mutation was undone, the drill still passes =='
 # The suite must leave the archive as it found it - proven the only honest
 # way: the same recovery, byte-for-byte, one more time.
 # ...and run as the nightly job would: `--latest` over the backup directory.
-if ./pitr.sh verify --latest "$OUT/backups" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify2.log" 2>&1; then
-    if grep -q "mark $(basename "$M") from base $(basename "$B")" "$OUT/verify2.log"; then
+if ./pitr.sh verify --latest "$OUT/backups" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} --max-age 7 >"$OUT/verify2.log" 2>&1; then
+    if grep -q "mark $(basename "$M") from base $(basename "$B")" "$OUT/verify2.log" \
+        && grep -q "within --max-age 7" "$OUT/verify2.log"; then
         pass_case 'the archive still reproduces the mark exactly (picked by verify --latest)'
     else
         fail_case 'verify --latest passed, but not on the expected mark / base'
@@ -363,6 +364,21 @@ if ./pitr.sh verify --latest "$OUT/backups" --archive "$ARCHIVE" --image "$IMAGE
 else
     fail_case 'the harness broke the archive it was testing'
     sed -n '1,20p' "$OUT/verify2.log" | sed 's/^/        /'
+fi
+printf '\n'
+
+echo '== Case 7b: --max-age with the clock 30 days ahead - the mark reproduces AND the run fails =='
+# A nightly `verify --latest --max-age 7` after marks stopped arriving: the
+# newest mark is a month old. The drill must still pass - VERIFIED stays in
+# the log, the positive anchor - and the run must fail as STALE anyway.
+STALE_RC=0
+BV_NOW=$(( $(date -u +%s) + 30 * 86400 )) ./pitr.sh verify --latest "$OUT/backups" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} --max-age 7 >"$OUT/verify-stale.log" 2>&1 || STALE_RC=$?
+if [ "$STALE_RC" -ne 0 ] && grep -q 'VERIFIED:' "$OUT/verify-stale.log" \
+    && grep -q 'STALE: this mark reproduces, but it was taken 30 days ago' "$OUT/verify-stale.log"; then
+    pass_case 'a month-old newest mark: VERIFIED, and failed as STALE'
+else
+    fail_case "--max-age did not fail a 30-day-old mark that reproduces (rc $STALE_RC)"
+    tail -n 20 "$OUT/verify-stale.log" | sed 's/^/        /'
 fi
 printf '\n'
 
