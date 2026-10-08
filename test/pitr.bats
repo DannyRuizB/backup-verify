@@ -635,3 +635,34 @@ _pick_pitr() { # dir, db -> "BASE MARK" basenames, or the error
     [ "$status" -eq 0 ]
     rm -rf "$arch"
 }
+
+# --- verify --max-age: a nightly drill that keeps proving an old instant ------
+
+@test "pitr.sh verify accepts --max-age (it no longer belongs to check --remote alone)" {
+    run bash "$REPO/pitr.sh" verify --latest /nonexistent --archive /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"--max-age belongs to"* ]]
+    # base still refuses it
+    run bash "$REPO/pitr.sh" base --container x --db app --archive /tmp --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age belongs to check --remote and verify"* ]]
+}
+
+@test "pitr.sh verify --max-age refuses a mark with no date BEFORE booting anything" {
+    dir=$(mktemp -d)
+    printf '{\n  "schema": 3,\n  "kind": "pitr-base",\n  "database": "app"\n}\n' > "$dir/base-copy.json"
+    printf '{\n  "schema": 3,\n  "kind": "pitr-mark",\n  "database": "app"\n}\n' > "$dir/mark-copy.json"
+    run bash "$REPO/pitr.sh" verify --base "$dir/base-copy.json" --mark "$dir/mark-copy.json" --archive "$dir" --max-age 7
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--max-age needs to know when the mark was taken"* ]]
+    # anchor: the same pair WITHOUT --max-age gets past that point (and fails later, on the missing fields)
+    run bash "$REPO/pitr.sh" verify --base "$dir/base-copy.json" --mark "$dir/mark-copy.json" --archive "$dir"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"--max-age needs"* ]]
+    rm -rf "$dir"
+}
+
+@test "pitr.sh --help documents verify --max-age" {
+    run bash "$REPO/pitr.sh" --help
+    [[ "$output" == *"(verify) also fail when the mark it just proved"* ]]
+}

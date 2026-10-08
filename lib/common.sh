@@ -200,6 +200,26 @@ stale_databases() {
     done
 }
 
+# When the backup was taken, as "EPOCH WHEN": the manifest's created_at
+# (schema 3), else the UTC stamp backup.sh puts in every name. Nothing when
+# neither is there - an age nobody can read is not an age.
+manifest_taken() {
+    local m="$1" when stamp
+    when="$(json_str "$m" created_at)"
+    if [ -z "$when" ] && [[ "$(basename "$m")" =~ _([0-9]{8}T[0-9]{6}Z) ]]; then
+        stamp="${BASH_REMATCH[1]}"
+        when="${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z"
+    fi
+    [ -n "$when" ] || return 0
+    printf '%s %s' "$(date -u -d "$when" +%s)" "$when"
+}
+
+# Whole days since EPOCH ($BV_NOW stands in for now), and whether that is
+# past a D-day window - exactly D days old is still inside, like
+# stale_databases.
+age_days() { printf '%s' $(( ( ${BV_NOW:-$(date -u +%s)} - $1 ) / 86400 )); }
+past_window() { [ $(( ${BV_NOW:-$(date -u +%s)} - $1 )) -gt $(( $2 * 86400 )) ]; }
+
 # Whole days between a name stamp and now ($BV_NOW if set), for the message.
 stamp_age_days() {
     local s="$1" t0

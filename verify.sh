@@ -125,25 +125,8 @@ pick_latest_manifest() {
     printf '%s' "$best"
 }
 
-# When the backup was taken, as "EPOCH WHEN": the manifest's created_at
-# (schema 3), else the UTC stamp backup.sh puts in every name. Nothing when
-# neither is there - an age nobody can read is not an age.
-manifest_taken() {
-    local m="$1" when stamp
-    when="$(json_str "$m" created_at)"
-    if [ -z "$when" ] && [[ "$(basename "$m")" =~ _([0-9]{8}T[0-9]{6}Z) ]]; then
-        stamp="${BASH_REMATCH[1]}"
-        when="${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z"
-    fi
-    [ -n "$when" ] || return 0
-    printf '%s %s' "$(date -u -d "$when" +%s)" "$when"
-}
-
-# Whole days since EPOCH ($BV_NOW stands in for now), and whether that is
-# past a D-day window - exactly D days old is still inside, like
-# stale_databases.
-age_days() { printf '%s' $(( ( ${BV_NOW:-$(date -u +%s)} - $1 ) / 86400 )); }
-past_window() { [ $(( ${BV_NOW:-$(date -u +%s)} - $1 )) -gt $(( $2 * 86400 )) ]; }
+# manifest_taken, age_days and past_window live in lib/common.sh: pitr.sh and
+# binlog.sh verify --max-age read a manifest's age by the same rule.
 
 # The manifest readers (json_str, json_num, manifest_section, manifest_tables)
 # live in lib/common.sh: offsite.sh reads manifests too, and two copies of a
