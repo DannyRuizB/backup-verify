@@ -1582,9 +1582,13 @@ cmd_verify() {
         # the decode side from the apply side, and rc 42 inside the decode
         # side means a file did not decrypt (gate 3 already proved these are
         # the mark's exact bytes, so that is the key disagreeing, not rot).
+        # The replay container runs as root (--entrypoint sh, no USER in the
+        # image), so the identity copy needs no loosening: 0600 in a 0700
+        # scratch dir still reads inside (measured, the copy owned by another
+        # host uid). It used to be chmod 644 - every account on the host
+        # could read the private key for the length of the replay.
         KEYDIR=$(mktemp -d)
-        cp "$IDENTITY" "$KEYDIR/identity"
-        chmod 755 "$KEYDIR"; chmod 644 "$KEYDIR/identity"
+        (umask 077 && cp "$IDENTITY" "$KEYDIR/identity")
         local dec_err apply_err
         dec_err=$(mktemp)
         apply_err=$(mktemp)

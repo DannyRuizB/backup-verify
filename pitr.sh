@@ -1552,14 +1552,16 @@ cmd_verify() {
     fi
     local -a key_mounts=()
     if [ -n "$wal_suffix" ]; then
-        # The throwaway decrypts each segment itself: a static age binary and
-        # a COPY of the identity ride in read-only. The copy is briefly
-        # world-readable on the host (the container's postgres user must read
-        # it); it lives in its own scratch dir and dies with the drill.
+        # The throwaway decrypts each segment itself: a static age binary
+        # rides in read-only, and a COPY of the identity is put INSIDE the
+        # container before it starts (below), owned by its postgres user,
+        # mode 0400. The host copy stays 0600 in a 0700 scratch dir: it used
+        # to be chmod 644 so a bind mount would let postgres read it, which
+        # left the private key readable by every account on the host for
+        # the whole drill.
         KEYDIR=$(mktemp -d)
-        cp "$IDENTITY" "$KEYDIR/identity"
-        chmod 755 "$KEYDIR"; chmod 644 "$KEYDIR/identity"
-        key_mounts=(-v "$(command -v age)":/usr/local/bin/age:ro -v "$KEYDIR:/run/bvkey:ro")
+        (umask 077 && cp "$IDENTITY" "$KEYDIR/identity")
+        key_mounts=(-v "$(command -v age)":/usr/local/bin/age:ro)
         printf "restore_command = 'age -d -i /run/bvkey/identity -o \"%%p\" /archive/\"%%f\".age'\n" >> "$SCRATCH/postgresql.auto.conf"
     else
         printf "restore_command = 'cp /archive/%%f %%p'\n" >> "$SCRATCH/postgresql.auto.conf"
@@ -1571,10 +1573,12 @@ cmd_verify() {
     touch "$SCRATCH/recovery.signal"
 
     log "booting a throwaway $IMAGE as '$PROBE' - recovery must reach '$mark_name' or die trying"
-    docker run -d --name "$PROBE" -e POSTGRES_PASSWORD=verify \
+    docker create --name "$PROBE" -e POSTGRES_PASSWORD=verify \
         -v "$SCRATCH:/var/lib/postgresql/data" -v "$ARCHIVE_DIR:/archive:ro" \
         ${key_mounts[@]+"${key_mounts[@]}"} \
         "$IMAGE" -c archive_mode=off > /dev/null
+    [ -z "$wal_suffix" ] || copy_identity_into "$PROBE" "$IMAGE" postgres "$KEYDIR"
+    docker start "$PROBE" > /dev/null
 
     local waited=0 state in_recovery
     while :; do
