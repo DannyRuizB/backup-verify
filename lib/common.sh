@@ -468,3 +468,21 @@ upload_checked() {
     rem_rename "$name.part" "$name"
     ok "  $name - uploaded, hashed AT the remote, renamed into place"
 }
+
+# copy_identity_into <container> <image> <user> <keydir>: put <keydir>/identity
+# at /run/bvkey/identity inside a CREATED (not yet started) container, owned
+# by <user> as the image defines it and mode 0400, its directory 0500. The tar
+# headers carry the ownership and `docker cp -a` keeps it, so the host copy
+# never has to be readable by anyone but its owner. Measured against
+# postgres:17-alpine: the image's postgres user reads it, nobody else does.
+copy_identity_into() {
+    local container="$1" image="$2" user="$3" keydir="$4" uid gid
+    uid=$(docker run --rm --entrypoint id "$image" -u "$user") \
+        || die "could not look up the '$user' user in $image"
+    gid=$(docker run --rm --entrypoint id "$image" -g "$user") \
+        || die "could not look up the '$user' group in $image"
+    tar -C "$keydir" -cf - --transform 's,^\.,bvkey,' \
+        --owner="$uid" --group="$gid" --numeric-owner --mode='u=rX,go=' . \
+        | docker cp -a - "$container:/run" \
+        || die "could not copy the identity into $container"
+}
