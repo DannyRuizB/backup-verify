@@ -669,7 +669,10 @@ EOF
                 fi
             fi
             mv "$ARCHIVE_DIR/.$aname.copying" "$ARCHIVE_DIR/$aname"
-            chmod 644 "$ARCHIVE_DIR/$aname"
+            # docker cp carries the server's 0640 over; the umask never sees
+            # it. Binlogs are rows in cleartext and the replay reads them as
+            # root, so the host user is the only account that needs them.
+            chmod 600 "$ARCHIVE_DIR/$aname"
             archived=$((archived + 1))
         fi
         if [ -n "$RECIPIENT" ]; then
@@ -1201,7 +1204,7 @@ cmd_pull() {
             die "$name did not survive the transfer (or rotted at the remote) - the fetched copy was removed"
         fi
         mv "$tmpf" "$ARCHIVE_DIR/$name"
-        chmod 644 "$ARCHIVE_DIR/$name"
+        chmod 600 "$ARCHIVE_DIR/$name"   # same mode as mark leaves, whatever the transport
         fetched=$((fetched + 1))
     done
     ok "PULLED: chain of $((m_idx - a_idx + 1)) file(s) ($fetched fetched, $already already here and hashing true)"

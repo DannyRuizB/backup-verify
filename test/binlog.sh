@@ -150,6 +150,15 @@ M=$(find "$OUT/backups" -name '*_binlogmark.json' | LC_ALL=C sort | tail -1)
 [ -n "$M" ] || die 'no mark manifest was written - nothing else can run'
 MARK_ROWS=$(eng_query "$SRC" app 'SELECT COUNT(*) FROM orders;' | tr -d '\n')
 pass_case "marked the instant to reproduce: $MARK_ROWS orders at $(json_str "$M" mark_file):$(json_num "$M" mark_pos)"
+# Binlogs and the anchored dump are rows in cleartext: the host user's alone.
+# mark used to chmod every archived binlog 644, and the dump was born 0644
+# under the usual umask - readable by every account on the host.
+LOOSE=$(find "$ARCHIVE" "$OUT/backups" -type f ! -perm 600 -printf '%m %f ')
+if [ -n "$(find "$ARCHIVE" -type f)" ] && [ -z "$LOOSE" ]; then
+    pass_case "the archive and the dump are private: $(find "$ARCHIVE" "$OUT/backups" -type f | grep -c .) file(s), all 0600"
+else
+    fail_case "readable beyond the host user: $LOOSE"
+fi
 
 if [ "$ENCRYPTED" -eq 1 ]; then
     # The stake, held: nothing in the archive may be plaintext, and the rows
