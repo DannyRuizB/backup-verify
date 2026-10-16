@@ -89,6 +89,7 @@ if [ "$KIND" = ssh ]; then
     remote_plant() { printf '%s' "$1" | remote_sh "cat > ${REMOTE#*:}/$2"; }
     remote_rm()    { remote_sh "rm -f ${REMOTE#*:}/$1"; }
     remote_ls()    { remote_sh "find ${REMOTE#*:} -maxdepth 1 -type f" | sed 's|.*/||' | LC_ALL=C sort; }
+    remote_loose() { remote_sh "find ${REMOTE#*:} -maxdepth 1 -type f ! -perm 600" | sed 's|.*/||'; }
 else
     REMOTE="$OUT/nas"
     OS=()
@@ -97,6 +98,7 @@ else
     remote_plant() { printf '%s' "$1" > "$REMOTE/$2"; }
     remote_rm()    { rm -f "$REMOTE/$1"; }
     remote_ls()    { find "$REMOTE" -maxdepth 1 -type f | sed 's|.*/||' | LC_ALL=C sort; }
+    remote_loose() { find "$REMOTE" -maxdepth 1 -type f ! -perm 600 | sed 's|.*/||'; }
 fi
 
 traffic() {
@@ -164,6 +166,14 @@ else
     fail_case 'check --remote rejected an instant that was just pushed and hashed'
     sed -n '1,15p' "$OUT/check1.log" | sed 's/^/        /'
 fi
+# The far end writes with its own umask (a stock sshd session is 022): every
+# pushed file used to land 0644 there. The off-site copy is the same data.
+LOOSE=$(remote_loose)
+if [ -n "$(remote_ls)" ] && [ -z "$LOOSE" ]; then
+    pass_case "the off-site copy is born private: all $(remote_ls | grep -c .) file(s) at the remote are 0600"
+else
+    fail_case "files at the remote readable beyond their owner: $(printf '%s' "$LOOSE" | tr '\n' ' ')"
+fi
 
 printf '\n'
 echo '== Case 2: the second push ships only what the remote cannot already prove =='
@@ -203,6 +213,17 @@ if ./pitr.sh pull --db app --remote "$REMOTE" --archive "$OUT/pulled3-archive" -
 else
     fail_case 'pull failed against a healthy remote'
     sed -n '1,15p' "$OUT/pull3.log" | sed 's/^/        /'
+fi
+# Pull onto what survived: the server's own archive, segments 0600 and owned
+# by its postgres - the host sees the names but cannot read the bytes. They
+# are the files the mark stands on, and pull must say so (it used to hash them
+# from the host, fail to read them, and accuse them of being impostors).
+if ./pitr.sh pull --db app --remote "$REMOTE" --archive "$ARCHIVE" --out "$OUT/pulled3b" "${OS[@]}" >"$OUT/pull3b.log" 2>&1 \
+   && grep -qE '\(0 fetched, [1-9][0-9]* already here and hashing true\)' "$OUT/pull3b.log"; then
+    pass_case "pull onto the surviving server archive: $(grep -oE '[0-9]+ already here' "$OUT/pull3b.log") and hashing true, nothing fetched or touched"
+else
+    fail_case 'pull onto the surviving server archive did not recognise the segments the mark stands on'
+    sed -n '1,15p' "$OUT/pull3b.log" | sed 's/^/        /'
 fi
 
 printf '\n'
@@ -341,6 +362,25 @@ root_sh "rm -rf /work/archive && chown -R $(id -u):$(id -g) /work" >/dev/null 2>
 rm -rf "$ARCHIVE" "$BK"
 ok "the machine is bare - the remote is the only copy of anything"
 if ./pitr.sh pull --db app --remote "$REMOTE" --archive "$OUT/fire-archive" --out "$OUT/fire" "${OS[@]}" >"$OUT/pull6.log" 2>&1; then
+    # What came back is the data. The chain must be what archive_command would
+    # have left (0600, the image's postgres) in a dir others cannot list; the
+    # base and manifests the host user's alone; and another account reads
+    # nothing. It used to be 0644 in 0755 - `nobody` read every byte.
+    PG_IDS=$(docker run --rm --entrypoint id "$IMAGE" -u postgres):$(docker run --rm --entrypoint id "$IMAGE" -g postgres)
+    WRONG=$(find "$OUT/fire-archive" -mindepth 1 -printf '%m %U:%G %f\n' | { grep -v "^600 $PG_IDS " || true; })
+    WRONG+=$(find "$OUT/fire" -mindepth 1 -printf '%m %U:%G %f\n' | { grep -v "^600 $(id -u):$(id -g) " || true; })
+    [ "$(stat -c %a "$OUT/fire-archive")" = 711 ] || WRONG+=" fire-archive is $(stat -c %a "$OUT/fire-archive")"
+    # nobody cannot list a 0711 dir, so it is handed every name to try.
+    mapfile -t TRY < <(cd "$OUT" && find fire-archive -type f | sed 's|^fire-archive/|a/|'; cd "$OUT" && find fire -type f | sed 's|^fire/|f/|')
+    # shellcheck disable=SC2016  # $@/$f expand inside the container's sh
+    NOBODY=$(docker run --rm -u 65534 -v "$OUT/fire-archive:/a:ro" -v "$OUT/fire:/f:ro" \
+        --entrypoint sh "$IMAGE" -c 'ls /a >/dev/null 2>&1 && echo "listed /a"
+            for f in "$@"; do head -c1 "/$f" >/dev/null 2>&1 && echo "read /$f"; done; true' sh "${TRY[@]}")
+    if [ "${#TRY[@]}" -ge 4 ] && [ -z "$WRONG" ] && [ -z "$NOBODY" ]; then
+        pass_case "the pulled pair is private: chain 0600 $PG_IDS (the image's postgres) in a 0711 dir, base and manifests 0600 - nobody reads or lists any of its ${#TRY[@]} files"
+    else
+        fail_case "the pulled pair is readable beyond its owners: ${WRONG}${NOBODY:+ / nobody got: $NOBODY}"
+    fi
     FB=$(find "$OUT/fire" -name '*_base.json')
     FM=$(find "$OUT/fire" -name '*_mark.json')
     if ./pitr.sh verify --base "$FB" --mark "$FM" --archive "$OUT/fire-archive" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify6.log" 2>&1; then

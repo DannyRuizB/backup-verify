@@ -337,6 +337,7 @@ artefact copies above don't — each one measured before `push`, `pull` and
 | The segment is there, the "skip existing" sync is fast | **A killed upload leaves a partial under the segment's final name, and an exists-check never repairs it** — measured: 262 144 of 16 777 216 bytes squatting as the segment, invisible to `test -f`-style syncs forever. `push` uploads under a temporary name, has the **remote** hash it, renames only on a match — and re-ships anything whose remote hash disagrees with the inventory, because "the file is already there" is a claim about a name, not about bytes. |
 | Prune the WAL remote like the dump remote: keep the newest N files | **A WAL remote is chains, not files.** Every segment there is either below the oldest *kept* base's start (dead weight) or part of a chain a kept base needs — and neither a file count nor an mtime can tell the two apart. `push --keep N` keeps the newest N bases **by name** and drops only what sits below the oldest kept base's start segment on its timeline: the older bases and their manifests, the segments only they needed, the marks only they could prove; history files and other timelines stay, and the prune runs after the mark landed, never before the receipt. Measured in the drill: after `--keep 1` the remote lost the older base and every segment below the new base's start, `check --remote` stayed green and the fire recovered the newest mark exactly. `--keep-days D` adds retention **by age** with `offsite.sh`'s rule — the same function decides: a base survives if *either* rule keeps it, the newest never goes by age, and since both rules keep the newest end of the list, the line is still drawn at the oldest survivor's start. Measured in the drill: `--keep-days 7` at the real clock dropped nothing (both bases minutes old), and `--keep 1 --keep-days 7` a month on (`BV_NOW`) drew exactly the line `--keep 1` draws. |
 | `check --remote` is green: every segment the newest mark stands on hashes true | **It also says nothing about WHEN that mark was taken.** Stop the cron that marks and pushes, and the remote keeps hashing perfectly while it proves nothing newer than the day it stopped. Measured in the drill with the clock a month ahead: plain `check --remote` rc 0, every pair `OK`; `--max-age 7` fails naming the database — *its newest provable instant is 30 days old: marks have stopped arriving*. Decided by the mark's **name** stamp (a remote mtime is the upload time), the same function as `offsite.sh check --max-age`, in `pitr.sh` and `binlog.sh` alike. |
+| `pull` onto what survived the fire: the names are already there, so it checks them | **The host can see the server's own segments but cannot read them** — `archive_command` writes them `0600`, owned by the server's `postgres`. `pull` hashed them from the host, could not read them, and accused the healthy survivors: *"…/000000010000000000000003 already exists and is NOT the file the mark stands on - refusing to overwrite it or to trust it"* (measured: `pull` onto the drill's live archive). Now a sidecar — the image the drill boots by default — hashes what is already there, as root: *"0 fetched, 3 already here and hashing true"*, nothing fetched or touched. |
 
 The protocol is offsite.sh's, applied per file: the same `rem_*` transports
 (ssh, or a mounted directory), upload to `.part`, hash at the remote, rename;
@@ -362,6 +363,7 @@ with the back door open — measured, like everything here:
 | Corruption in an encrypted archive needs the inventory to catch | The inventory still catches it **today** — but authenticated encryption adds a second, free line of defence: a truncated *or* bit-flipped `.age` refuses to decrypt at all (*"failed to decrypt and authenticate payload chunk"* — measured both ways), so even an old mark without an inventory dies loudly instead of replaying garbage. And every complete ciphertext measures the same (plaintext + constant overhead; 16 781 496 bytes for every 16 MiB segment), so the exact-size gate survives encryption unchanged. |
 | The key question waits until recovery day | **`verify` refuses to run without `--identity`** — no key, no drill, no comforting green tick — and a wrong key dies at the base artefact, named for what it is. Inside the drill the throwaway decrypts each segment itself (`restore_command` pipes through a static `age` that rides into the container read-only); the wrong key there is FATAL and immediate: *"no identity matched any of the recipients"* (measured). `base --recipient` requires `--identity` for the same reason `backup.sh` offers it: the key gets proven **today**. |
 | The drill holds the key for a minute, in a scratch dir that dies with it | **For that minute the private key was readable by every account on the host.** The throwaway's `postgres` user must read the identity, and a bind mount only lets it if the host copy is readable by that uid — so the drill used to `chmod 644` its copy. Now the host copy stays `0600` in a `0700` scratch dir, and the key is put **inside** the created (not yet started) container with `docker cp -a`, from a tar whose headers already say `postgres` and `0400`. Measured on `postgres:17-alpine`: `-r-------- postgres postgres /run/bvkey/identity`, postgres reads it, `nobody` gets *Permission denied*. `binlog.sh verify` replays as root inside its container, so there the loosening was never needed and is simply gone. |
+| The backups live on a box only admins log into | **Every file this tool wrote was born readable by every account on that box.** Under the usual umask 022 the dump, the base tar, the manifests and the pulled WAL chain landed `0644` in `0755` directories — measured: after a `pull`, `nobody` read the base tar, both segments and every manifest; `binlog.sh mark` even `chmod 644`ed each archived binlog (`docker cp` brings the server's `0640` over, whatever the umask). And over ssh the off-site copy is written with the far end's umask, not yours: through a stock sshd the pushed base tar, the manifests and the WAL segments all landed readable by other accounts at the remote. Now every script runs under `umask 077` (files `0600`, directories `0700`), the ssh remote writes under `umask 077` too, and the one reader that is not you — the throwaway's `postgres`, replaying a pulled chain — is handed those files explicitly: owned by the image's `postgres`, `0600`, exactly what `archive_command` leaves, in a `0711` directory nobody else can list. |
 
 ## MySQL point-in-time has its own ways of lying
 
@@ -562,9 +564,12 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   prove; an unpushed mark being unclaimable (pull returns the newest instant
   the remote can *prove*); in-place rot named by `check --remote` from the
   inventory alone, refused and cleaned up by `pull`, and *repaired* by the
-  next `push`; the crashed `.part` upload named for what it is; and, with
-  the clock a month ahead, marks that stopped arriving: plain `check
-  --remote` still green, `--max-age 7` failing.
+  next `push`; the crashed `.part` upload named for what it is; `pull` onto
+  the server's surviving archive recognising its segments instead of
+  accusing them; every file at the remote and every pulled file private
+  (`nobody` reads none of them); and, with the clock a month ahead, marks
+  that stopped arriving: plain `check --remote` still green, `--max-age 7`
+  failing.
 - **`test/binlog.sh [--encrypted] [--gtid]`** — the MySQL fire drill: seed,
   anchored
   dump, mark —
@@ -617,7 +622,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Thirteen bugs this harness caught in its own code
+## Fourteen bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -742,8 +747,19 @@ through push and pull, and the throwaway instance's postgres user cannot read
 a `0600` file owned by the host; ssh's `cat >` redirect mints fresh `0644`
 files and sails through. Same bytes, same hashes, different mode bits — the
 fourth time a transport- or order-dependent difference has been caught by
-running everything on more than one of them. `pull` now sets the mode
-explicitly, so both transports tell the same story.
+running everything on more than one of them. `pull` now hands every fetched
+file to the image's `postgres`, `0600`, so both transports tell the same
+story — and nobody else can read it (it used to be a blanket `chmod 644`).
+
+**`pull` called the survivors impostors.** Found while making that hand-over
+private, then pinned by a drill case: `pull` onto the server's own surviving
+archive died with *"already exists and is NOT the file the mark stands on"* on
+a segment that was exactly that file. The server archives `0600` under its own
+`postgres`, so the host could see the name but not the bytes, and the hash it
+compared was the word `unreadable`. Same lesson as the mutation cases above —
+the host can `stat` those files but never read them — learned again from the
+other side. What is already in the archive is now hashed by a root sidecar,
+and the case runs on every off-site drill.
 
 ## Scope
 

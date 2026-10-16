@@ -198,6 +198,10 @@ parse_args() {
         if [ ! -d "$ARCHIVE_DIR" ]; then
             [ "$SUBCMD" = pull ] || die "archive directory not found: $ARCHIVE_DIR"
             mkdir -p "$ARCHIVE_DIR" || die "could not create archive directory: $ARCHIVE_DIR"
+            # Born 0700 (umask); the throwaway's postgres must still step
+            # into it to read the chain pull hands it. 0711: it can open a
+            # name it is given, and no other account can even list one.
+            chmod 711 "$ARCHIVE_DIR"
         fi
         ARCHIVE_DIR="$(cd "$ARCHIVE_DIR" && pwd)"   # docker -v needs it absolute
     fi
@@ -1208,6 +1212,30 @@ cmd_prune() {
 
 # --- pull ----------------------------------------------------------------------
 
+# Hand files that already hashed true (in a private scratch dir) to the archive
+# the way archive_command would have left them: owned by the image's postgres,
+# 0600. The throwaway's postgres must read them - and nobody else. They used
+# to be chmod 644 instead: the drill worked on both transports, and so did
+# every other account on the host (measured: `nobody` read both segments).
+# Same protocol as everywhere else: temporary name, hash what landed, rename;
+# an existing name is never overwritten. The scratch dir goes either way.
+pull_hand_over() {
+    local stage="$1" sidecar="$2" rc=0
+    if [ -n "$(ls -A "$stage")" ]; then
+        docker run --rm -u root --entrypoint sh -v "$stage:/stage:ro" -v "$ARCHIVE_DIR:/archive" "$sidecar" -c '
+            cd /stage || exit 1
+            for n in *; do
+                t="/archive/.$n.pulling"
+                [ ! -e "/archive/$n" ] || { echo "/archive/$n appeared while pull ran - not overwriting it" >&2; exit 3; }
+                cp "$n" "$t" || { rm -f "$t"; exit 1; }
+                [ "$(sha256sum < "$n")" = "$(sha256sum < "$t")" ] || { rm -f "$t"; echo "$n changed on its way into the archive" >&2; exit 1; }
+                chown postgres:postgres "$t" && chmod 600 "$t" && mv "$t" "/archive/$n" || exit 1
+            done' || rc=$?
+    fi
+    rm -rf "$stage"
+    [ "$rc" -eq 0 ] || die "could not hand the fetched chain over to the archive (sidecar rc=$rc) - nothing that landed was left under its real name unverified"
+}
+
 # Disaster recovery: bring back the newest instant the remote can PROVE - the
 # newest mark manifest by NAME, because push writes the mark last, after
 # everything it stands on landed and hashed true. Everything is re-hashed
@@ -1308,36 +1336,55 @@ cmd_pull() {
     for line in "${inv_lines[@]}"; do
         case "${line%%$'\t'*}" in *.history|*.history.age) needed+=("${line%%$'\t'*}");; esac
     done
-    local iname isha fetched=0 already=0 tmpf
+    # What is already here was usually archived by the server itself: 0600,
+    # owned by ITS postgres - the host can see the name but not the bytes,
+    # and a host-side hash used to call a healthy survivor "NOT the file the
+    # mark stands on". The sidecar is the image the drill boots by default;
+    # it hashes, as root, whatever the pair needs that is already here.
+    local sidecar hashed
+    local -A present=()
+    sidecar="postgres:$(json_str "$base_local" server_version)-alpine"
+    hashed=$(printf '%s\n' "${needed[@]}" \
+        | docker run --rm -i -u root --entrypoint sh -v "$ARCHIVE_DIR:/archive:ro" "$sidecar" \
+            -c 'cd /archive && while read -r n; do [ ! -e "$n" ] || sha256sum "$n" || echo "unreadable $n"; done') \
+        || die "could not look into $ARCHIVE_DIR through a $sidecar sidecar"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        present["${line##* }"]="${line%% *}"
+    done <<< "$hashed"
+
+    # Fetched files land in a private scratch dir and are hashed there; only
+    # then are they handed over. On a failure, what already hashed true is
+    # still handed over before dying - the next pull finds it "already here".
+    local iname isha fetched=0 already=0 stage
+    stage=$(mktemp -d)
     for iname in "${needed[@]}"; do
         isha="${inv[$iname]:-}"
-        [ -n "$isha" ] \
-            || die "the pair needs $iname and the mark's inventory never stood on it - nothing can vouch for those bytes; pull refuses to guess"
-        if [ -e "$ARCHIVE_DIR/$iname" ]; then
-            [ "$(sha256_of "$ARCHIVE_DIR/$iname" 2>/dev/null || echo unreadable)" = "$isha" ] \
-                || die "$ARCHIVE_DIR/$iname already exists and is NOT the file the mark stands on - refusing to overwrite it or to trust it"
+        if [ -z "$isha" ]; then
+            pull_hand_over "$stage" "$sidecar"
+            die "the pair needs $iname and the mark's inventory never stood on it - nothing can vouch for those bytes; pull refuses to guess"
+        fi
+        if [ -n "${present[$iname]:-}" ]; then
+            if [ "${present[$iname]}" != "$isha" ]; then
+                pull_hand_over "$stage" "$sidecar"
+                die "$ARCHIVE_DIR/$iname already exists and is NOT the file the mark stands on - refusing to overwrite it or to trust it"
+            fi
             already=$((already + 1))
             continue
         fi
-        tmpf="$ARCHIVE_DIR/.$iname.pulling"
-        if ! rem_get "$iname" "$tmpf"; then
-            rm -f "$tmpf"
+        if ! rem_get "$iname" "$stage/$iname"; then
+            rm -f "$stage/$iname"
+            pull_hand_over "$stage" "$sidecar"
             die "could not fetch $iname - the chain is incomplete, and an incomplete chain recovers to a lie"
         fi
-        if [ "$(sha256_of "$tmpf")" != "$isha" ]; then
-            rm -f "$tmpf"
+        if [ "$(sha256_of "$stage/$iname")" != "$isha" ]; then
+            rm -f "$stage/$iname"
+            pull_hand_over "$stage" "$sidecar"
             die "$iname did not survive the transfer (or rotted at the remote) - the fetched copy was removed"
         fi
-        mv "$tmpf" "$ARCHIVE_DIR/$iname"
-        # The throwaway's own postgres user must be able to read what the
-        # host just fetched. A dir remote's cp carries the source's 0600
-        # over; ssh's redirect leaves 0644 - the recovery would then work on
-        # one transport and die on the other with the SAME bytes (caught by
-        # the fire drill, dir kind). An explicit mode makes both transports
-        # tell the same story.
-        chmod 644 "$ARCHIVE_DIR/$iname"
         fetched=$((fetched + 1))
     done
+    pull_hand_over "$stage" "$sidecar"
     ok "PULLED: chain of ${#needed[@]} file(s) ($fetched fetched, $already already here and hashing true)"
     local id_hint=""
     case "$(json_str "$base_local" artefact)" in *"$ENC_SUFFIX") id_hint=" --identity KEYFILE";; esac

@@ -592,3 +592,36 @@ _mkman() { # dir, filename, database, [kind]
     [ "$status" -ne 0 ]
     [[ "$output" == *"--db only means something with --latest"* ]]
 }
+
+@test "every entry script is born private: files 0600, directories 0700" {
+    local dir s
+    dir=$(mktemp -d)
+    for s in backup verify offsite pitr binlog; do
+        run bash -c "source '$REPO/$s.sh'; umask; touch '$dir/$s.f'; mkdir '$dir/$s.d'; stat -c %a '$dir/$s.f' '$dir/$s.d'"
+        [ "$status" -eq 0 ]
+        [ "${lines[0]}" = "0077" ]
+        [ "${lines[1]}" = "600" ]
+        [ "${lines[2]}" = "700" ]
+    done
+    rm -rf "$dir"
+}
+
+@test "the ssh remote writes with umask 077 on the far end, not with whatever umask it has" {
+    local dir
+    dir=$(mktemp -d)
+    mkdir "$dir/bin"
+    # A fake ssh that records the remote command; like the real one, it reads
+    # stdin only when it was not given -n.
+    cat > "$dir/bin/ssh" <<FAKE
+#!/bin/sh
+printf '%s\n' "\$*" >> "$dir/argv"
+case " \$* " in *" -n "*) ;; *) cat > /dev/null;; esac
+FAKE
+    chmod 700 "$dir/bin/ssh"
+    echo payload > "$dir/file"
+    run bash -c "PATH='$dir/bin':\$PATH; source '$REPO/lib/common.sh'; REM_HOST=h; REM_DIR=/srv/b; REM_SSH_OPTS=(); source '$REPO/lib/remote_ssh.sh'; rem_put '$dir/file' a.dump.part && rem_preflight rw" < /dev/null
+    [ "$status" -eq 0 ]
+    grep -q 'umask 077 && cat > /srv/b/a.dump.part' "$dir/argv"
+    grep -q 'umask 077 && mkdir -p /srv/b' "$dir/argv"
+    rm -rf "$dir"
+}

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Shared helpers, engine-agnostic. Sourced by backup.sh and verify.sh; never
-# run directly. Everything database-specific lives in lib/<engine>.sh behind a
-# common eng_* interface, so neither script contains an engine name.
+# Shared helpers, engine-agnostic. Sourced by every entry script (backup,
+# verify, offsite, pitr, binlog); never run directly. Everything
+# database-specific lives in lib/<engine>.sh behind a common eng_* interface,
+# so neither backup.sh nor verify.sh contains an engine name.
 # =============================================================================
 
 # pipefail is not decoration here, it is the whole point of one of this repo's
@@ -15,6 +16,15 @@
 # failed dump left a plausible 0-byte artefact behind - negative case 2 caught
 # it, which is negative case 2's entire job.
 set -Eeuo pipefail
+
+# Everything this tool writes is somebody's data: dumps, base backups, WAL
+# segments and binlogs all carry rows in cleartext. Under the usual umask 022
+# every one of them was born 0644 in a 0755 directory - measured: after a
+# pull, `nobody` read the base tar, both WAL segments and the manifests. So
+# every file is born 0600 and every directory 0700; the one reader that is not
+# the host user (a throwaway's postgres, reading a pulled WAL chain) gets the
+# files handed to it explicitly, never the whole world.
+umask 077
 
 # Colour only when stdout is a terminal. Escape codes in a CI log are noise at
 # best, and they broke a test that grepped for "OK   customers" while the real

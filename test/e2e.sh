@@ -94,6 +94,13 @@ else
 fi
 MANIFEST=$(find "$OUT" -name '*.json' | head -1)
 [ -n "$MANIFEST" ] || die 'backup.sh produced no manifest'
+# The artefact is the whole database (or tree) in one file - the host user's
+# alone. Under the usual umask 022 it used to be born 0644.
+PAIR="$(basename "$MANIFEST" .json)*"
+[ "$(find "$OUT" -type f -name "$PAIR" | grep -c .)" -ge 2 ] || die "no artefact next to $(basename "$MANIFEST")"
+LOOSE=$(find "$OUT" -type f -name "$PAIR" ! -perm 600 -printf '%m %f ')
+[ -z "$LOOSE" ] || die "backup.sh left files readable beyond the host user: $LOOSE"
+ok "artefact and manifest are private: $(find "$OUT" -type f -name "$PAIR" -printf '%f ')all 0600"
 
 # The destruction is the point. A backup nobody has restored is a hope, and the
 # only way to stop hoping is to throw the original away first.

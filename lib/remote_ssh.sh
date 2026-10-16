@@ -51,14 +51,18 @@ rem_preflight() {
     rem_ssh "command -v sha256sum >/dev/null" \
         || die "$REM_HOST has no sha256sum - a remote that cannot hash what it holds cannot prove it holds anything"
     if [ "$mode" = rw ]; then
-        rem_ssh "mkdir -p $qdir && [ -w $qdir ]" \
+        rem_ssh "umask 077 && mkdir -p $qdir && [ -w $qdir ]" \
             || die "cannot create or write $REM_DIR on $REM_HOST"
     else
         rem_ssh "[ -d $qdir ]" || die "$REM_DIR does not exist on $REM_HOST - wrong --remote?"
     fi
 }
 
-rem_put()    { rem_ssh_stdin "cat > $(rem_path "$2")" < "$1"; }
+# The far end writes with ITS OWN umask, not ours: through a stock sshd every
+# pushed file - base tar, manifests, WAL segments - landed readable by other
+# accounts at the remote (measured). The off-site copy is the same data, so
+# it is born private there too.
+rem_put()    { rem_ssh_stdin "umask 077 && cat > $(rem_path "$2")" < "$1"; }
 rem_get()    { rem_ssh "cat $(rem_path "$1")" > "$2"; }
 rem_rename() { rem_ssh "mv -f $(rem_path "$1") $(rem_path "$2")"; }
 rem_delete() { rem_ssh "rm -f $(rem_path "$1")"; }
