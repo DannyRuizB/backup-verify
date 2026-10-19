@@ -50,7 +50,15 @@ seed_mysql() {
     # The mysql client aborts on the first error in batch mode, so no
     # ON_ERROR_STOP analogue is needed. Single-statement routine bodies on
     # purpose: they need no DELIMITER games inside a heredoc.
-    docker exec -i -e MYSQL_PWD=verify "$container" mysql -uroot "$db" <<'SQL'
+    # The orders CTE recurses 2000 deep and both servers stop at 1000 - under
+    # different names (measured): MySQL's cte_max_recursion_depth is unknown
+    # to MariaDB (ERROR 1193 on 10.11), which stops at max_recursive_iterations
+    # = 1000 (ERROR 1931 on 10.11 and 11.4).
+    local depth='SET SESSION cte_max_recursion_depth = 5000;'
+    case "$(eng_query "$container" "$db" 'SELECT VERSION();')" in
+        *MariaDB*) depth='SET SESSION max_recursive_iterations = 5000;';;
+    esac
+    { printf '%s\n' "$depth"; cat <<'SQL'
 CREATE TABLE customers (
   id int AUTO_INCREMENT PRIMARY KEY,
   name varchar(100) NOT NULL,
@@ -75,7 +83,6 @@ CREATE FUNCTION order_label(oid int) RETURNS varchar(20) DETERMINISTIC
 CREATE PROCEDURE count_orders() SELECT COUNT(*) FROM orders;
 CREATE TRIGGER orders_note BEFORE INSERT ON orders
   FOR EACH ROW SET NEW.note = IFNULL(NEW.note, 'pedido sin nota');
-SET SESSION cte_max_recursion_depth = 5000;
 INSERT INTO customers (name, email)
   WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 500)
   SELECT CONCAT('cliente ', n), CONCAT('c', n, '@example.com') FROM g;
@@ -83,6 +90,7 @@ INSERT INTO orders (customer_id, total, note)
   WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 2000)
   SELECT (n % 500) + 1, ROUND(n * 1.37, 2), CONCAT('pedido ', n) FROM g;
 SQL
+    } | docker exec -i -e MYSQL_PWD=verify "$container" "$(my_bin "$container" mysql)" -uroot "$db"
 }
 
 # SQLite gets the same shape to lose, in one file: two tables (PK, UNIQUE,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# MySQL / MariaDB engine module.
+# MySQL / MariaDB engine module (MariaDB measured on 10.11 and 11.4 - see my_bin).
 #
 # Same eng_* interface as lib/postgres.sh. Two MySQL-specific traps, both
 # MEASURED on a real 8.4 server, shape everything below:
@@ -32,10 +32,38 @@ ENG_UNIT="table"
 # MYSQL_PWD is used throughout instead of -p: a password on the command line is
 # visible to every user on the box via the process list.
 
+# Which client binary this container has. MariaDB 11 images ship only
+# `mariadb` and `mariadb-dump` (measured on mariadb:11.4: no `mysql`, no
+# `mysqldump` - every call failed and the readiness wait ran out after 120 s);
+# 10.11 ships both names, MySQL images only the mysql* ones. The mariadb*
+# name wins where it exists. Asked once per container and remembered in THIS
+# shell; callers inside $(...) are subshells and would forget, so
+# eng_preflight and eng_wait_ready - which run in the parent - ask first. A
+# container that does not answer yet gets the mysql* name for this one call
+# and nothing is remembered.
+declare -gA MY_BIN=()
+my_bin() {
+    local container="$1" name="$2" maria found
+    case "$name" in
+        mysql)     maria=mariadb;;
+        mysqldump) maria=mariadb-dump;;
+        *)         die "my_bin: unknown client '$name'";;
+    esac
+    if [ -z "${MY_BIN[$container:$name]:-}" ]; then
+        found=$(docker exec "$container" sh -c "if command -v $maria >/dev/null; then echo $maria; elif command -v $name >/dev/null; then echo $name; fi" \
+            < /dev/null 2>/dev/null) || true
+        if [ -z "$found" ]; then printf '%s' "$name"; return 0; fi
+        MY_BIN[$container:$name]="$found"
+    fi
+    printf '%s' "${MY_BIN[$container:$name]}"
+}
+
 # Backup-side preconditions: the tools exist and the source is reachable.
 eng_preflight() {
     need docker
     docker inspect "$1" >/dev/null 2>&1 || die "container '$1' not found"
+    my_bin "$1" mysql >/dev/null
+    my_bin "$1" mysqldump >/dev/null
 }
 
 # Arguments past the image go to the SERVER: a GTID pair must be verified on
@@ -51,6 +79,29 @@ eng_boot() {
         "$image" "$@" >/dev/null
 }
 
+# The server's own version string ("8.4.6", "11.4.13-MariaDB-ubu2404"),
+# written into the manifest so verify can boot the same server: a MariaDB
+# 11.4 dump restored into the default mysql:8.4 dies on its collation
+# ("Unknown collation: 'utf8mb4_uca1400_ai_ci'", measured), and verify then
+# blamed the fingerprint ("not usable") instead of the engine.
+eng_server_version() {
+    eng_query "$1" "$2" 'SELECT VERSION();' | tr -d '\n'
+}
+
+# The throwaway image for a recorded server version when --image is not
+# given: MariaDB gets its own series (11.4.13-MariaDB -> mariadb:11.4); MySQL
+# keeps ENG_DEFAULT_IMAGE, as before the field existed. Fails on a MariaDB
+# version it cannot read - never guess an engine.
+eng_image_for_server() {
+    local series
+    case "$1" in
+        *MariaDB*)
+            series=$(printf '%s' "$1" | grep -oE '^[0-9]+\.[0-9]+') || return 1
+            printf 'mariadb:%s' "$series";;
+        *)  printf '%s' "$ENG_DEFAULT_IMAGE";;
+    esac
+}
+
 # Remove the throwaway instance.
 eng_teardown() {
     docker rm -f "$1" >/dev/null 2>&1 || true
@@ -63,7 +114,9 @@ eng_wait_ready() {
     local container="$1" tries="${2:-120}" stable_needed="${3:-3}"
     local i streak=0
     for ((i = 1; i <= tries; i++)); do
-        if docker exec -e MYSQL_PWD=verify "$container" mysql -uroot -N -B -e 'SELECT 1' \
+        my_bin "$container" mysql >/dev/null
+        my_bin "$container" mysqldump >/dev/null
+        if docker exec -e MYSQL_PWD=verify "$container" "$(my_bin "$container" mysql)" -uroot -N -B -e 'SELECT 1' \
                 >/dev/null 2>&1 < /dev/null; then
             streak=$((streak + 1))
             [ "$streak" -ge "$stable_needed" ] && return 0
@@ -79,7 +132,7 @@ eng_wait_ready() {
 # the rest of the code expects. stdin closed for the same reason as Postgres.
 eng_query() {
     local container="$1" db="$2" sql="$3"
-    docker exec -e MYSQL_PWD=verify "$container" mysql -uroot -N -B "$db" -e "$sql" < /dev/null 2>/dev/null
+    docker exec -e MYSQL_PWD=verify "$container" "$(my_bin "$container" mysql)" -uroot -N -B "$db" -e "$sql" < /dev/null 2>/dev/null
 }
 
 # --routines --events --triggers are NOT optional: without them the dump
@@ -87,14 +140,14 @@ eng_query() {
 # gives a consistent snapshot without locking the whole database.
 eng_dump() {
     local container="$1" db="$2"
-    docker exec -e MYSQL_PWD=verify "$container" mysqldump -uroot \
+    docker exec -e MYSQL_PWD=verify "$container" "$(my_bin "$container" mysqldump)" -uroot \
         --single-transaction --routines --events --triggers \
         --databases "$db" < /dev/null 2>/dev/null
 }
 
 eng_restore() {
     local container="$1" db="$2"
-    docker exec -e MYSQL_PWD=verify -i "$container" mysql -uroot "$db"
+    docker exec -e MYSQL_PWD=verify -i "$container" "$(my_bin "$container" mysql)" -uroot "$db"
 }
 
 # A .sql dump is plain text, so "does it parse" is a weaker question than for a

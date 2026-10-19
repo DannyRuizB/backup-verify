@@ -32,8 +32,9 @@
 #   --db NAME         with --latest, which database's backups to consider
 #                     (siblings sharing a prefix are told apart by the manifest)
 #   --identity FILE   age identity, required when the backup is encrypted
-#   --image IMAGE     container image for the throwaway instance (engine default
-#                     if omitted)
+#   --image IMAGE     container image for the throwaway instance (if omitted:
+#                     the engine default - or, for a MariaDB dump whose manifest
+#                     records its server, that MariaDB series, e.g. mariadb:11.4)
 #   --keep-container  leave the throwaway container running (for debugging)
 #   --max-age D       fail when the backup was taken more than D days ago,
 #                     even if it restores perfectly (0 = off). A nightly
@@ -161,7 +162,18 @@ main() {
     engine="$(json_str "$MANIFEST" engine)"
     [ -n "$engine" ] || engine="postgres"   # schema 1/2 manifests predate the field
     load_engine "$engine"
-    [ -n "$IMAGE" ] || IMAGE="$ENG_DEFAULT_IMAGE"
+    if [ -z "$IMAGE" ]; then
+        # A manifest that names its server gets that flavour back (a MariaDB
+        # dump into mysql:8.4 is a different engine, and fails as one).
+        local server
+        server="$(json_str "$MANIFEST" server_version)"
+        if [ -n "$server" ] && declare -F eng_image_for_server >/dev/null; then
+            IMAGE="$(eng_image_for_server "$server")" \
+                || die "the manifest names a server ('$server') whose version this tool cannot read - pass --image"
+        else
+            IMAGE="$ENG_DEFAULT_IMAGE"
+        fi
+    fi
     dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
     db="$(json_str "$MANIFEST" database)"
     artefact="$dir/$(json_str "$MANIFEST" artefact)"
