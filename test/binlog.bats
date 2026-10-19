@@ -62,6 +62,30 @@ setup() {
     [ "$(binlog_name mysql-bin 7)" = "mysql-bin.000007" ]
 }
 
+@test "purged gap: the files between the archive's newest and the server's oldest, plain or .age" {
+    source "$REPO/lib/mysql.sh"
+    source "$REPO/binlog.sh" 2>/dev/null || true
+    ARCHIVE_DIR=$(mktemp -d)
+    # An empty archive has no chain yet: it starts wherever the server is.
+    [ -z "$(purged_gap_before binlog.000009)" ]
+    touch "$ARCHIVE_DIR/binlog.000001" "$ARCHIVE_DIR/binlog.000002"
+    [ -z "$(purged_gap_before binlog.000001)" ]    # the server still has it all
+    [ -z "$(purged_gap_before binlog.000003)" ]    # the next file is the server's oldest
+    [ "$(purged_gap_before binlog.000004)" = "binlog.000003 binlog.000003" ]
+    [ "$(purged_gap_before binlog.000010)" = "binlog.000003 binlog.000009" ]
+    # Strays and another server's series do not move the archive's newest.
+    touch "$ARCHIVE_DIR/.binlog.000007.copying" "$ARCHIVE_DIR/mysql-bin.000008"
+    [ "$(purged_gap_before binlog.000010)" = "binlog.000003 binlog.000009" ]
+    # Ciphertext names the same chain.
+    rm "$ARCHIVE_DIR"/binlog.00000*
+    touch "$ARCHIVE_DIR/binlog.000005.age"
+    [ -z "$(purged_gap_before binlog.000006)" ]
+    [ "$(purged_gap_before binlog.000008)" = "binlog.000006 binlog.000007" ]
+    [ "$(binlog_range binlog.000006 binlog.000006)" = "binlog.000006" ]
+    [ "$(binlog_range binlog.000006 binlog.000007)" = "binlog.000006 .. binlog.000007" ]
+    rm -rf "$ARCHIVE_DIR"
+}
+
 @test "binlog.sh verify refuses pitr and dump manifests, pointing at their tools" {
     tmp=$(mktemp -d)
     mkdir "$tmp/tools" "$tmp/archive"

@@ -380,6 +380,7 @@ archiving but in places its exact opposite:
 | `mysqlbinlog` read the whole file without complaint | **It does not verify event checksums unless asked**: a corrupted binlog decodes with rc 0 without `--verify-binlog-checksum` and dies loudly with it (measured, same file both ways). The flag is hardwired here — and the mark's inventory names the rot **today**, without waiting for a replay to trip. |
 | The nightly `mysqldump`, plus "we keep the binlogs" | **The tutorial dump records no anchor** — nothing says WHERE the replay starts. Starting from the beginning re-runs history the dump already contains (measured: it died on the first DDL collision, leaving an ambiguous half-replay). `base` dumps with `--source-data` and refuses to write a manifest if the anchor is missing. |
 | Copy the binlogs somewhere safe | **The active binlog grows under the copy, and MySQL has no `archive_command`** — nothing ships closed files anywhere, ever. So `mark` IS the archiver: it flushes the active file closed, copies every file the instant stands on, and hash-verifies each copy against the server's own bytes *before* the manifest exists. The mark's inventory carries one sha256 per file — sizes vary by nature here, so the hash carries all the weight the WAL size gate used to. |
+| `check` calls the archive continuous, and the next mark goes through | **The server deletes binlogs on its own clock, and asks nobody.** `binlog_expire_logs_seconds` (30 days by default) drops old files at every rotation and `PURGE BINARY LOGS` drops them on demand — and with no `archive_command`, nothing holds a file back until it is archived. Measured: the archive ended at `.000002`, the server's oldest was `.000005`, `check --container` called the archive continuous, and the next `mark` archived past the hole and wrote its manifest, rc 0 — even when it was the mark's **own** `FLUSH` that expired the file, because a rotation is when MySQL expires. Files gone from both sides are a gap nothing can ever fill: `check --container` names the range, and `mark` refuses — before fingerprinting, and again after its own flush — naming the expiry setting and the way out: a new chain, a fresh `base` and a new `--archive`. |
 | The database image can read its own history | **The official `mysql` image does not ship `mysqlbinlog`** (and `SHOW MASTER STATUS` is gone in 8.4 — both measured the hard way). The drill extracts the exact-version binary from the official client RPM and mounts it read-only into throwaways — the static-age lesson again — and `verify` refuses a version-skewed tool: a replay through the wrong decoder is a guess. |
 
 Measured with `gtid_mode=OFF`, the 8.4 default. GTID mode changes the replay
@@ -578,8 +579,11 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   it, each measured binlog lie as a caught case: a mark doctored to stop
   early replays **clean** and is failed by the arrival gate alone; the hole
   and the rot are named before anything boots; the pre-anchor mark is
-  refused in milliseconds; and the drill to the second mark proves the
-  archived disaster is also a recoverable instant. `--encrypted` runs the
+  refused in milliseconds; the drill to the second mark proves the
+  archived disaster is also a recoverable instant; and a server that purges
+  binlogs no mark has archived — on its own expiry clock, even at the mark's
+  own flush, or by `PURGE BINARY LOGS` — is named by `check --container` and
+  refused by `mark`, leaving the archive continuous. `--encrypted` runs the
   same drill through age ciphertext end to end — asserting the archive holds
   no plaintext and the seeded rows no longer grep out of it — plus the
   encrypted-only refusals: no key means no drill, and the wrong key is named.
@@ -622,7 +626,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Fourteen bugs this harness caught in its own code
+## Fifteen bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -760,6 +764,19 @@ compared was the word `unreadable`. Same lesson as the mutation cases above —
 the host can `stat` those files but never read them — learned again from the
 other side. What is already in the archive is now hashed by a root sidecar,
 and the case runs on every off-site drill.
+
+**`check` blessed a chain the server had already cut.** Every gate looked
+inward: holes *between* archived files, bytes that disagree with the
+server's. None looked at the edge — the archive's newest file against the
+server's oldest — so binlogs the server expired or purged before any mark
+archived them fell through both: `check --container` said continuous, and
+the next `mark` archived past the hole and wrote a manifest no existing base
+could ever reach. The sharpest version was the mark's own `FLUSH` expiring
+the very file it was about to copy. Both moments are refused now, and drill
+case 10 sets up each one. Writing that case also turned up case 8 calling
+two name-arithmetic helpers the harness never defined: its check only runs
+when a mark survives a prune, and the empty comparison would have answered
+"kept" for a mark that should have gone (reproduced).
 
 ## Scope
 

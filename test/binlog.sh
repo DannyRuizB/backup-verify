@@ -59,8 +59,16 @@ FAILURES=0
 pass_case() { printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$1"; }
 fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAILURES + 1)); }
 
+# binlog.sh's name arithmetic, for the cases that reason about file numbers.
+# Case 8 used to call the first two without them existing here: its check
+# only runs when a mark survives the prune, and an empty comparison would
+# have waved it through.
+binlog_prefix_of() { printf '%s' "${1%.*}"; }
+binlog_index_of()  { printf '%s' "$((10#${1##*.}))"; }
+binlog_name()      { printf '%s.%06d' "$1" "$2"; }
+
 cleanup() {
-    docker rm -f "$SRC" "${SRC}8" >/dev/null 2>&1 || true
+    docker rm -f "$SRC" "${SRC}8" "${SRC}10" >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -469,6 +477,91 @@ else
     sed -n '1,20p' "$OUT/prune8.log" | sed 's/^/        /'
 fi
 docker rm -f "$SRC8" >/dev/null 2>&1 || true
+printf '\n'
+
+echo '== Case 10: the server purges binlogs no mark archived - the gap is named, and no mark is written over it =='
+# MySQL drops closed binlogs on its own clock (binlog_expire_logs_seconds,
+# at every rotation) or on PURGE BINARY LOGS, and asks nobody. Measured
+# before the fix: check --container called such an archive continuous, and
+# the next mark archived past the hole and wrote its manifest, rc 0 - even
+# when it was the mark's OWN flush that expired the file. Self-contained:
+# case 1 destroyed the main source.
+SRC10="${SRC}10"; ARCHIVE10="$OUT/archive10"; BK10="$OUT/backups10"
+mkdir -p "$ARCHIVE10" "$BK10"
+docker rm -f "$SRC10" >/dev/null 2>&1 || true
+docker run -d --name "$SRC10" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" \
+    ${GTID_ARGS[@]+"${GTID_ARGS[@]}"} >/dev/null
+eng_wait_ready "$SRC10"
+seed_mysql "$SRC10" app
+oldest10() { eng_query "$SRC10" mysql 'SHOW BINARY LOGS;' | awk -F'\t' 'NR == 1 {print $1}'; }
+archive10() { find "$ARCHIVE10" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | tr '\n' ' '; }
+marks10() { find "$BK10" -name '*_binlogmark.json' | grep -c . || true; }
+./binlog.sh mark --container "$SRC10" --db app --archive "$ARCHIVE10" --out "$BK10" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark10a.log" 2>&1 \
+    || { fail_case 'the first mark of case 10 failed'; sed -n '1,10p' "$OUT/mark10a.log" | sed 's/^/        /'; }
+M10=$(find "$BK10" -name '*_binlogmark.json' | head -1)
+LAST10=$(json_str "$M10" mark_file)
+P10=$(binlog_prefix_of "$LAST10")
+NEXT10=$(binlog_name "$P10" $(($(binlog_index_of "$LAST10") + 1)))
+AFTER10=$(binlog_name "$P10" $(($(binlog_index_of "$LAST10") + 2)))
+
+# Scene 1: one closed file the archive does not have yet, and an expiry of
+# one second - so the mark's own FLUSH is what takes it away.
+eng_query "$SRC10" app "INSERT INTO orders (customer_id, total, note) VALUES (1, 10, 'case10');" >/dev/null
+eng_query "$SRC10" mysql 'SET GLOBAL binlog_expire_logs_seconds = 1;' >/dev/null
+eng_query "$SRC10" mysql 'FLUSH BINARY LOGS;' >/dev/null
+sleep 2
+BEFORE10=$(archive10)
+# The scene: NEXT is closed and still on the server, so nothing is missing
+# yet ($LAST10 itself may or may not have expired - it is archived).
+LOGS10=$(eng_query "$SRC10" mysql 'SHOW BINARY LOGS;' | awk -F'\t' '{print $1}')
+if ! grep -qx "$NEXT10" <<< "$LOGS10" \
+   || [ "$(binlog_index_of "$(oldest10)")" -gt "$(binlog_index_of "$NEXT10")" ]; then
+    fail_case "could not set the scene: $NEXT10 should be closed and still on the server (oldest there: $(oldest10))"
+else
+    RC10=0
+    ./binlog.sh mark --container "$SRC10" --db app --archive "$ARCHIVE10" --out "$BK10" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark10b.log" 2>&1 || RC10=$?
+    if [ "$RC10" -ne 0 ] && grep -q "this mark's own FLUSH rotated the binlog.* purged $NEXT10 before any mark archived it" "$OUT/mark10b.log" \
+       && grep -q 'expires binlogs after 1s' "$OUT/mark10b.log" \
+       && [ "$(marks10)" -eq 1 ] && [ "$(archive10)" = "$BEFORE10" ]; then
+        pass_case "the mark's own FLUSH expired $NEXT10 before it could be archived: named, no manifest written, archive untouched"
+    else
+        fail_case "a mark whose own FLUSH expired $NEXT10 was not refused cleanly (rc $RC10, $(marks10) mark(s), archive: $(archive10))"
+        tail -n 5 "$OUT/mark10b.log" | sed 's/^/        /'
+    fi
+fi
+
+# Scene 2: no expiry at all now, so only an explicit PURGE widens the gap -
+# and the refusal must not blame a clock the server does not run.
+eng_query "$SRC10" mysql 'SET GLOBAL binlog_expire_logs_seconds = 2592000; SET GLOBAL binlog_expire_logs_auto_purge = OFF;' >/dev/null
+CUR10=$(eng_query "$SRC10" mysql 'SHOW BINARY LOG STATUS;' | awk '{print $1}')
+eng_query "$SRC10" mysql "PURGE BINARY LOGS TO '$CUR10';" >/dev/null
+if ./binlog.sh check --archive "$ARCHIVE10" --container "$SRC10" ${VF[@]+"${VF[@]}"} >"$OUT/check10.log" 2>&1; then
+    fail_case "check --container blessed an archive whose next files the server no longer has (server starts at $(oldest10), archive ends at $LAST10)"
+    sed -n '1,10p' "$OUT/check10.log" | sed 's/^/        /'
+elif grep -q "FAIL $NEXT10 .. $AFTER10 - purged by the server before any mark archived it" "$OUT/check10.log" \
+     && ! grep -q 'travel with the next mark' "$OUT/check10.log"; then
+    pass_case "check --container names $NEXT10 .. $AFTER10 as gone from both sides - not as files the next mark will carry"
+else
+    fail_case 'check --container failed without naming the purged range'
+    sed -n '1,10p' "$OUT/check10.log" | sed 's/^/        /'
+fi
+RC10=0
+./binlog.sh mark --container "$SRC10" --db app --archive "$ARCHIVE10" --out "$BK10" ${EFLAGS[@]+"${EFLAGS[@]}"} >"$OUT/mark10c.log" 2>&1 || RC10=$?
+if [ "$RC10" -ne 0 ] && grep -q "the server already purged $NEXT10 .. $AFTER10 before any mark archived it" "$OUT/mark10c.log" \
+   && grep -q 'does not expire binlogs on its own, so a PURGE BINARY LOGS outran the marks' "$OUT/mark10c.log" \
+   && ! grep -q 'fingerprinting' "$OUT/mark10c.log" && [ "$(marks10)" -eq 1 ] && [ "$(archive10)" = "$BEFORE10" ]; then
+    pass_case 'a mark over the purged gap is refused before anything is fingerprinted - no manifest, archive untouched'
+else
+    fail_case "a mark over the purged gap was not refused up front (rc $RC10, $(marks10) mark(s), archive: $(archive10))"
+    tail -n 5 "$OUT/mark10c.log" | sed 's/^/        /'
+fi
+if ./binlog.sh check --archive "$ARCHIVE10" ${VF[@]+"${VF[@]}"} >"$OUT/check10b.log" 2>&1; then
+    pass_case 'the archive itself stays continuous: every mark before the gap still has its chain'
+else
+    fail_case 'the refusals left the archive broken'
+    sed -n '1,10p' "$OUT/check10b.log" | sed 's/^/        /'
+fi
+docker rm -f "$SRC10" >/dev/null 2>&1 || true
 printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then

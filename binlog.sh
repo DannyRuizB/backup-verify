@@ -66,10 +66,13 @@
 #           active file closed, and ARCHIVE every closed binlog the mark
 #           stands on - each copy hash-verified against the server's own
 #           bytes. The mark records one sha256 per archived file: MySQL has
-#           no archive_command, so the mark IS the archiver.
+#           no archive_command, so the mark IS the archiver. A mark the
+#           archive can no longer reach - the server purged files no mark
+#           had archived yet - is refused, not written.
 #   check   audit the archive TODAY: numbering holes, strays, and - with
 #           --container - whether the server's closed binlogs match the
-#           archived copies byte for byte. With --remote, audit the
+#           archived copies byte for byte, and whether the server already
+#           purged files the archive never got. With --remote, audit the
 #           off-site copy (every file the newest mark replays, hashed AT the
 #           remote); with --max-age, also that the newest mark is recent.
 #   verify  the drill: boot a throwaway MySQL, load the dump, replay the
@@ -312,6 +315,34 @@ binlog_prefix_of() { printf '%s' "${1%.*}"; }
 binlog_index_of()  { printf '%s' "$((10#${1##*.}))"; }
 binlog_name()      { printf '%s.%06d' "$1" "$2"; }
 
+# The binlogs a server dropped before any mark archived them. Given the
+# server's OLDEST binlog, print "FIRST LAST" of the gap between the archive's
+# newest file (same prefix, plain or .age) and it - or nothing. MySQL drops
+# closed binlogs on its own (binlog_expire_logs_seconds, at every rotation)
+# and on PURGE BINARY LOGS, and asks nobody first: there is no
+# archive_command to hold it back. Measured both ways: the archive ended at
+# .000002, the server's oldest was .000005, check --container called the
+# archive continuous and the next mark wrote a manifest over the hole, rc 0.
+# An empty archive has no chain yet - it starts wherever the server is.
+purged_gap_before() {
+    local oldest="$1" prefix newest=-1 name idx
+    prefix=$(binlog_prefix_of "$oldest")
+    while IFS= read -r name; do
+        name="${name%"$ENC_SUFFIX"}"
+        [ "$(binlog_prefix_of "$name")" = "$prefix" ] || continue
+        idx=$(binlog_index_of "$name")
+        [ "$idx" -le "$newest" ] || newest="$idx"
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -printf '%f\n' | grep -E '^[A-Za-z0-9_-]+\.[0-9]{6,}(\.age)?$')
+    [ "$newest" -ge 0 ] || return 0
+    [ "$(binlog_index_of "$oldest")" -gt $((newest + 1)) ] || return 0
+    printf '%s %s' "$(binlog_name "$prefix" $((newest + 1)))" "$(binlog_name "$prefix" $(($(binlog_index_of "$oldest") - 1)))"
+}
+
+# "X" for a one-file range, "X .. Y" otherwise.
+binlog_range() {
+    if [ "$1" = "$2" ]; then printf '%s' "$1"; else printf '%s .. %s' "$1" "$2"; fi
+}
+
 assert_binlog_on() {
     [ "$(eng_query "$CONTAINER" mysql 'SELECT @@log_bin;' | tr -d '\n')" = "1" ] \
         || die "the server in '$CONTAINER' is not writing a binary log - there is no history to recover through"
@@ -341,6 +372,34 @@ server_gtid_executed() {
 
 container_sha256() {
     docker exec "$CONTAINER" sha256sum "/var/lib/mysql/$1" < /dev/null 2>/dev/null | awk '{print $1}'
+}
+
+server_oldest_binlog() {
+    eng_query "$CONTAINER" mysql 'SHOW BINARY LOGS;' | awk -F'\t' 'NR == 1 {print $1}'
+}
+
+# A mark the archive's chain can no longer reach is refused, not written: a
+# hole of files that exist nowhere any more can never be filled, so every
+# base anchored before it is cut off from every mark after it. The argument
+# opens the message and says which moment caught it - before anything ran,
+# or after the mark's own FLUSH, because a rotation is exactly when MySQL
+# expires old binlogs (measured: the mark's FLUSH took a closed,
+# not-yet-archived file out from under it, and the mark used to carry on and
+# archive past the hole).
+assert_no_purged_gap() {
+    local gap first last expiry why
+    gap=$(purged_gap_before "$(server_oldest_binlog)")
+    [ -n "$gap" ] || return 0
+    read -r first last <<< "$gap"
+    # 0 when the server never expires on its own (measured on 8.4: seconds
+    # 0, or binlog_expire_logs_auto_purge OFF with the default 30 days).
+    expiry=$(eng_query "$CONTAINER" mysql 'SELECT IF(@@binlog_expire_logs_auto_purge, @@binlog_expire_logs_seconds, 0);' | tr -d '\n')
+    if [ "$expiry" = 0 ]; then
+        why="This server does not expire binlogs on its own, so a PURGE BINARY LOGS outran the marks."
+    else
+        why="This server expires binlogs after ${expiry}s (binlog_expire_logs_seconds): marks must come more often than that, and no PURGE BINARY LOGS may outrun them."
+    fi
+    die "$1 $(binlog_range "$first" "$last") before any mark archived it - gone from the server AND the archive, so the chain in $ARCHIVE_DIR ends for good at $(binlog_name "$(binlog_prefix_of "$first")" $(($(binlog_index_of "$first") - 1))) and no base anchored before the gap can reach a mark after it. No manifest was written. Start a new chain: a fresh './binlog.sh base' and a new --archive (this one still proves every mark before the gap). $why"
 }
 
 # The archive decides its own form: every file is NAME (plain) or NAME.age
@@ -540,6 +599,7 @@ cmd_mark() {
     elif [ -n "$sfx" ]; then
         die "this archive is encrypted ($ENC_SUFFIX) and the mark was given no --recipient - a mixed archive is a coin toss; refusing"
     fi
+    assert_no_purged_gap "the server already purged"
 
     local stamp manifest
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -607,6 +667,7 @@ EOF
         [ "$waited" -le "$TIMEOUT" ] || die "the server never rotated past $mark_file in ${TIMEOUT}s - this mark cannot be archived, so no manifest was written"
         sleep 1
     done
+    assert_no_purged_gap "this mark's own FLUSH rotated the binlog, and at a rotation the server expires old files: it purged"
 
     # MySQL has no archive_command: the mark IS the archiver. Every closed
     # file the mark stands on is copied out and the copy hash-verified
@@ -809,8 +870,19 @@ cmd_check() {
                 unarchived=$((unarchived + 1))
             fi
         done < <(eng_query "$CONTAINER" mysql 'SHOW BINARY LOGS;' | awk -F'\t' '{print $1 "\t" $2}')
-        [ "$unarchived" -eq 0 ] \
-            || log "$unarchived closed file(s) on the server are not archived yet - they travel with the next mark (MySQL has no archive_command; the mark is the archiver)"
+        # The files BETWEEN the two: on neither side any more. The archive
+        # can be continuous and byte-true and still end where the server's
+        # history no longer begins - and then no next mark can carry on.
+        local gap gap_first gap_last
+        gap=$(purged_gap_before "$(server_oldest_binlog)")
+        if [ -n "$gap" ]; then
+            read -r gap_first gap_last <<< "$gap"
+            printf '  %sFAIL%s %s - purged by the server before any mark archived it: gone from both sides, so this chain can never be replayed past %s (a fresh base and a new --archive start a new one)\n' \
+                "$c_red" "$c_reset" "$(binlog_range "$gap_first" "$gap_last")" "$prefix.$(printf '%06d' "$i1")$sfx"
+            problems=$((problems + 1))
+        elif [ "$unarchived" -gt 0 ]; then
+            log "$unarchived closed file(s) on the server are not archived yet - they travel with the next mark (MySQL has no archive_command; the mark is the archiver)"
+        fi
     fi
 
     printf '\n'
