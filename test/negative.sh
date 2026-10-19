@@ -281,7 +281,7 @@ case "$ENG_NAME" in
     mysql)
         # Everything eng_dump forces on, deliberately left at the default:
         # tables, view and trigger survive; the function and procedure vanish.
-        docker exec -e MYSQL_PWD=verify "$SRC" mysqldump -uroot \
+        docker exec -e MYSQL_PWD=verify "$SRC" "$(my_bin "$SRC" mysqldump)" -uroot \
             --single-transaction --databases app < /dev/null > "$ARTEFACT";;
     files)
         # The glob expands to everything EXCEPT the dotfiles - measured: .env

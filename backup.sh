@@ -115,6 +115,11 @@ write_manifest() {
         printf '  "bytes": %s,\n' "$(stat -c%s "$artefact")"
         printf '  "sha256": "%s",\n' "$(sha256_of "$artefact")"
         printf '  "engine": "%s",\n' "$ENG_NAME"
+        # Which server wrote the dump, where the engine can say (mysql): verify
+        # boots the same flavour when it is not told --image.
+        if declare -F eng_server_version >/dev/null; then
+            printf '  "server_version": "%s",\n' "$(eng_server_version "$CONTAINER" "$DB")"
+        fi
         # Recorded so verify.sh knows it needs an identity, and so a human can
         # tell WHICH key opens this file. A recipient is a public key: safe here.
         printf '  "encryption": "%s",\n' "$([ -n "$RECIPIENT" ] && echo age || echo none)"

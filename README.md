@@ -184,6 +184,26 @@ And the official MySQL image boots **two** servers just like the Postgres one
 (init, shutdown, the real one), so the same wait rule applies to both: a real
 query must succeed three times in a row before anyone trusts the server.
 
+### MariaDB, measured instead of assumed
+
+This README said "MySQL/MariaDB" from the first engine on, and no job ever
+started a MariaDB. When one did, three things broke. **On `mariadb:11.4` the
+tool could not even connect**: the image ships only `mariadb` and
+`mariadb-dump` — no `mysql`, no `mysqldump` (10.11 ships both names) — so the
+readiness wait ran out after 120 s. The module now asks each container which
+client it has. **A MariaDB dump restored into the default `mysql:8.4`
+throwaway died on its collation** (`Unknown collation:
+'utf8mb4_uca1400_ai_ci'`), and verify blamed the fingerprint; `backup.sh` now
+records the server (`server_version` in the manifest) and `verify.sh` boots
+the same MariaDB series unless told `--image` (`11.4.13-MariaDB` →
+`mariadb:11.4`; a MySQL manifest keeps `mysql:8.4`). And **the harness's own
+seed was MySQL-only**: `cte_max_recursion_depth` does not exist there (ERROR
+1193) and the same 1000-deep limit is called `max_recursive_iterations`.
+Drilled now on 11.4 and 10.11, plain and encrypted, plus the negative suite
+on 11.4 — `mariadb-dump` drops routines by default exactly like `mysqldump`,
+and is caught the same way. Binlog PITR was never measured on MariaDB, so it
+is not claimed there.
+
 ## File trees have their own ways of lying
 
 The third engine needed no database at all to earn its measurement table —
@@ -609,9 +629,9 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   interfaces, the WAL-name arithmetic (including the log-number carry a naive
   hex increment gets wrong), the binlog name arithmetic, and the regression
   guards described below.
-- CI runs the e2e against **Postgres 17, Postgres 16, MySQL 8.4 and a file
-  tree, plain and encrypted** (eight combinations), the negative suite per
-  engine, the off-site fire drill over **both remote kinds**, the PITR fire
+- CI runs the e2e against **Postgres 17, Postgres 16, MySQL 8.4, MariaDB 11.4
+  and 10.11, a file tree and a SQLite database, plain and encrypted** (fourteen
+  combinations), the negative suite per engine (MariaDB 11.4 included), the off-site fire drill over **both remote kinds**, the PITR fire
   drill on **both Postgres majors** (a base backup is bytes from one major
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
@@ -626,7 +646,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Fifteen bugs this harness caught in its own code
+## Sixteen bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -778,13 +798,20 @@ two name-arithmetic helpers the harness never defined: its check only runs
 when a mark survives a prune, and the empty comparison would have answered
 "kept" for a mark that should have gone (reproduced).
 
+**MariaDB was promised and never started.** The first job that ran one found
+the tool unable to connect to `mariadb:11.4` (no `mysql` binary in the
+image), a verify that restored a MariaDB dump into MySQL and blamed the
+fingerprint, and a seed that only MySQL accepts — see "MariaDB, measured
+instead of assumed". The fix was the cheap part; the lesson is the README's
+own rule: a claim no job drills is not a claim.
+
 ## Scope
 
-PostgreSQL and MySQL/MariaDB via Docker containers, SQLite databases and plain
+PostgreSQL, MySQL and MariaDB (drilled on 10.11 and 11.4) via Docker containers, SQLite databases and plain
 directory trees with no Docker at all (`--engine sqlite` / `--engine files`),
 off-site copies over ssh or onto a mounted disk, and
 point-in-time recovery for both database engines — Postgres over a WAL
-archive and MySQL over archived binlogs, both archives optionally encrypted
+archive and MySQL (not MariaDB) over archived binlogs, both archives optionally encrypted
 end to end, both pushed off-site, audited at the remote, and pulled back
 onto a bare machine: contents, schema objects (or file metadata), encryption
 at rest, whether the restored copy is actually usable, whether the remote

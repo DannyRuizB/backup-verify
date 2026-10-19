@@ -79,6 +79,11 @@ jobs:
           - { engine: postgres, image: 'postgres:17-alpine' }
           - { engine: postgres, image: 'postgres:16-alpine' }
           - { engine: mysql, image: 'mysql:8.4' }
+          # MariaDB, both client layouts: 11.4 ships only mariadb/mariadb-dump,
+          # 10.11 both names (measured) - the README promised MariaDB long
+          # before any job drilled it.
+          - { engine: mysql, image: 'mariadb:11.4' }
+          - { engine: mysql, image: 'mariadb:10.11' }
           # No image at all: the files engine restores into a scratch
           # directory. Same destruction test, no Docker involved.
           - { engine: files, image: 'scratch-dir' }
@@ -100,7 +105,7 @@ jobs:
         run: ./test/e2e.sh --engine ${{ matrix.target.engine }} ${{ matrix.mode }}
 
   negative:
-    name: Every failure mode is caught (${{ matrix.engine }})
+    name: Every failure mode is caught (${{ matrix.target.engine }} ${{ matrix.target.image }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -109,19 +114,28 @@ jobs:
       # invocation on MySQL, the dotfile-dropping `tar czf backup.tgz *` on
       # files, and a table-scoped `.dump customers orders` on sqlite (which
       # drops the index, both views and the trigger while keeping every row).
+      # MariaDB too: mariadb-dump drops routines by default exactly like
+      # mysqldump (measured), so case 6 holds there as well.
       matrix:
-        engine: [postgres, mysql, files, sqlite]
+        target:
+          - { engine: postgres }
+          - { engine: mysql }
+          - { engine: mysql, image: 'mariadb:11.4' }
+          - { engine: files }
+          - { engine: sqlite }
     steps:
       - uses: actions/checkout@v5
       - name: Install sqlite3
-        if: matrix.engine == 'sqlite'
+        if: matrix.target.engine == 'sqlite'
         run: sudo apt-get update -qq && sudo apt-get install -y sqlite3 >/dev/null
       # Not optional: the encryption cases FAIL the suite if age is missing,
       # rather than skipping quietly and reporting green.
       - name: Install age
         run: sudo apt-get update -qq && sudo apt-get install -y age >/dev/null
       - name: negative cases
-        run: ./test/negative.sh --engine ${{ matrix.engine }}
+        env:
+          BV_IMAGE: ${{ matrix.target.image }}
+        run: ./test/negative.sh --engine ${{ matrix.target.engine }}
 
   offsite:
     name: off-site fire drill (${{ matrix.remote }})

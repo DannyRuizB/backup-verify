@@ -625,3 +625,35 @@ FAKE
     grep -q 'umask 077 && mkdir -p /srv/b' "$dir/argv"
     rm -rf "$dir"
 }
+
+@test "a MariaDB manifest picks its own series for the throwaway; MySQL keeps the default" {
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server '11.4.13-MariaDB-ubu2404'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "mariadb:11.4" ]
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server '10.11.14-MariaDB-ubu2204'"
+    [ "$output" = "mariadb:10.11" ]
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server '8.4.11'"
+    [ "$output" = "mysql:8.4" ]
+    # A MariaDB string with no readable series is refused, never guessed.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server 'MariaDB-something'"
+    [ "$status" -ne 0 ]
+}
+
+@test "the client name is asked of the container: mariadb* where it exists, mysql* otherwise" {
+    tmp=$(mktemp -d)
+    # A fake docker that answers `command -v` like a MariaDB 11 image (mariadb only)
+    # or like a MySQL image (mysql only), chosen by the container name.
+    cat > "$tmp/docker" <<'SH'
+#!/bin/sh
+case "$2" in
+    maria11) case "$5" in *mariadb-dump*) echo mariadb-dump;; *) echo mariadb;; esac;;
+    mysql84) case "$5" in *mysqldump*) echo mysqldump;; *) echo mysql;; esac;;
+    *) exit 1;;
+esac
+SH
+    chmod +x "$tmp/docker"
+    run bash -c "PATH='$tmp':\$PATH; source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; echo \$(my_bin maria11 mysql) \$(my_bin maria11 mysqldump) \$(my_bin mysql84 mysql) \$(my_bin mysql84 mysqldump) \$(my_bin gone mysql)"
+    [ "$status" -eq 0 ]
+    [ "$output" = "mariadb mariadb-dump mysql mysqldump mysql" ]
+    rm -rf "$tmp"
+}
