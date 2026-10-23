@@ -666,3 +666,40 @@ _pick_pitr() { # dir, db -> "BASE MARK" basenames, or the error
     run bash "$REPO/pitr.sh" --help
     [[ "$output" == *"(verify) also fail when the mark it just proved"* ]]
 }
+
+# image_pgdata: the throwaway's cluster goes where the IMAGE keeps it.
+# postgres:18 moved PGDATA to /var/lib/postgresql/18/docker and refuses to
+# start with anything mounted at the old /var/lib/postgresql/data (measured),
+# which the recovery drill used to hard-code. `docker` is stubbed: these
+# tests are about the asking, not about Docker.
+@test "image_pgdata reads the PGDATA the image declares (postgres:18's own path)" {
+    run bash -c "source '$REPO/pitr.sh'
+        docker() {
+            [ \"\$1 \$2\" = 'image inspect' ] || return 1
+            [ \"\$3\" = '--format' ] && printf 'PATH=/usr/bin\nPGDATA=/var/lib/postgresql/18/docker\nPG_MAJOR=18\n'
+            return 0
+        }
+        image_pgdata postgres:18-alpine"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/var/lib/postgresql/18/docker" ]
+}
+
+@test "image_pgdata refuses an image that declares no PGDATA instead of guessing" {
+    run bash -c "source '$REPO/pitr.sh'
+        docker() {
+            [ \"\$1 \$2\" = 'image inspect' ] || return 1
+            [ \"\$3\" = '--format' ] && printf 'PATH=/usr/bin\n'
+            return 0
+        }
+        image_pgdata custom/postgres:odd"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"declares no PGDATA - refusing to guess"* ]]
+}
+
+@test "image_pgdata pulls a missing image before asking, and says so when it cannot" {
+    run bash -c "source '$REPO/pitr.sh'
+        docker() { return 1; }
+        image_pgdata postgres:99-alpine"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot pull postgres:99-alpine"* ]]
+}

@@ -76,6 +76,9 @@ jobs:
       # not change the promise, so the same cycle also runs through age.
       matrix:
         target:
+          # 18 keeps its cluster somewhere else (PGDATA /var/lib/postgresql/18/
+          # docker) and was promised by "PostgreSQL" a year before a job ran it.
+          - { engine: postgres, image: 'postgres:18-alpine' }
           - { engine: postgres, image: 'postgres:17-alpine' }
           - { engine: postgres, image: 'postgres:16-alpine' }
           - { engine: mysql, image: 'mysql:8.4' }
@@ -119,6 +122,7 @@ jobs:
       matrix:
         target:
           - { engine: postgres }
+          - { engine: postgres, image: 'postgres:18-alpine' }
           - { engine: mysql }
           - { engine: mysql, image: 'mariadb:11.4' }
           - { engine: files }
@@ -165,7 +169,9 @@ jobs:
       # encryption must not change the promise, so the same drill also runs
       # with every segment leaving the server as age ciphertext.
       matrix:
-        image: ['postgres:17-alpine', 'postgres:16-alpine']
+        # 18 included: its entrypoint refuses a mount at the old data path,
+        # which is where this drill used to put the restored base (measured).
+        image: ['postgres:18-alpine', 'postgres:17-alpine', 'postgres:16-alpine']
         mode: ['', '--encrypted']
     steps:
       - uses: actions/checkout@v5

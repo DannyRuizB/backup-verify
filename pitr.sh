@@ -1433,6 +1433,25 @@ pitr_base_reaches() {
     [ "$(wal_name_index "$bstart" "$bbytes")" -le "$(wal_name_index "$mfile" "$bbytes")" ]
 }
 
+# Where this image keeps its cluster. postgres:18 moved PGDATA from
+# /var/lib/postgresql/data to /var/lib/postgresql/18/docker, and its
+# entrypoint refuses to start with ANYTHING mounted at the old path -
+# measured: exit 1, "in 18+, these Docker images are configured to store
+# database data in a format which is compatible with pg_ctlcluster", before
+# postgres ever runs. So the restore goes where the image says (16 and 17
+# still say /var/lib/postgresql/data). Asked, never assumed: an image that
+# declares no PGDATA is refused.
+image_pgdata() {
+    local image="$1" dir
+    docker image inspect "$image" > /dev/null 2>&1 \
+        || docker pull -q "$image" > /dev/null \
+        || die "cannot pull $image to ask where it keeps its cluster"
+    dir=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
+        | sed -n 's/^PGDATA=//p' | head -n 1)
+    [ -n "$dir" ] || die "$image declares no PGDATA - refusing to guess where its cluster lives"
+    printf '%s\n' "$dir"
+}
+
 cmd_verify() {
     need docker
     need tar
@@ -1619,9 +1638,11 @@ cmd_verify() {
     } >> "$SCRATCH/postgresql.auto.conf"
     touch "$SCRATCH/recovery.signal"
 
-    log "booting a throwaway $IMAGE as '$PROBE' - recovery must reach '$mark_name' or die trying"
+    local pgdata
+    pgdata=$(image_pgdata "$IMAGE")
+    log "booting a throwaway $IMAGE as '$PROBE' (cluster at $pgdata) - recovery must reach '$mark_name' or die trying"
     docker create --name "$PROBE" -e POSTGRES_PASSWORD=verify \
-        -v "$SCRATCH:/var/lib/postgresql/data" -v "$ARCHIVE_DIR:/archive:ro" \
+        -v "$SCRATCH:$pgdata" -v "$ARCHIVE_DIR:/archive:ro" \
         ${key_mounts[@]+"${key_mounts[@]}"} \
         "$IMAGE" -c archive_mode=off > /dev/null
     [ -z "$wal_suffix" ] || copy_identity_into "$PROBE" "$IMAGE" postgres "$KEYDIR"
@@ -1632,7 +1653,15 @@ cmd_verify() {
         state=$(docker inspect --format '{{.State.Running}}' "$PROBE" 2>/dev/null || echo false)
         if [ "$state" != "true" ]; then
             printf '\n'
-            docker logs "$PROBE" 2>&1 | grep -E 'FATAL|PANIC|invalid' | tail -5 | sed 's/^/      /'
+            # `|| true`: under pipefail a log with no FATAL line made this
+            # grep the script's last word - errexit, and the die below never
+            # spoke. And an entrypoint that refuses to start prints no FATAL
+            # at all (postgres:18 with a mount at its old data path), so
+            # show the end of the log instead of nothing.
+            local why
+            why=$(docker logs "$PROBE" 2>&1 | grep -E 'FATAL|PANIC|invalid' | tail -5 || true)
+            [ -n "$why" ] || why=$(docker logs "$PROBE" 2>&1 | tail -8 || true)
+            printf '%s\n' "$why" | sed 's/^/      /'
             die "recovery DIED before reaching '$mark_name' - the archive cannot reproduce this mark (rc $(docker inspect --format '{{.State.ExitCode}}' "$PROBE" 2>/dev/null || echo '?'))"
         fi
         in_recovery=$(eng_query "$PROBE" "$db" 'SELECT pg_is_in_recovery();' 2>/dev/null | tr -d '\n' || true)

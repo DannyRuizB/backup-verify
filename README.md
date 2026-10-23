@@ -314,6 +314,21 @@ line of `pitr.sh` was written:
 | Every segment file is present, names contiguous | **A truncated segment only fails on the day you recover** — `invalid segment file size`, FATAL — which is the worst possible day to learn it. Every *complete* segment measures exactly `wal_segment_size`, so `check` makes that lie loud **today**, by size, from the directory alone (`.backup` and `.history` files are legitimately small and exempt). |
 | The archive directory accepts files | **One planted file bearing the name of the *next* segment jams the documented `archive_command` forever**: `test ! -f ... && cp ...` refuses to overwrite, so the real segment can never land (measured: `failed_count` +6 per 70 s, indefinitely — the poison pill). And a `pg_basebackup -X none` artefact alone does not even boot (`could not locate required checkpoint record`): it is **half** a backup whose other half *is* the archive — which is why `base` waits for that WAL to be archived, and a hung `base` is the honest symptom of a dead archiver. |
 
+### Postgres 18, measured instead of assumed
+
+The official `postgres:18` image keeps its cluster in
+`/var/lib/postgresql/18/docker` (16 and 17: `/var/lib/postgresql/data`), and
+its entrypoint **refuses to start with anything mounted at the old path** —
+exit 1, *"in 18+, these Docker images are configured to store database data in
+a format which is compatible with pg_ctlcluster"*, before postgres ever runs,
+even for an empty directory (measured). The PITR drill mounted the restored
+base backup exactly there. It now asks the image where its cluster lives
+(`PGDATA` from the image's own environment; an image that declares none is
+refused, not guessed at) and mounts it there — 16, 17 and 18 alike. Drilled on
+18: the dump cycle plain and encrypted, the negative suite, the PITR drill
+plain and encrypted (20/20 cases), and locally the PITR off-site drill over a
+directory remote.
+
 Hence the subcommands, suspicious at every step:
 
 - **`base`** — `pg_basebackup` (tar, `-X none` on purpose: bundling WAL into
@@ -629,10 +644,10 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   interfaces, the WAL-name arithmetic (including the log-number carry a naive
   hex increment gets wrong), the binlog name arithmetic, and the regression
   guards described below.
-- CI runs the e2e against **Postgres 17, Postgres 16, MySQL 8.4, MariaDB 11.4
-  and 10.11, a file tree and a SQLite database, plain and encrypted** (fourteen
-  combinations), the negative suite per engine (MariaDB 11.4 included), the off-site fire drill over **both remote kinds**, the PITR fire
-  drill on **both Postgres majors** (a base backup is bytes from one major
+- CI runs the e2e against **Postgres 18, 17 and 16, MySQL 8.4, MariaDB 11.4
+  and 10.11, a file tree and a SQLite database, plain and encrypted** (sixteen
+  combinations), the negative suite per engine (MariaDB 11.4 and Postgres 18 included), the off-site fire drill over **both remote kinds**, the PITR fire
+  drill on **all three Postgres majors** (a base backup is bytes from one major
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
   **plain and encrypted**, because encryption must not change the promise —
@@ -646,7 +661,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Sixteen bugs this harness caught in its own code
+## Seventeen bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -805,9 +820,20 @@ fingerprint, and a seed that only MySQL accepts — see "MariaDB, measured
 instead of assumed". The fix was the cheap part; the lesson is the README's
 own rule: a claim no job drills is not a claim.
 
+**Postgres 18 was the current major for a year, and the drill never booted
+it.** Scope said "PostgreSQL"; CI drilled 16 and 17. On `postgres:18-alpine`
+the dump cycle passed untouched, and the PITR drill failed 5 cases without a
+single line of explanation — two bugs stacked. The image moved its cluster
+(see "Postgres 18, measured instead of assumed"), and the drill's
+death-detector piped the dying container's log through `grep FATAL` under
+`pipefail`: a log with no FATAL line made that grep the script's last word,
+errexit fired, and the `die` that names the failure never ran (reproduced in
+isolation: rc 1, nothing printed). A recovery that dies now shows the end of
+its log whatever it says.
+
 ## Scope
 
-PostgreSQL, MySQL and MariaDB (drilled on 10.11 and 11.4) via Docker containers, SQLite databases and plain
+PostgreSQL (drilled on 16, 17 and 18), MySQL and MariaDB (drilled on 10.11 and 11.4) via Docker containers, SQLite databases and plain
 directory trees with no Docker at all (`--engine sqlite` / `--engine files`),
 off-site copies over ssh or onto a mounted disk, and
 point-in-time recovery for both database engines — Postgres over a WAL
