@@ -333,6 +333,17 @@ sha256_of() {
     sha256sum "$1" | awk '{print $1}'
 }
 
+# Which hash a manifest's fingerprints were taken with. Absent means md5:
+# that is what every manifest written before the field existed used, and
+# those must keep verifying exactly as they always did. Only an engine that
+# declares ENG_FINGERPRINT (mysql) writes the field or reads FP_ALGO.
+FP_ALGO=""
+manifest_fingerprint() {
+    local algo
+    algo="$(json_str "$1" fingerprint)"
+    printf '%s' "${algo:-md5}"
+}
+
 # --- Comparing a live instance against a manifest -----------------------------
 #
 # These four gates are THE verdict of this repo, so there is exactly one copy
@@ -347,6 +358,12 @@ compare_tables() {
     local container="$1" db="$2" manifest="$3"
     local failures=0 table expected actual
     COMPARED_TABLES=0
+    # Hash the restored copy the way the yardstick was hashed - and find out
+    # now, by name, if this server cannot.
+    FP_ALGO="$(manifest_fingerprint "$manifest")"
+    if declare -F eng_fingerprint_preflight >/dev/null; then
+        eng_fingerprint_preflight "$container" "$db"
+    fi
     while IFS=$'\t' read -r table expected; do
         [ -n "$table" ] || continue
         COMPARED_TABLES=$((COMPARED_TABLES + 1))
@@ -373,6 +390,8 @@ compare_tables() {
 # indexes, constraints, view, function and trigger.
 compare_objects() {
     local container="$1" db="$2" manifest="$3"
+    # shellcheck disable=SC2034  # read by the engine (lib/mysql.sh my_hash)
+    FP_ALGO="$(manifest_fingerprint "$manifest")"
     local failures=0 obj_lines obj_class obj_expected obj_actual exp_count act_count
     obj_lines=$(manifest_section "$manifest" objects)
     if [ -z "$obj_lines" ]; then

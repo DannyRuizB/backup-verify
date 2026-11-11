@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# MySQL / MariaDB engine module (MariaDB measured on 10.11 and 11.4 - see my_bin).
+# MySQL / MariaDB engine module (MySQL measured on 8.4 and 9.7, MariaDB on 10.11
+# and 11.4 - see my_bin and ENG_FINGERPRINT).
 #
 # Same eng_* interface as lib/postgres.sh. Two MySQL-specific traps, both
 # MEASURED on a real 8.4 server, shape everything below:
@@ -24,6 +25,15 @@
 ENG_NAME="mysql"
 # shellcheck disable=SC2034  # read by backup.sh/verify.sh, which source this
 ENG_DEFAULT_IMAGE="mysql:8.4"
+# The hash new manifests are fingerprinted with. MySQL 9.7 - the LTS after
+# 8.4, and what `mysql:lts` points at - no longer has MD5(), SHA1() or SHA():
+# they moved to component_classic_hashing, which is not installed by default
+# (measured on 9.7.4: "FUNCTION <db>.MD5 does not exist"; SHA2() is still built
+# in, on 8.4 and on MariaDB too). Every manifest written before this says
+# nothing and means md5 - see manifest_fingerprint - and keeps verifying
+# exactly as it always did.
+# shellcheck disable=SC2034  # read by backup.sh/binlog.sh, which source this
+ENG_FINGERPRINT="sha256"
 # shellcheck disable=SC2034  # read by backup.sh/verify.sh, which source this
 ENG_ARTEFACT_EXT=".sql"
 # shellcheck disable=SC2034  # used in user-facing messages
@@ -89,16 +99,19 @@ eng_server_version() {
 }
 
 # The throwaway image for a recorded server version when --image is not
-# given: MariaDB gets its own series (11.4.13-MariaDB -> mariadb:11.4); MySQL
-# keeps ENG_DEFAULT_IMAGE, as before the field existed. Fails on a MariaDB
+# given: each server gets its own series back (11.4.13-MariaDB ->
+# mariadb:11.4, 9.7.4 -> mysql:9.7, 8.4.6 -> mysql:8.4). MySQL used to keep
+# ENG_DEFAULT_IMAGE whatever the manifest said, and a 9.7 backup was then
+# "VERIFIED" on 8.4 - proving it restores into an older server than the one
+# you would recover onto (measured), and failing a perfectly good backup the
+# day it holds something 8.4 does not know, like a VECTOR column. Fails on a
 # version it cannot read - never guess an engine.
 eng_image_for_server() {
     local series
+    series=$(printf '%s' "$1" | grep -oE '^[0-9]+\.[0-9]+') || return 1
     case "$1" in
-        *MariaDB*)
-            series=$(printf '%s' "$1" | grep -oE '^[0-9]+\.[0-9]+') || return 1
-            printf 'mariadb:%s' "$series";;
-        *)  printf '%s' "$ENG_DEFAULT_IMAGE";;
+        *MariaDB*) printf 'mariadb:%s' "$series";;
+        *)         printf 'mysql:%s' "$series";;
     esac
 }
 
@@ -184,21 +197,61 @@ WHERE table_schema='$db' AND table_type='BASE TABLE' ORDER BY table_name;"
 # limit is raised AND the query proves it was enough, by comparing the joined
 # length against the length the rows must add up to. Anything else returns
 # TRUNCATED and the caller aborts rather than hashing 6% and reporting OK.
+#
+# The hash itself is whatever the yardstick was taken with: FP_ALGO is set by
+# whoever writes a manifest (ENG_FINGERPRINT) or compares against one (the
+# manifest's own "fingerprint"), and both sides run this same query.
+my_hash() {
+    case "${FP_ALGO:-$ENG_FINGERPRINT}" in
+        md5)    printf 'MD5(%s)' "$1";;
+        sha256) printf 'SHA2(%s, 256)' "$1";;
+        *)      die "unknown fingerprint algorithm '${FP_ALGO}' - refusing to guess how a manifest was hashed";;
+    esac
+}
+
+# Before comparing anything: can THIS server compute the hash the manifest
+# was taken with? Without the check, a manifest hashed with MD5() verified on
+# a 9.7 throwaway died with "the fingerprint of customers (restored copy) is
+# not usable ('')" (measured) - true, and no help at all on recovery day.
+eng_fingerprint_preflight() {
+    local container="$1" db="$2" probe
+    probe=$(eng_query "$container" "$db" "SELECT $(my_hash "'probe'");" | tr -d '\n') || true
+    [ -n "$probe" ] && [ "$probe" != NULL ] && return 0
+    die "this server ($(eng_server_version "$container" "$db")) cannot compute the ${FP_ALGO:-$ENG_FINGERPRINT} fingerprints this manifest was taken with - MySQL 9 moved MD5() out of the server (component_classic_hashing). Verify on the series that wrote it (the manifest's server_version)"
+}
+
 eng_table_fingerprint() {
     local container="$1" db="$2" table="$3" cols out
+    # A VECTOR column (MySQL 9) refuses CAST AS CHAR outright - "Incorrect
+    # arguments to cast_as_char", so a table with one could not be backed up -
+    # and VECTOR_TO_STRING is no way round it: it prints six digits, and 0.1
+    # and 0.1000001 (CDCCCC3D vs DACCCC3D, unequal to the server) both print
+    # [1.00000e-01] (measured on 9.7.4). HEX gives its exact float32 bytes.
+    # Every other column produces the very expression it always did, so
+    # existing fingerprints do not move.
     cols=$(eng_query "$container" "$db" "
 SET SESSION group_concat_max_len = 1073741824;
-SELECT GROUP_CONCAT(CONCAT('IFNULL(CAST(\`', column_name, '\` AS CHAR), ''<NULL>'')')
+SELECT GROUP_CONCAT(CONCAT('IFNULL(',
+                           IF(data_type = 'vector',
+                              CONCAT('HEX(\`', column_name, '\`)'),
+                              CONCAT('CAST(\`', column_name, '\` AS CHAR)')),
+                           ', ''<NULL>'')')
                     ORDER BY ordinal_position)
 FROM information_schema.columns
 WHERE table_schema='$db' AND table_name='$table';")
-    [ -n "$cols" ] || die "could not read the column list of \`$table\` - refusing to fingerprint nothing"
+    # A table that is not there has no columns, and GROUP_CONCAT over no rows
+    # prints the word NULL - which used to pass for a column list: the query
+    # then failed, the fingerprint came back empty, and verify died "not
+    # usable" instead of reporting the table absent and comparing the rest.
+    if [ -z "$cols" ] || [ "$cols" = NULL ]; then
+        die "could not read the column list of \`$table\` - refusing to fingerprint nothing"
+    fi
     out=$(eng_query "$container" "$db" "
 SET SESSION group_concat_max_len = 1073741824;
 SELECT CASE
          WHEN cnt = 0 THEN 'EMPTY:0'
          WHEN LENGTH(joined) <> expected_len THEN CONCAT('TRUNCATED:', cnt)
-         ELSE CONCAT(MD5(joined), ':', cnt)
+         ELSE CONCAT($(my_hash joined), ':', cnt)
        END
 FROM (
   SELECT GROUP_CONCAT(row_text ORDER BY row_text SEPARATOR '\n') AS joined,
@@ -236,7 +289,7 @@ FROM information_schema.table_constraints WHERE table_schema='$db' ORDER BY 1;";
 FROM information_schema.columns WHERE table_schema='$db'
 AND extra LIKE '%auto_increment%' ORDER BY 1;";;
         views)
-            sql="SELECT CONCAT(table_name,' ',MD5(view_definition))
+            sql="SELECT CONCAT(table_name,' ',$(my_hash view_definition))
 FROM information_schema.views WHERE table_schema='$db' ORDER BY 1;";;
         routines)
             # The class that a default mysqldump silently drops.

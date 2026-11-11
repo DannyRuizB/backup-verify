@@ -54,8 +54,9 @@ seed_mysql() {
     # different names (measured): MySQL's cte_max_recursion_depth is unknown
     # to MariaDB (ERROR 1193 on 10.11), which stops at max_recursive_iterations
     # = 1000 (ERROR 1931 on 10.11 and 11.4).
-    local depth='SET SESSION cte_max_recursion_depth = 5000;'
-    case "$(eng_query "$container" "$db" 'SELECT VERSION();')" in
+    local depth='SET SESSION cte_max_recursion_depth = 5000;' version
+    version="$(eng_query "$container" "$db" 'SELECT VERSION();')"
+    case "$version" in
         *MariaDB*) depth='SET SESSION max_recursive_iterations = 5000;';;
     esac
     { printf '%s\n' "$depth"; cat <<'SQL'
@@ -91,6 +92,21 @@ INSERT INTO orders (customer_id, total, note)
   SELECT (n % 500) + 1, ROUND(n * 1.37, 2), CONCAT('pedido ', n) FROM g;
 SQL
     } | docker exec -i -e MYSQL_PWD=verify "$container" "$(my_bin "$container" mysql)" -uroot "$db"
+    # MySQL 9 has VECTOR, and a VECTOR refuses CAST AS CHAR (measured on
+    # 9.7.4), so the seed carries one there - with two values that print the
+    # same at VECTOR_TO_STRING's six digits (0.1 and 0.1000001) and a NULL.
+    # Negative case 12 turns the first into the second.
+    case "$version" in
+        *MariaDB*|[0-8].*) ;;
+        *)  docker exec -i -e MYSQL_PWD=verify "$container" "$(my_bin "$container" mysql)" -uroot "$db" <<'SQL'
+CREATE TABLE embeddings (id int PRIMARY KEY, v VECTOR(3));
+INSERT INTO embeddings VALUES
+  (1, STRING_TO_VECTOR('[0.1,2,3]')),
+  (2, STRING_TO_VECTOR('[0.1000001,2,3]')),
+  (3, NULL);
+SQL
+            ;;
+    esac
 }
 
 # SQLite gets the same shape to lose, in one file: two tables (PK, UNIQUE,

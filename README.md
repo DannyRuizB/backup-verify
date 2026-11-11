@@ -111,9 +111,10 @@ This is the finding the whole repo is built on, measured on a real Postgres:
 So the two obvious checks both sign that backup off: the table exists, and it
 has rows. Only comparing the **whole content** catches it. `verify.sh` therefore
 never answers the question by counting: for each table it computes an
-order-independent md5 over every column of every row (the row count rides along
-only so a failure can say how many rows are missing), and compares it to the
-fingerprint recorded at backup time.
+order-independent hash over every column of every row — md5, or sha256 on
+MySQL, whose 9.7 no longer has `MD5()` (the manifest records which) — with the
+row count riding along only so a failure can say how many rows are missing,
+and compares it to the fingerprint recorded at backup time.
 
 ### ...and rows are only half the database
 
@@ -196,13 +197,37 @@ throwaway died on its collation** (`Unknown collation:
 'utf8mb4_uca1400_ai_ci'`), and verify blamed the fingerprint; `backup.sh` now
 records the server (`server_version` in the manifest) and `verify.sh` boots
 the same MariaDB series unless told `--image` (`11.4.13-MariaDB` →
-`mariadb:11.4`; a MySQL manifest keeps `mysql:8.4`). And **the harness's own
+`mariadb:11.4`; since 9.7, a MySQL manifest gets its own series back too —
+see below). And **the harness's own
 seed was MySQL-only**: `cte_max_recursion_depth` does not exist there (ERROR
 1193) and the same 1000-deep limit is called `max_recursive_iterations`.
 Drilled now on 11.4 and 10.11, plain and encrypted, plus the negative suite
 on 11.4 — `mariadb-dump` drops routines by default exactly like `mysqldump`,
 and is caught the same way. Binlog PITR was never measured on MariaDB, so it
 is not claimed there.
+
+### MySQL 9.7, measured instead of assumed
+
+9.7 is the LTS after 8.4 — `mysql:lts` and `mysql:9` point at it — and "MySQL"
+in this README covered it while every job ran 8.4. The first run on
+`mysql:9.7` (9.7.4) could not back up anything:
+
+| What the tool assumed | What 9.7 does (measured) |
+|---|---|
+| `MD5()` is a built-in, so the fingerprint can hash in the server | **`MD5()`, `SHA1()` and `SHA()` are gone** — moved to `component_classic_hashing`, which is not installed — and `SELECT MD5('a')` is *"FUNCTION &lt;db&gt;.MD5 does not exist"*. Every fingerprint came back empty and `backup.sh` refused to write a manifest (the empty-fingerprint guard doing its job). `SHA2()` is still built in, on 8.4 and MariaDB too: new MySQL manifests are hashed with `SHA2(…, 256)` and say so (`"fingerprint": "sha256"`). A manifest without the field is md5, as every manifest before it was, and verifies exactly as it always did — measured: an 8.4 and a MariaDB 11.4 backup written by the previous release, verified by this one, both VERIFIED. Asked to verify such a manifest on 9.7, verify now says why it cannot instead of calling the first table "not usable". |
+| Any MySQL dump can be checked on the default `mysql:8.4` | **A 9.7 backup was "VERIFIED" on 8.4** — proof that it restores into an older server than the one you would recover onto. verify now boots the series the manifest names (`9.7.4` → `mysql:9.7`, `8.4.11` → `mysql:8.4`), as it already did for MariaDB. Forced onto 8.4, a perfectly good 9.7 backup holding a `VECTOR` column FAILS: the restore dies on `vector(3)` (ERROR 1064). |
+| Every column can be read as text with `CAST(col AS CHAR)` | **A `VECTOR` refuses it** (*"Incorrect arguments to cast_as_char"*), so a table with one could not be backed up. `VECTOR_TO_STRING` is no way round it: it prints six digits, and 0.1 and 0.1000001 — `CDCCCC3D` and `DACCCC3D`, unequal to the server — both print `[1.00000e-01]`. The fingerprint reads a `VECTOR` with `HEX()`, its exact float32 bytes; every other column is read exactly as before, so no existing fingerprint moves. |
+
+The seed carries a `VECTOR` on MySQL 9 (two values that print the same at six
+digits, and a NULL), and negative case 12 turns the first into the second in
+the dump, realigns the manifest so only content can tell, and requires the
+`embeddings` fingerprint — and only it — to fail; with `VECTOR_TO_STRING` in
+place of `HEX` that case is VERIFIED (measured). Drilled on 9.7: the dump
+cycle plain and encrypted, the negative suite, and the binlog drill in all
+four modes — the drill now asks the image which series' `mysqlbinlog` to
+fetch (`mysql9.7-server-minimal` → the 9.7 client RPM) instead of hard-coding
+8.4's; locally 20 cases plain (the same 20 as on 8.4), 23 with GTID and 23
+encrypted. The binlog off-site drill tests the transports and stays on 8.4.
 
 ## File trees have their own ways of lying
 
@@ -644,15 +669,15 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   interfaces, the WAL-name arithmetic (including the log-number carry a naive
   hex increment gets wrong), the binlog name arithmetic, and the regression
   guards described below.
-- CI runs the e2e against **Postgres 18, 17 and 16, MySQL 8.4, MariaDB 11.4
-  and 10.11, a file tree and a SQLite database, plain and encrypted** (sixteen
-  combinations), the negative suite per engine (MariaDB 11.4 and Postgres 18 included), the off-site fire drill over **both remote kinds**, the PITR fire
+- CI runs the e2e against **Postgres 18, 17 and 16, MySQL 8.4 and 9.7, MariaDB
+  11.4 and 10.11, a file tree and a SQLite database, plain and encrypted**
+  (eighteen combinations), the negative suite per engine (MySQL 9.7, MariaDB 11.4 and Postgres 18 included), the off-site fire drill over **both remote kinds**, the PITR fire
   drill on **all three Postgres majors** (a base backup is bytes from one major
   version, so a recovery is a compatibility promise too), the PITR off-site
   fire drill over **both remote kinds again** — the PITR drills each run
   **plain and encrypted**, because encryption must not change the promise —
-  the MySQL binlog fire drill (**plain, encrypted, GTID, and GTID+encrypted**
-  — no mode may change the promise)
+  the MySQL binlog fire drill on **both LTS series, 8.4 and 9.7** (**plain,
+  encrypted, GTID, and GTID+encrypted** — no mode may change the promise)
   and its off-site drill over **both remote kinds, plain and encrypted
   again**, and everything
   again on a
@@ -661,7 +686,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Seventeen bugs this harness caught in its own code
+## Nineteen bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -831,9 +856,26 @@ errexit fired, and the `die` that names the failure never ran (reproduced in
 isolation: rc 1, nothing printed). A recovery that dies now shows the end of
 its log whatever it says.
 
+**MySQL 9.7 was the current LTS, and no job booted it.** Same lesson a third
+time, and the most complete failure yet: on `mysql:9.7` not one backup could
+be written, because the fingerprint hashed with `MD5()` and 9.7 has none; a
+`VECTOR` column could not be read at all; and verify would have checked a 9.7
+backup on 8.4 — see "MySQL 9.7, measured instead of assumed". The guard that
+refuses an empty fingerprint is what turned a missing function into a loud
+refusal instead of a manifest of nothing.
+
+**A table that was not there had a column list: the word `NULL`.** Measuring
+the 9.7 changes turned this one up in code from the first MySQL release:
+`GROUP_CONCAT` over no rows prints `NULL`, which passed the "do we have a
+column list?" check, so a table missing from the restored copy was
+fingerprinted anyway, came back empty, and verify died on it ("not usable")
+instead of reporting it absent and comparing the rest. Measured on a restore
+that loses two tables: now 9 problems named, one by one, where it used to
+stop at the first missing table.
+
 ## Scope
 
-PostgreSQL (drilled on 16, 17 and 18), MySQL and MariaDB (drilled on 10.11 and 11.4) via Docker containers, SQLite databases and plain
+PostgreSQL (drilled on 16, 17 and 18), MySQL (drilled on 8.4 and 9.7) and MariaDB (drilled on 10.11 and 11.4) via Docker containers, SQLite databases and plain
 directory trees with no Docker at all (`--engine sqlite` / `--engine files`),
 off-site copies over ssh or onto a mounted disk, and
 point-in-time recovery for both database engines — Postgres over a WAL
@@ -842,8 +884,8 @@ end to end, both pushed off-site, audited at the remote, and pulled back
 onto a bare machine: contents, schema objects (or file metadata), encryption
 at rest, whether the restored copy is actually usable, whether the remote
 provably holds what was sent, and whether a named instant provably comes back.
-Binlog PITR is claimed under both `gtid_mode=OFF` (the 8.4 default) and
-`gtid_mode=ON` — each measured in its own campaign, with the mode read from
+Binlog PITR is claimed on 8.4 and 9.7 (its off-site drill runs on 8.4),
+under both `gtid_mode=OFF` (the default) and `gtid_mode=ON` — each measured in its own campaign, with the mode read from
 the server and the manifests, never from a flag. Nothing else is promised:
 what the harness above does not drill, this repo does not claim.
 

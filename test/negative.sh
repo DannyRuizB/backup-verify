@@ -21,6 +21,9 @@
 #   7-11. Encryption: real ciphertext on disk, refusal without the key, the
 #      wrong key told apart from a bad archive, truncated ciphertext, and the
 #      good encrypted backup passing end to end.
+#   12. MySQL 9+: a VECTOR value changed below the six digits VECTOR_TO_STRING
+#      prints (0.1 -> 0.1000001) is still caught - the fingerprint reads its
+#      bytes.
 #
 # A test that only proves the happy path proves the least interesting thing.
 # =============================================================================
@@ -423,6 +426,49 @@ else
     fi
 fi
 printf '\n'
+
+# 12 (MySQL 9+ only, where the seed has a VECTOR): an embedding changed below
+# what VECTOR_TO_STRING prints. The dump's first vector 0.1 (CDCCCC3D) becomes
+# 0.1000001 (DACCCC3D) - both print [1.00000e-01] - and the manifest is
+# realigned so only the content fingerprint can tell. mysqldump writes the
+# value as _binary '...' with each high byte after a backslash (measured).
+SERVER_VERSION=""
+if [ "$ENG_NAME" = mysql ]; then
+    SERVER_VERSION=$(eng_query "$SRC" app 'SELECT VERSION();' | tr -d '\n')
+fi
+case "$SERVER_VERSION" in
+    ''|*MariaDB*|[0-8].*) ;;
+    *)
+        echo '== Case 12: an embedding changed below the six digits VECTOR_TO_STRING prints =='
+        MANIFEST=$(fresh_backup)
+        ARTEFACT="${MANIFEST%.json}$EXT"
+        if ! python3 - "$ARTEFACT" <<'PY'
+import sys
+p = sys.argv[1]
+b = open(p, 'rb').read()
+old, new = b"(1,_binary '\\\xcd\\\xcc\\\xcc=", b"(1,_binary '\\\xda\\\xcc\\\xcc="
+if b.count(old) != 1:
+    raise SystemExit('the dump does not write embeddings row 1 the way this case expects')
+open(p, 'wb').write(b.replace(old, new))
+PY
+        then
+            fail_case 'could not plant the changed embedding (see above)'
+        else
+            realign_manifest "$MANIFEST"
+            if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c12.log" 2>&1; then
+                fail_case 'an embedding changed below six printed digits was VERIFIED'
+                sed -n '1,15p' "$OUT/c12.log" | sed 's/^/        /'
+            elif grep -q 'FAIL.* embeddings - fingerprint differs' "$OUT/c12.log" \
+                && ! grep -q 'FAIL.* \(customers\|orders\) ' "$OUT/c12.log"; then
+                pass_case 'an embedding changed below six printed digits is caught by its fingerprint, and only it'
+            else
+                fail_case 'rejected, but not by the embeddings fingerprint'
+                sed -n '1,15p' "$OUT/c12.log" | sed 's/^/        /'
+            fi
+        fi
+        printf '\n'
+        ;;
+esac
 
 if [ "$FAILURES" -gt 0 ]; then
     die "$FAILURES negative case(s) behaved wrongly ($ENG_NAME)"

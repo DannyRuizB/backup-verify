@@ -82,6 +82,11 @@ jobs:
           - { engine: postgres, image: 'postgres:17-alpine' }
           - { engine: postgres, image: 'postgres:16-alpine' }
           - { engine: mysql, image: 'mysql:8.4' }
+          # 9.7 is the LTS after 8.4 (what mysql:lts points at) and was
+          # promised by "MySQL" while no job ran it: it has no MD5(), so not
+          # one backup could be fingerprinted there, and its VECTOR refuses
+          # CAST AS CHAR (all measured on 9.7.4).
+          - { engine: mysql, image: 'mysql:9.7' }
           # MariaDB, both client layouts: 11.4 ships only mariadb/mariadb-dump,
           # 10.11 both names (measured) - the README promised MariaDB long
           # before any job drilled it.
@@ -124,6 +129,9 @@ jobs:
           - { engine: postgres }
           - { engine: postgres, image: 'postgres:18-alpine' }
           - { engine: mysql }
+          # 9.7 adds case 12: an embedding changed below the six digits
+          # VECTOR_TO_STRING prints is still caught.
+          - { engine: mysql, image: 'mysql:9.7' }
           - { engine: mysql, image: 'mariadb:11.4' }
           - { engine: files }
           - { engine: sqlite }
@@ -213,7 +221,7 @@ jobs:
         run: ./test/pitr-offsite.sh --remote-kind ${{ matrix.remote }} ${{ matrix.mode }}
 
   binlog:
-    name: MySQL binlog fire drill (${{ matrix.mode }})
+    name: MySQL binlog fire drill (${{ matrix.image }} ${{ matrix.mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -221,7 +229,10 @@ jobs:
       # encrypted-only refusals (no key, wrong key). GTID re-runs it against
       # a gtid_mode=ON source - detected, never flagged - plus the GTID-only
       # gates; and the two compose, because neither may change the promise.
+      # Both LTS series: a binlog is bytes from one server version, and the
+      # replay tool has to be that version's (the drill asks the image).
       matrix:
+        image: ['mysql:8.4', 'mysql:9.7']
         mode: ['', '--encrypted', '--gtid', '--gtid --encrypted']
     steps:
       - uses: actions/checkout@v5
@@ -236,6 +247,8 @@ jobs:
       # the mysql image does not ship it (measured), and only the
       # exact-version official build is an honest replay tool.
       - name: fire drill + every measured binlog lie
+        env:
+          BV_IMAGE: ${{ matrix.image }}
         run: ./test/binlog.sh ${{ matrix.mode }}
 
   binlog-offsite:

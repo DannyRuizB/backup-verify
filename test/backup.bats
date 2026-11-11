@@ -130,7 +130,9 @@ JSON
     # disagree because their rows sit in a different physical order.
     run bash -c "grep -A4 '^eng_table_fingerprint' '$REPO/lib/postgres.sh'"
     [[ "$output" == *"ORDER BY row_text"* ]]
-    run bash -c "grep -A18 '^eng_table_fingerprint' '$REPO/lib/mysql.sh'"
+    # The whole function, not N lines after its name: a count broke the day
+    # the function grew a comment.
+    run bash -c "sed -n '/^eng_table_fingerprint/,/^}/p' '$REPO/lib/mysql.sh'"
     [[ "$output" == *"ORDER BY row_text"* ]]
 }
 
@@ -626,7 +628,7 @@ FAKE
     rm -rf "$dir"
 }
 
-@test "a MariaDB manifest picks its own series for the throwaway; MySQL keeps the default" {
+@test "every server gets its own series back for the throwaway, MySQL included" {
     run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server '11.4.13-MariaDB-ubu2404'"
     [ "$status" -eq 0 ]
     [ "$output" = "mariadb:11.4" ]
@@ -634,9 +636,65 @@ FAKE
     [ "$output" = "mariadb:10.11" ]
     run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server '8.4.11'"
     [ "$output" = "mysql:8.4" ]
-    # A MariaDB string with no readable series is refused, never guessed.
+    # A 9.7 backup used to be verified on mysql:8.4, whatever it said.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server '9.7.4'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "mysql:9.7" ]
+    # A string with no readable series is refused, never guessed.
     run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server 'MariaDB-something'"
     [ "$status" -ne 0 ]
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; eng_image_for_server 'mysql-something'"
+    [ "$status" -ne 0 ]
+}
+
+@test "a manifest without a fingerprint field means md5; the field wins when present" {
+    local tmp
+    tmp=$(mktemp)
+    printf '{\n  "engine": "mysql",\n  "tables": {\n  }\n}\n' > "$tmp"
+    run bash -c "source '$REPO/lib/common.sh'; manifest_fingerprint '$tmp'"
+    [ "$output" = "md5" ]
+    printf '{\n  "engine": "mysql",\n  "fingerprint": "sha256",\n  "tables": {\n  }\n}\n' > "$tmp"
+    run bash -c "source '$REPO/lib/common.sh'; manifest_fingerprint '$tmp'"
+    [ "$output" = "sha256" ]
+    rm -f "$tmp"
+}
+
+@test "my_hash hashes the way FP_ALGO says - sha256 by default - and refuses to guess" {
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; FP_ALGO=md5; my_hash joined"
+    [ "$output" = "MD5(joined)" ]
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; FP_ALGO=sha256; my_hash joined"
+    [ "$output" = "SHA2(joined, 256)" ]
+    # Nobody set it: new manifests are written with ENG_FINGERPRINT.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; my_hash joined"
+    [ "$output" = "SHA2(joined, 256)" ]
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'; FP_ALGO=crc32; my_hash joined"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown fingerprint algorithm 'crc32'"* ]]
+}
+
+@test "the preflight names the missing hash instead of letting a table look unusable" {
+    # A 9.7 server asked for MD5(): the query fails and returns nothing.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'
+        eng_query() { case \"\$3\" in *VERSION*) echo 9.7.4;; *) return 1;; esac; }
+        FP_ALGO=md5; eng_fingerprint_preflight c app"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"this server (9.7.4) cannot compute the md5 fingerprints"* ]]
+    # A server that answers is left alone.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'
+        eng_query() { echo 0123456789abcdef; }
+        FP_ALGO=sha256; eng_fingerprint_preflight c app && echo ready"
+    [ "$status" -eq 0 ]
+    [ "$output" = "ready" ]
+}
+
+@test "a missing table's column list (the word NULL) is not a column list" {
+    # GROUP_CONCAT over no rows prints NULL: that used to be fingerprinted,
+    # the query failed, and verify died 'not usable' instead of 'absent'.
+    run bash -c "source '$REPO/lib/common.sh'; source '$REPO/lib/mysql.sh'
+        eng_query() { echo NULL; }
+        eng_table_fingerprint c app gone"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *'could not read the column list of `gone`'* ]]
 }
 
 @test "the client name is asked of the container: mariadb* where it exists, mysql* otherwise" {
