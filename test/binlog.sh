@@ -107,15 +107,21 @@ fi
 # mysqlbinlog is NOT in the mysql image (measured) - the drill extracts the
 # exact-version binary from the official client RPM, once, and mounts it
 # read-only wherever it is needed. No skip path: a missing tool fails the
-# suite rather than reporting green on a drill that never ran.
+# suite rather than reporting green on a drill that never ran. The series is
+# asked of the image (its own repo is named mysql8.4-server-minimal or
+# mysql9.7-server-minimal), not written here: an 8.4 path drilled a 9.7
+# server with an 8.4 replay tool.
 log "extracting mysqlbinlog from the official mysql-community-client RPM"
 mkdir -p "$TOOLS" "$ARCHIVE"
 docker run --rm -v "$TOOLS:/tools" --entrypoint sh "$IMAGE" -c '
     set -e
-    printf "[mysql-full]\nname=MySQL Community\nbaseurl=https://repo.mysql.com/yum/mysql-8.4-community/el/9/x86_64/\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-mysql\nmodule_hotfixes=true\n" > /etc/yum.repos.d/full.repo
+    series=$(sed -n "s/^\[mysql\([0-9][0-9.]*\)-server-minimal\]$/\1/p" /etc/yum.repos.d/*.repo | head -1)
+    [ -n "$series" ] || { echo "the image names no mysqlX.Y-server-minimal repo"; exit 1; }
+    repo="https://repo.mysql.com/yum/mysql-$series-community/el/9/x86_64"
+    printf "[mysql-full]\nname=MySQL Community\nbaseurl=%s/\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-mysql\nmodule_hotfixes=true\n" "$repo" > /etc/yum.repos.d/full.repo
     nvr=$(microdnf repoquery mysql-community-client 2>/dev/null | grep "el9.x86_64" | sort -V | tail -1)
     [ -n "$nvr" ] || { echo "could not resolve the client RPM"; exit 1; }
-    curl -sO "https://repo.mysql.com/yum/mysql-8.4-community/el/9/x86_64/$nvr.rpm"
+    curl -sO "$repo/$nvr.rpm"
     rpm -Uvh --replacefiles --nodeps "$nvr.rpm" >/dev/null
     cp /usr/bin/mysqlbinlog /tools/
 ' >/dev/null 2>&1 || die 'could not extract mysqlbinlog from the official RPM - the drill cannot replay without it'

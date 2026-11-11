@@ -105,6 +105,8 @@ parse_args() {
 write_manifest() {
     local artefact="$1" manifest="$2" tables table fp first=1
     tables=$(eng_list_tables "$CONTAINER" "$DB")
+    # shellcheck disable=SC2034  # read by the engine (lib/mysql.sh my_hash)
+    FP_ALGO="${ENG_FINGERPRINT:-md5}"
 
     {
         printf '{\n'
@@ -115,6 +117,11 @@ write_manifest() {
         printf '  "bytes": %s,\n' "$(stat -c%s "$artefact")"
         printf '  "sha256": "%s",\n' "$(sha256_of "$artefact")"
         printf '  "engine": "%s",\n' "$ENG_NAME"
+        # How the fingerprints below were hashed, where the engine had to
+        # choose (mysql: 9.7 dropped MD5). Absent = md5, as it always was.
+        if [ -n "${ENG_FINGERPRINT:-}" ]; then
+            printf '  "fingerprint": "%s",\n' "$ENG_FINGERPRINT"
+        fi
         # Which server wrote the dump, where the engine can say (mysql): verify
         # boots the same flavour when it is not told --image.
         if declare -F eng_server_version >/dev/null; then

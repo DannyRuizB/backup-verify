@@ -615,6 +615,8 @@ cmd_mark() {
     # after bracket the fingerprinting, so writes landing in between are
     # reported, not hidden.
     local pos_before tables_block="" objects_block="" first=1
+    # shellcheck disable=SC2034  # read by the engine (lib/mysql.sh my_hash)
+    FP_ALGO="${ENG_FINGERPRINT:-md5}"
     pos_before=$(binlog_status)
     log "fingerprinting '$DB' ($count tables) - the yardstick the replay will be measured against"
     while IFS= read -r table; do
@@ -760,6 +762,8 @@ EOF
         printf '  "database": "%s",\n' "$DB"
         printf '  "created_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf '  "engine": "%s",\n' "$ENG_NAME"
+        # How the mark's fingerprints were hashed (absent = md5, as before).
+        printf '  "fingerprint": "%s",\n' "${ENG_FINGERPRINT:-md5}"
         printf '  "mark_file": "%s",\n' "$mark_file"
         printf '  "mark_pos": %s,\n' "$mark_pos"
         printf '  "quiesced": "%s",\n' "$quiesced"
