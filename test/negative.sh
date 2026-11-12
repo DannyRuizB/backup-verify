@@ -24,6 +24,8 @@
 #   12. MySQL 9+: a VECTOR value changed below the six digits VECTOR_TO_STRING
 #      prints (0.1 -> 0.1000001) is still caught - the fingerprint reads its
 #      bytes.
+#   13. Postgres: `pg_dump -n public` restores every row and none of the large
+#      objects those rows point to - the table matches, the documents are gone.
 #
 # A test that only proves the happy path proves the least interesting thing.
 # =============================================================================
@@ -426,6 +428,32 @@ else
     fi
 fi
 printf '\n'
+
+# 13 (Postgres only): every row restored, every document gone. Large objects
+# live in pg_largeobject, outside every table; `documents` holds only their
+# oids. `pg_dump -n public` - the "just my schema" invocation - leaves them
+# out (pg_dump includes large objects by default EXCEPT with -n, -t or
+# --schema-only), exit 0. The restored `documents` is byte-identical - same
+# rows, same oids - and every lo_get() on it fails: "large object N does not
+# exist" (measured on 16, 17 and 18).
+if [ "$ENG_NAME" = postgres ]; then
+    echo '== Case 13: every row restored, every document gone (large objects) =='
+    MANIFEST=$(fresh_backup)
+    ARTEFACT="${MANIFEST%.json}$EXT"
+    docker exec "$SRC" pg_dump -U postgres -d app -Fc -n public < /dev/null > "$ARTEFACT"
+    realign_manifest "$MANIFEST"
+    if ./verify.sh --manifest "$MANIFEST" --image "$IMAGE" >"$OUT/c13.log" 2>&1; then
+        fail_case 'a dump without its large objects was VERIFIED'
+        sed -n '1,20p' "$OUT/c13.log" | sed 's/^/        /'
+    elif grep -q 'FAIL.* large_objects - expected 3, restored copy has 0' "$OUT/c13.log" \
+        && grep -q 'OK   documents' "$OUT/c13.log"; then
+        pass_case 'the missing large objects were caught and NAMED, while documents itself matched'
+    else
+        fail_case 'rejected, but not for the missing large objects'
+        sed -n '1,20p' "$OUT/c13.log" | sed 's/^/        /'
+    fi
+    printf '\n'
+fi
 
 # 12 (MySQL 9+ only, where the seed has a VECTOR): an embedding changed below
 # what VECTOR_TO_STRING prints. The dump's first vector 0.1 (CDCCCC3D) becomes

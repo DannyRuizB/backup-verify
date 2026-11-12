@@ -42,6 +42,15 @@ CREATE FUNCTION touch_note() RETURNS trigger AS
   $$ BEGIN NEW.note := coalesce(NEW.note, 'pedido sin nota'); RETURN NEW; END $$ LANGUAGE plpgsql;
 CREATE TRIGGER orders_note BEFORE INSERT ON orders
   FOR EACH ROW EXECUTE FUNCTION touch_note();
+-- Large objects live in pg_largeobject, outside every table: `documents`
+-- holds only their oids, and restores identical without them (measured on
+-- 16, 17 and 18). One over 1 MiB so the fingerprint reads it in chunks, one
+-- empty.
+CREATE TABLE documents (id int PRIMARY KEY, name text NOT NULL, body oid NOT NULL);
+INSERT INTO documents VALUES
+  (1, 'contrato.txt', lo_from_bytea(0, convert_to('contrato firmado el 2026-01-01', 'UTF8'))),
+  (2, 'escaneo.bin', lo_from_bytea(0, convert_to(repeat('escaneo ', 300000), 'UTF8'))),
+  (3, 'vacio.txt', lo_from_bytea(0, ''::bytea));
 SQL
 }
 
