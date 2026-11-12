@@ -50,8 +50,8 @@ fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAI
 root_sh() { docker run --rm -u root --entrypoint sh -v "$OUT:/work" "$IMAGE" -c "$1"; }
 
 cleanup() {
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
-    if [ "$KIND" = ssh ]; then docker rm -f "$SSHD" >/dev/null 2>&1 || true; fi
+    docker rm -fv "$SRC" >/dev/null 2>&1 || true
+    if [ "$KIND" = ssh ]; then docker rm -fv "$SSHD" >/dev/null 2>&1 || true; fi
     root_sh "rm -rf /work/archive /work/pulled* && chown -R $(id -u):$(id -g) /work" >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
 }
@@ -61,7 +61,7 @@ trap cleanup EXIT
 if [ "$KIND" = ssh ]; then
     log "booting a real sshd in Docker"
     ssh-keygen -t ed25519 -N '' -f "$OUT/key" -q
-    docker rm -f "$SSHD" >/dev/null 2>&1 || true
+    docker rm -fv "$SSHD" >/dev/null 2>&1 || true
     docker run -d --name "$SSHD" -p "127.0.0.1:$PORT:22" alpine:3.20 sh -c "
         apk add --no-cache openssh >/dev/null 2>&1 &&
         ssh-keygen -A >/dev/null 2>&1 &&
@@ -113,7 +113,7 @@ traffic() {
 # Only verify does, at the very end.
 mkdir -p "$ARCHIVE" "$BK"
 chmod 777 "$ARCHIVE"   # the container's postgres user writes it
-docker rm -f "$SRC" >/dev/null 2>&1 || true
+docker rm -fv "$SRC" >/dev/null 2>&1 || true
 SEGSFX=""
 VF=()
 BASE_ENC=()
@@ -357,7 +357,7 @@ fi
 printf '\n'
 echo '== Case 7: the fire - source, archive and every local manifest destroyed =='
 log "DESTROYING the source, the local archive and the local backups (this is the whole point)"
-docker rm -f "$SRC" >/dev/null 2>&1
+docker rm -fv "$SRC" >/dev/null 2>&1
 root_sh "rm -rf /work/archive && chown -R $(id -u):$(id -g) /work" >/dev/null 2>&1 || true
 rm -rf "$ARCHIVE" "$BK"
 ok "the machine is bare - the remote is the only copy of anything"

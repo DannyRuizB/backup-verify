@@ -68,7 +68,7 @@ binlog_index_of()  { printf '%s' "$((10#${1##*.}))"; }
 binlog_name()      { printf '%s.%06d' "$1" "$2"; }
 
 cleanup() {
-    docker rm -f "$SRC" "${SRC}8" "${SRC}10" >/dev/null 2>&1 || true
+    docker rm -fv "$SRC" "${SRC}8" "${SRC}10" >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -130,7 +130,7 @@ ok "mysqlbinlog $(docker run --rm -v "$TOOLS/mysqlbinlog:/usr/bin/mysqlbinlog:ro
 
 # --- the source, binlog on (the 8.4 default) -----------------------------------
 log "booting the source database ($IMAGE) with its binary log on"
-docker rm -f "$SRC" >/dev/null 2>&1 || true
+docker rm -fv "$SRC" >/dev/null 2>&1 || true
 docker run -d --name "$SRC" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" \
     ${GTID_ARGS[@]+"${GTID_ARGS[@]}"} >/dev/null
 eng_wait_ready "$SRC"
@@ -204,8 +204,9 @@ else
 fi
 
 log 'DESTROYING the source database (this is the whole point)'
-docker rm -f "$SRC" >/dev/null
+docker rm -fv "$SRC" >/dev/null
 ok 'source is gone - the dump and the archived binlogs are now the only copy'
+DANGLING_BEFORE=$(docker volume ls -q --filter dangling=true | sort)
 if ./binlog.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --tools "$TOOLS" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify.log" 2>&1; then
     if grep -q 'BINLOG PITR VERIFIED' "$OUT/verify.log"; then
         pass_case 'the archive reproduced the marked instant, fingerprints and all - the archived disaster excluded'
@@ -216,6 +217,15 @@ if ./binlog.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --tools "$TOO
 else
     fail_case 'the fire drill failed: dump + binlogs did not reproduce the mark'
     sed -n '1,25p' "$OUT/verify.log" | sed 's/^/        /'
+fi
+# The drill's throwaway server declares a VOLUME (/var/lib/mysql) and the dump
+# is restored INTO it; torn down without -v, every drill left the recovered
+# database behind in a dangling volume. This verify must leave none.
+LEFT=$(comm -13 <(printf '%s\n' "$DANGLING_BEFORE") <(docker volume ls -q --filter dangling=true | sort) | grep -c . || true)
+if [ "$LEFT" -eq 0 ]; then
+    pass_case 'the drill left no volume behind (no recovered copy stays on disk)'
+else
+    fail_case "the drill left $LEFT dangling volume(s) behind - the recovered database is still on disk"
 fi
 if [ "$GTID" -eq 1 ]; then
     # Nothing was flagged: the pair itself must have carried the mode, the
@@ -408,7 +418,7 @@ echo '== Case 8: local retention - prune draws its line at the oldest KEPT dump 
 # source on purpose, and retention needs a SECOND anchored dump to draw a line.
 SRC8="${SRC}8"; ARCHIVE8="$OUT/archive8"; BK8="$OUT/backups8"
 mkdir -p "$ARCHIVE8" "$BK8"
-docker rm -f "$SRC8" >/dev/null 2>&1 || true
+docker rm -fv "$SRC8" >/dev/null 2>&1 || true
 docker run -d --name "$SRC8" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" \
     ${GTID_ARGS[@]+"${GTID_ARGS[@]}"} >/dev/null
 eng_wait_ready "$SRC8"
@@ -482,7 +492,7 @@ else
     fail_case 'prune --keep 1 failed'
     sed -n '1,20p' "$OUT/prune8.log" | sed 's/^/        /'
 fi
-docker rm -f "$SRC8" >/dev/null 2>&1 || true
+docker rm -fv "$SRC8" >/dev/null 2>&1 || true
 printf '\n'
 
 echo '== Case 10: the server purges binlogs no mark archived - the gap is named, and no mark is written over it =='
@@ -494,7 +504,7 @@ echo '== Case 10: the server purges binlogs no mark archived - the gap is named,
 # case 1 destroyed the main source.
 SRC10="${SRC}10"; ARCHIVE10="$OUT/archive10"; BK10="$OUT/backups10"
 mkdir -p "$ARCHIVE10" "$BK10"
-docker rm -f "$SRC10" >/dev/null 2>&1 || true
+docker rm -fv "$SRC10" >/dev/null 2>&1 || true
 docker run -d --name "$SRC10" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" \
     ${GTID_ARGS[@]+"${GTID_ARGS[@]}"} >/dev/null
 eng_wait_ready "$SRC10"
@@ -567,7 +577,7 @@ else
     fail_case 'the refusals left the archive broken'
     sed -n '1,10p' "$OUT/check10b.log" | sed 's/^/        /'
 fi
-docker rm -f "$SRC10" >/dev/null 2>&1 || true
+docker rm -fv "$SRC10" >/dev/null 2>&1 || true
 printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then

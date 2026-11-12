@@ -44,7 +44,7 @@ pass_case() { printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$1"; }
 fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAILURES + 1)); }
 
 cleanup() {
-    if [ "$KIND" = ssh ]; then docker rm -f "$SSHD" >/dev/null 2>&1 || true; fi
+    if [ "$KIND" = ssh ]; then docker rm -fv "$SSHD" >/dev/null 2>&1 || true; fi
     rm -rf "$OUT"
     rm -rf "${TMPDIR:-/tmp}"/bv-files-bv-verify-* 2>/dev/null || true
 }
@@ -54,7 +54,7 @@ trap cleanup EXIT
 if [ "$KIND" = ssh ]; then
     log "booting a real sshd in Docker (with a 256K tmpfs for the disk-full case)"
     ssh-keygen -t ed25519 -N '' -f "$OUT/key" -q
-    docker rm -f "$SSHD" >/dev/null 2>&1 || true
+    docker rm -fv "$SSHD" >/dev/null 2>&1 || true
     docker run -d --name "$SSHD" -p "127.0.0.1:$PORT:22" \
         --tmpfs /srv/full:rw,size=256k alpine:3.20 sh -c "
         apk add --no-cache openssh >/dev/null 2>&1 &&

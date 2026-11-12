@@ -51,9 +51,9 @@ fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAI
 root_sh() { docker run --rm -u root --entrypoint sh -v "$OUT:/work" "$IMAGE" -c "$1"; }
 
 cleanup() {
-    docker rm -f "${SRC}9" >/dev/null 2>&1 || true
-    docker rm -f "${SRC}2b" >/dev/null 2>&1 || true
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
+    docker rm -fv "${SRC}9" >/dev/null 2>&1 || true
+    docker rm -fv "${SRC}2b" >/dev/null 2>&1 || true
+    docker rm -fv "$SRC" >/dev/null 2>&1 || true
     root_sh 'rm -rf /work/archive /work/pristine' >/dev/null 2>&1 || true
     rm -rf "$OUT" 2>/dev/null || true
 }
@@ -61,7 +61,7 @@ trap cleanup EXIT
 
 mkdir -p "$ARCHIVE"
 chmod 777 "$ARCHIVE"   # the container's postgres user writes it
-docker rm -f "$SRC" >/dev/null 2>&1 || true
+docker rm -fv "$SRC" >/dev/null 2>&1 || true
 # The archive_command is the documentation's own suggestion, on purpose: the
 # lies this suite catches are the ones that ship with the standard recipe.
 # --encrypted swaps cp for age (the static binary rides into the container
@@ -208,7 +208,7 @@ echo '== Case 2b: ONE dead segment on a quiet server - the segment-boundary trap
 # in both modes - the arithmetic under test is the same.
 SRC2B="${SRC}2b"; ARCHIVE2B="$OUT/archive2b"
 mkdir -p "$ARCHIVE2B"; chmod 777 "$ARCHIVE2B"
-docker rm -f "$SRC2B" >/dev/null 2>&1 || true
+docker rm -fv "$SRC2B" >/dev/null 2>&1 || true
 docker run -d --name "$SRC2B" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
     -v "$ARCHIVE2B:/archive" "$IMAGE" -c autovacuum=off \
     -c archive_mode=on -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
@@ -250,7 +250,7 @@ else
     pass_case 'one stuck segment at a segment boundary: check counts the segment being WRITTEN and fails'
 fi
 chmod 777 "$ARCHIVE2B"
-docker rm -f "$SRC2B" >/dev/null 2>&1 || true
+docker rm -fv "$SRC2B" >/dev/null 2>&1 || true
 printf '\n'
 
 echo '== Case 1, continued: disaster, destruction, and the recovery that must be exact =='
@@ -261,8 +261,9 @@ eng_query "$SRC" app "DELETE FROM orders WHERE note LIKE 'archivo muerto%';
     SELECT pg_walfile_name(pg_switch_wal());" >/dev/null 2>&1
 sleep 2
 log 'DESTROYING the source database (this is the whole point)'
-docker rm -f "$SRC" >/dev/null
+docker rm -fv "$SRC" >/dev/null
 ok 'source is gone - the base backup and the archive are now the only copy'
+DANGLING_BEFORE=$(docker volume ls -q --filter dangling=true | sort)
 if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE" ${VF[@]+"${VF[@]}"} >"$OUT/verify.log" 2>&1; then
     if grep -q 'PITR VERIFIED' "$OUT/verify.log" \
        && grep -q 'recovery stopping at restore point' "$OUT/verify.log"; then
@@ -274,6 +275,15 @@ if ./pitr.sh verify --base "$B" --mark "$M" --archive "$ARCHIVE" --image "$IMAGE
 else
     fail_case 'the fire drill failed: base + archive did not reproduce the mark'
     sed -n '1,25p' "$OUT/verify.log" | sed 's/^/        /'
+fi
+# The drill's throwaway server declares a VOLUME; torn down without -v, every
+# drill on 18 left a dangling volume (a 12 KB skeleton around the bind-mounted
+# PGDATA - measured). This verify must leave none.
+LEFT=$(comm -13 <(printf '%s\n' "$DANGLING_BEFORE") <(docker volume ls -q --filter dangling=true | sort) | grep -c . || true)
+if [ "$LEFT" -eq 0 ]; then
+    pass_case 'the drill left no volume behind'
+else
+    fail_case "the drill left $LEFT dangling volume(s) behind"
 fi
 printf '\n'
 
@@ -449,7 +459,7 @@ echo '== Case 9: local retention - prune draws its line at the oldest KEPT base 
 # a line between. Same image, same archive_command, same key when encrypted.
 SRC9="${SRC}9"; ARCHIVE9="$OUT/archive9"; BK9="$OUT/backups9"
 mkdir -p "$ARCHIVE9" "$BK9"; chmod 777 "$ARCHIVE9"
-docker rm -f "$SRC9" >/dev/null 2>&1 || true
+docker rm -fv "$SRC9" >/dev/null 2>&1 || true
 if [ "$ENCRYPTED" -eq 1 ]; then
     docker run -d --name "$SRC9" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=app \
         -v "$ARCHIVE9:/archive" -v "$(command -v age):/usr/local/bin/age:ro" "$IMAGE" \
@@ -541,7 +551,7 @@ else
     fail_case 'prune --keep 1 failed'
     sed -n '1,20p' "$OUT/prune9.log" | sed 's/^/        /'
 fi
-docker rm -f "$SRC9" >/dev/null 2>&1 || true
+docker rm -fv "$SRC9" >/dev/null 2>&1 || true
 printf '\n'
 
 if [ "$FAILURES" -gt 0 ]; then

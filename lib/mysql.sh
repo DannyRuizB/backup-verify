@@ -115,9 +115,14 @@ eng_image_for_server() {
     esac
 }
 
-# Remove the throwaway instance.
+# Remove the throwaway instance AND its anonymous volume (-v). The image
+# declares a VOLUME for its data directory, so `docker rm -f` alone left the
+# restored database behind in a dangling volume on every run - measured: one
+# verify of an age-encrypted backup left 46.6 MB holding the restored rows in
+# cleartext (customer e-mails greppable) while the .age on disk held none.
+# Anonymous volumes only: named volumes and bind mounts are never touched.
 eng_teardown() {
-    docker rm -f "$1" >/dev/null 2>&1 || true
+    docker rm -fv "$1" >/dev/null 2>&1 || true
 }
 
 # MySQL's official image also starts twice (init server, then the real one) -

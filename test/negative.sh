@@ -63,8 +63,8 @@ cleanup() {
         [ -n "$SRC_DB" ] && rm -f "$SRC_DB" "$SRC_DB-wal" "$SRC_DB-shm"
         rm -f "${TMPDIR:-/tmp}"/bv-sqlite-bv-verify-*.db 2>/dev/null || true
     else
-        docker rm -f "$SRC" >/dev/null 2>&1 || true
-        docker ps -aq --filter "name=bv-verify-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+        docker rm -fv "$SRC" >/dev/null 2>&1 || true
+        docker ps -aq --filter "name=bv-verify-" | xargs -r docker rm -fv >/dev/null 2>&1 || true
     fi
     rm -rf "$OUT"
 }
@@ -83,7 +83,7 @@ elif [ "$ENG_NAME" = sqlite ]; then
     seed_sqlite "$SRC_DB"
 else
     log "booting a source database with data ($ENG_NAME, $IMAGE)"
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
+    docker rm -fv "$SRC" >/dev/null 2>&1 || true
     eng_boot "$SRC" app "$IMAGE"
     eng_wait_ready "$SRC"
     "seed_$ENG_NAME" "$SRC" app

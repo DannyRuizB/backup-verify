@@ -136,6 +136,19 @@ JSON
     [[ "$output" == *"ORDER BY row_text"* ]]
 }
 
+@test "every docker rm takes the container's anonymous volumes with it (-v)" {
+    # The database images declare a VOLUME for their data directory. A plain
+    # `docker rm -f` left the RESTORED database behind in a dangling volume on
+    # every verify - measured: 46.6 MB per run, and for an age-encrypted
+    # backup the rows in cleartext. -v removes only anonymous volumes.
+    run bash -c "cd '$REPO' && grep -rn 'docker rm -f ' --include='*.sh' ."
+    [ "$status" -eq 1 ]
+    for engine in postgres mysql; do
+        run bash -c "sed -n '/^eng_teardown/,/^}/p' '$REPO/lib/$engine.sh'"
+        [[ "$output" == *"docker rm -fv"* ]]
+    done
+}
+
 @test "postgres fingerprints its large objects; the other engines have none to list" {
     # A large object lives outside every table: a table holding its oid
     # restores identical without it (measured on 16, 17 and 18), so only a

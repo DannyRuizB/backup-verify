@@ -40,7 +40,7 @@ cleanup() {
     elif [ "$ENG_NAME" = sqlite ]; then
         [ -n "$SRC_DB" ] && rm -f "$SRC_DB" "$SRC_DB-wal" "$SRC_DB-shm"
     else
-        docker rm -f "$SRC" >/dev/null 2>&1 || true
+        docker rm -fv "$SRC" >/dev/null 2>&1 || true
     fi
     rm -rf "$OUT"
 }
@@ -60,7 +60,7 @@ elif [ "$ENG_NAME" = sqlite ]; then
     ok "seeded: $(eng_query "$SRC_DB" app 'SELECT count(*) FROM customers;' | tr -d '\n') customers, $(eng_query "$SRC_DB" app 'SELECT count(*) FROM orders;' | tr -d '\n') orders"
 else
     log "booting the source database ($ENG_NAME, $IMAGE)"
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
+    docker rm -fv "$SRC" >/dev/null 2>&1 || true
     eng_boot "$SRC" app "$IMAGE"
     eng_wait_ready "$SRC"
 
@@ -114,10 +114,19 @@ elif [ "$ENG_NAME" = sqlite ]; then
     SRC_DB=""
 else
     log "DESTROYING the source database (this is the whole point)"
-    docker rm -f "$SRC" >/dev/null
+    docker rm -fv "$SRC" >/dev/null
     SRC=""
 fi
 ok 'source is gone - the artefact on disk is now the only copy'
+
+# Every verify below boots a throwaway server whose image declares a VOLUME.
+# Torn down without -v, each one left the RESTORED database in a dangling
+# volume - for an encrypted backup, the decrypted rows, in cleartext (measured:
+# 46.6 MB per run). The three verifies must leave none behind.
+DANGLING_BEFORE=""
+if [ "$ENG_NAME" = postgres ] || [ "$ENG_NAME" = mysql ]; then
+    DANGLING_BEFORE=$(docker volume ls -q --filter dangling=true | sort)
+fi
 
 # No --engine here on purpose: verify.sh reads the engine from the manifest.
 log "VERIFY (restores into a fresh instance and compares)"
@@ -161,6 +170,14 @@ if [ "$STALE_RC" -eq 0 ] || ! grep -q 'VERIFIED:' "$STALE_LOG" \
 fi
 rm -f "$STALE_LOG"
 ok '--max-age 7 a month later: VERIFIED, and failed as STALE'
+
+if [ "$ENG_NAME" = postgres ] || [ "$ENG_NAME" = mysql ]; then
+    LEFT=$(comm -13 <(printf '%s\n' "$DANGLING_BEFORE") <(docker volume ls -q --filter dangling=true | sort) | grep -c . || true)
+    if [ "$LEFT" -ne 0 ]; then
+        die "the three verifies left $LEFT dangling volume(s) behind - the restored database is still on disk"
+    fi
+    ok 'the three verifies left no volume behind (no restored copy stays on disk)'
+fi
 
 if [ "$ENCRYPTED" -eq 1 ]; then
     ok "e2e passed: the ENCRYPTED $ENG_NAME backup decrypted and restored identically after the source was destroyed"

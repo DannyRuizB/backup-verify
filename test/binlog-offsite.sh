@@ -51,8 +51,8 @@ pass_case() { printf '  %sOK%s   %s\n' "$c_green" "$c_reset" "$1"; }
 fail_case() { printf '  %sFAIL%s %s\n' "$c_red" "$c_reset" "$1"; FAILURES=$((FAILURES + 1)); }
 
 cleanup() {
-    docker rm -f "$SRC" >/dev/null 2>&1 || true
-    if [ "$KIND" = ssh ]; then docker rm -f "$SSHD" >/dev/null 2>&1 || true; fi
+    docker rm -fv "$SRC" >/dev/null 2>&1 || true
+    if [ "$KIND" = ssh ]; then docker rm -fv "$SSHD" >/dev/null 2>&1 || true; fi
     rm -rf "$OUT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -79,7 +79,7 @@ fi
 if [ "$KIND" = ssh ]; then
     log "booting a real sshd in Docker"
     ssh-keygen -t ed25519 -N '' -f "$OUT/key" -q
-    docker rm -f "$SSHD" >/dev/null 2>&1 || true
+    docker rm -fv "$SSHD" >/dev/null 2>&1 || true
     docker run -d --name "$SSHD" -p "127.0.0.1:$PORT:22" alpine:3.20 sh -c "
         apk add --no-cache openssh >/dev/null 2>&1 &&
         ssh-keygen -A >/dev/null 2>&1 &&
@@ -136,7 +136,7 @@ docker run --rm -v "$TOOLS:/tools" --entrypoint sh "$IMAGE" -c '
 
 # --- the source ---------------------------------------------------------------
 log "booting the source database ($IMAGE) with its binary log on"
-docker rm -f "$SRC" >/dev/null 2>&1 || true
+docker rm -fv "$SRC" >/dev/null 2>&1 || true
 docker run -d --name "$SRC" -e MYSQL_ROOT_PASSWORD=verify -e MYSQL_DATABASE=app "$IMAGE" >/dev/null
 eng_wait_ready "$SRC"
 seed_mysql "$SRC" app
@@ -338,7 +338,7 @@ fi
 printf '\n'
 echo '== Case 7: the fire - source, archive and every local manifest destroyed =='
 log "DESTROYING the source, the local archive and the local backups (this is the whole point)"
-docker rm -f "$SRC" >/dev/null 2>&1
+docker rm -fv "$SRC" >/dev/null 2>&1
 rm -rf "$ARCHIVE" "$BK"
 ok "the machine is bare - the remote is the only copy of anything"
 if ./binlog.sh pull --db app --remote "$REMOTE" --archive "$OUT/fire-archive" --out "$OUT/fire" "${OS[@]}" >"$OUT/pull6.log" 2>&1; then
