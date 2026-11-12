@@ -132,6 +132,22 @@ triggers — as a count plus a fingerprint of their definitions, and `verify.sh`
 compares each class. A missing index is a failure, and so is an index that came
 back on the wrong column.
 
+Postgres adds one class the others have no use for: **large objects**. They
+live in `pg_largeobject`, outside every table, so a table that only holds their
+oids restores byte-identical without them. Measured on 16, 17 and 18 with a
+`documents` table pointing at three of them: `pg_dump -n public` — large
+objects are in a dump by default *except* with `-n`, `-t` or `--schema-only` —
+and `pg_dump --no-large-objects` (`--no-blobs` on 16) both restored every row,
+same oids, same table fingerprint, and **not one large object**: every
+`lo_get()` on the restored table failed with *large object N does not exist*.
+The `-n public` restore even exits 1 — for `schema "public" already exists`,
+harmless noise that points away from the real loss, which says nothing at all.
+The class records each object's oid (`pg_restore` keeps them) and a digest of
+its **content**, read through `lo_get` in 1 MiB chunks: a hole reads as zeros
+the way `pg_dump` reads it, no single `bytea` has to hold an object bigger than
+the 1 GB a `bytea` can, and it needs only the privilege `pg_dump` needs. A byte
+changed past the first megabyte moves it; a new owner does not.
+
 More ways a backup lies, all measured, all covered by the test suites:
 
 | What looks fine | What is actually happening |
@@ -567,7 +583,13 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   destruction is the point: it removes the possibility of accidentally
   verifying against the original.
 - **`test/negative.sh [--engine postgres|mysql|files|sqlite]`** — eleven cases
-  *per engine*:
+  *per engine*, plus one each where an engine has its own way to lose data
+  quietly (MySQL 9+: an embedding changed below the six digits
+  `VECTOR_TO_STRING` prints, caught by its fingerprint and only it; Postgres: a
+  `pg_dump -n public` artefact that restores every row of `documents` and none
+  of its large objects, rejected for exactly
+  `large_objects - expected 3, restored copy has 0` while `documents` itself
+  matches). The eleven:
   truncated archive, un-runnable dump, post-backup corruption, matching row
   count with different content, **everything restored with the silent loss
   intact** (Postgres: a `pg_dump -t` tables-only artefact; MySQL: a dump made
@@ -588,7 +610,9 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
 - **`test/seed.sh`** — ONE seed shared by both suites, per engine, after a
   negative case went green against a different shape and proved nothing. The
   database engines get the same things to lose: two tables (PK, UNIQUE, CHECK,
-  FK), an index, a view, routines and a trigger. The files tree gets what a
+  FK), an index, a view, routines and a trigger — plus, where the engine has
+  them, a `VECTOR` column (MySQL 9+) and a `documents` table whose rows point
+  at three large objects, one over 1 MiB and one empty (Postgres). The files tree gets what a
   naive file backup is measured to lose: a dotfile, a 100 KB blob, a setgid
   shared directory, a group-writable file, a symlink and an empty directory.
 - **`test/offsite.sh [--remote-kind ssh|dir]`** — the fire drill: back up,
@@ -686,7 +710,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Nineteen bugs this harness caught in its own code
+## Twenty bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -872,6 +896,16 @@ fingerprinted anyway, came back empty, and verify died on it ("not usable")
 instead of reporting it absent and comparing the rest. Measured on a restore
 that loses two tables: now 9 problems named, one by one, where it used to
 stop at the first missing table.
+
+**Every document gone, and the verdict was VERIFIED.** Large objects live
+outside every table, and every Postgres class read the `public` schema — so a
+`pg_dump -n public` artefact, which carries no large objects at all, passed
+every gate: the `documents` table matched byte for byte (it holds only the
+oids), the restore's one error was an unrelated `schema "public" already
+exists`, and the run ended VERIFIED (measured on `main` with negative case 13
+before the class existed). The class `large_objects` names the loss now; a
+manifest written before it simply does not list it, and verify compares the
+classes a manifest lists.
 
 ## Scope
 

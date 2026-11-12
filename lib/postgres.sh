@@ -13,6 +13,16 @@ ENG_DEFAULT_IMAGE="postgres:17-alpine"
 ENG_ARTEFACT_EXT=".dump"
 # shellcheck disable=SC2034  # used in user-facing messages
 ENG_UNIT="table"
+# The database default plus large_objects. A large object lives in
+# pg_largeobject, outside every table: a table holding its oid restores
+# byte-identical without it, and every lo_get() on that oid fails with "large
+# object N does not exist" - measured on 16, 17 and 18 with `pg_dump -n
+# public` (large objects are in a dump by default EXCEPT with -n, -t or
+# --schema-only) and with --no-large-objects / --no-blobs. A manifest written
+# before this class existed simply does not list it, and verify compares the
+# classes the manifest lists.
+# shellcheck disable=SC2034  # consumed by backup.sh/verify.sh, which source this
+SCHEMA_CLASSES="indexes constraints sequences views routines triggers large_objects"
 
 # Backup-side preconditions: the tools exist and the source is reachable.
 eng_preflight() {
@@ -129,6 +139,15 @@ eng_schema_digest() {
         views)       sql="SELECT table_name||' '||md5(coalesce(view_definition,'')) FROM information_schema.views WHERE table_schema='public' ORDER BY 1;";;
         routines)    sql="SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' ORDER BY 1;";;
         triggers)    sql="SELECT t.tgname||' on '||c.relname FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal AND n.nspname='public' ORDER BY 1;";;
+        # Every large object of the database (they belong to no schema): its
+        # oid - pg_restore keeps them, measured - and a digest of its CONTENT,
+        # read the logical way, through lo_get in 1 MiB chunks: a hole reads
+        # as zeros like it does for pg_dump, no single bytea has to hold the
+        # whole object (bytea stops at 1 GB, large objects do not), and it
+        # needs only the SELECT privilege pg_dump itself needs. The size comes
+        # from seeking to the end of a read-only descriptor; descriptors close
+        # with the statement's transaction.
+        large_objects) sql="SELECT m.oid||' '||(SELECT md5(string_agg(md5(lo_get(m.oid, off, 1048576)), '' ORDER BY off)) FROM generate_series(0::bigint, greatest(lo_lseek64(lo_open(m.oid, 262144), 0, 2) - 1, 0), 1048576) AS off) FROM pg_largeobject_metadata m ORDER BY m.oid;";;
         *)           die "unknown object class for $ENG_NAME: $class";;
     esac
     out=$(eng_query "$container" "$db" "$sql")

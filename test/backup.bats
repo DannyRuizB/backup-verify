@@ -136,6 +136,32 @@ JSON
     [[ "$output" == *"ORDER BY row_text"* ]]
 }
 
+@test "postgres fingerprints its large objects; the other engines have none to list" {
+    # A large object lives outside every table: a table holding its oid
+    # restores identical without it (measured on 16, 17 and 18), so only a
+    # class of its own sees the loss. MySQL shares the database default and
+    # has no large objects - listing the class there would die in
+    # eng_schema_digest ("unknown object class").
+    run bash -c "source '$REPO/lib/common.sh'; load_engine postgres; echo \"\$SCHEMA_CLASSES\""
+    [[ " $output " == *" large_objects "* ]]
+    for engine in mysql sqlite files; do
+        run bash -c "source '$REPO/lib/common.sh'; load_engine $engine; echo \"\$SCHEMA_CLASSES\""
+        [[ " $output " != *" large_objects "* ]]
+    done
+}
+
+@test "the large object digest reads content through lo_get, in chunks, not pg_largeobject" {
+    # lo_get needs only the SELECT privilege pg_dump needs, reads a hole as
+    # zeros the way pg_dump does, and a 1 MiB chunk keeps every bytea far
+    # below the 1 GB a single bytea can hold. Reading pg_largeobject pages
+    # would need superuser and would see the physical layout instead.
+    run bash -c "sed -n '/^eng_schema_digest/,/^}/p' '$REPO/lib/postgres.sh' | grep 'large_objects) sql='"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lo_get(m.oid, off, 1048576)"* ]]
+    [[ "$output" == *"pg_largeobject_metadata"* ]]
+    [[ "$output" != *"FROM pg_largeobject "* ]]
+}
+
 @test "no engine's query helper attaches stdin (it would eat a caller's read loop)" {
     # Regression guard for a real bug: with `docker exec -i`, calling the query
     # helper from inside a `while read` loop made the client swallow the loop's
