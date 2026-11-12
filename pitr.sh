@@ -1397,7 +1397,11 @@ cmd_pull() {
 
 cleanup() {
     if [ -n "$PROBE" ] && [ "$KEEP_CONTAINER" -eq 0 ]; then
-        docker rm -f "$PROBE" > /dev/null 2>&1 || true
+        # -v: on 18 the image's VOLUME is the whole /var/lib/postgresql, around
+        # the bind-mounted PGDATA, so every drill left a dangling volume behind
+        # (measured: a 12 KB skeleton - the data itself lives in the scratch
+        # directory, wiped below - but one more per nightly drill, forever).
+        docker rm -fv "$PROBE" > /dev/null 2>&1 || true
     elif [ -n "$PROBE" ]; then
         warn "throwaway instance left in place: $PROBE (data dir: $SCRATCH)"
         return 0

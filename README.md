@@ -176,6 +176,17 @@ and that the key still opens it. So `--recipient` encrypts with
   the script **says out loud** that it was not decryption-checked.
 - `verify.sh` decrypts into `pg_restore` and **refuses to run without the key**:
   no key, no verification, no comforting green tick.
+- The throwaway server the proof restores into is removed **with its volume**
+  (`docker rm -fv`). The database images declare a `VOLUME` for their data
+  directory, and a plain `docker rm -f` left it behind: **every verify left the
+  restored database on disk** in a dangling Docker volume. Measured on a
+  Postgres 17 backup encrypted with age: 46.6 MB per run, the `.age` on disk
+  holding not one customer e-mail and the leftover volume holding them in
+  cleartext (greppable in two files). The e2e now fails any run whose verifies
+  leave a volume behind, and so do the PITR and binlog drills. Volumes left by
+  earlier versions are anonymous and dangling: `docker volume ls -qf
+  dangling=true` lists them — look before a `docker volume prune`, which
+  removes every dangling volume on the machine, not only these.
 
 Two measured facts shaped this, and they pull in opposite directions:
 
@@ -581,7 +592,8 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   back up → **destroy the source** (`docker rm -f`, or `rm -rf` of the tree) →
   restore into a fresh instance → compare. The
   destruction is the point: it removes the possibility of accidentally
-  verifying against the original.
+  verifying against the original. The verifies must also leave **no dangling
+  Docker volume** behind: the restored copy is not allowed to outlive the proof.
 - **`test/negative.sh [--engine postgres|mysql|files|sqlite]`** — eleven cases
   *per engine*, plus one each where an engine has its own way to lose data
   quietly (MySQL 9+: an embedding changed below the six digits
@@ -710,7 +722,7 @@ for the same reason it refuses to verify a Postgres backup as MySQL.
   a skip path — a missing tool fails the suite rather than reporting green on
   tests that never ran.
 
-## Twenty bugs this harness caught in its own code
+## Twenty-one bugs this harness caught in its own code
 
 **The most dangerous one: a fingerprint of nothing.** MySQL has no `t.*` inside
 functions, so the Postgres fingerprint query was a syntax error there — an
@@ -906,6 +918,17 @@ exists`, and the run ended VERIFIED (measured on `main` with negative case 13
 before the class existed). The class `large_objects` names the loss now; a
 manifest written before it simply does not list it, and verify compares the
 classes a manifest lists.
+
+**The proof left a copy of the data behind.** Every throwaway server was
+removed with `docker rm -f`, and the database images declare a `VOLUME` for
+their data directory — so every verify, nightly, left the restored database in
+a dangling volume: 46.6 MB a run on Postgres 17, and for an encrypted backup
+the decrypted rows, in cleartext, next to a `.age` that held none. The
+harness's own source containers did the same. `-v` on every `docker rm`, a guard in the unit
+tests, and a count of dangling volumes around the verifies in the e2e and both
+PITR drills (on Postgres 18 the PITR drill left a 12 KB skeleton each run —
+the data itself lives in the wiped scratch directory — still one more volume
+per night).
 
 ## Scope
 
